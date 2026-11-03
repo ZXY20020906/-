@@ -9,7 +9,10 @@
  *   脚本只允许同源（`script-src 'self'`），没有 inline script。
  * - `/media/*` 的 CORP 必须是 cross-origin：插件要跨源取封面和皮肤包；
  *   其它路径收紧成 same-origin。
+ * - `referrer-policy` 默认 no-referrer，只有登录页（/__gate）放宽到 same-origin：
+ *   登录 POST 的来源校验用同源 Referer 兜底，no-referrer 会把它掐掉。
  */
+import { isGatePath } from './gate.js';
 
 const CSP = [
   "default-src 'self'",
@@ -36,7 +39,9 @@ export function withSecurityHeaders(response, request) {
   headers.set('content-security-policy', CSP);
   headers.set('x-content-type-options', 'nosniff');
   headers.set('x-frame-options', 'DENY');
-  headers.set('referrer-policy', 'no-referrer');
+  // 登录页例外：登录 POST 的来源校验有一条「同源 Referer」兜底（gate-middleware.js 的 checkSource），
+  // 而 no-referrer 会让浏览器连同源 Referer 都不发，那条兜底就永远失效。这里只放开到 same-origin。
+  headers.set('referrer-policy', isGatePath(url.pathname) ? 'same-origin' : 'no-referrer');
   headers.set('permissions-policy', 'camera=(), microphone=(), geolocation=(), payment=()');
   headers.set('cross-origin-opener-policy', 'same-origin');
   // 媒体 / 公开接口要能被插件跨源使用，其它资源只允许同源

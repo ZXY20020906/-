@@ -21,7 +21,9 @@ const CSP = [
 const NO_STORE = {
   'cache-control': 'no-store, max-age=0',
   'x-robots-tag': 'noindex, nofollow',
-  'referrer-policy': 'no-referrer',
+  // 登录 POST 的来源校验有「同源 Referer」兜底；no-referrer 会把这条兜底掐死。
+  // 只泄露同源路径，外站拿不到任何东西。
+  'referrer-policy': 'same-origin',
 };
 
 export const PAGE_HEADERS = { ...NO_STORE, 'content-security-policy': CSP };

@@ -27,13 +27,17 @@ const MAX_BODY_BYTES = 4096;
 /**
  * 登录表单的 CSRF：
  * - GET /__gate 时发一枚一次性 token，同时写进 Cookie 和表单隐藏域（double-submit）；
- * - POST 时两边都要有、且常量时间比较相等，比较通过后标记为已用（重放 → 403）；
- * - Cookie 用 SameSite=Strict + HttpOnly，有效期 10 分钟，POST 之后一律清掉。
+ * - POST 时先判来源（同源 Origin / PUBLIC_ORIGIN / 同源 Referer，见 checkSource），
+ *   再要求两边都有 token 且常量时间比较相等；
+ * - Cookie 用 SameSite=Strict + HttpOnly，有效期 10 分钟，POST 之后一律清掉；
+ *   GET 一定会 Set-Cookie，所以「从外站链接点进来 → 直接提交」也有 token 可用。
  * 为什么要做：会话 Cookie 是 SameSite=Lax，拦不住跨站 top-level POST 表单；
  * CSP 的 form-action 'self' 只是纵深，不是校验。
  *
- * 已知局限：已用 token 的集合在 isolate 内存里（和 rate-limit.js 同类），
- * 跨 isolate 的重放不一定被识别；真正的防护来自 double-submit + SameSite=Strict + Origin 校验。
+ * 关于「一次性」：已用 token 的集合在 isolate 内存里，只用于压制**同 isolate 内**的重放，
+ * 跨 isolate 的重放不一定被识别。它只会拒绝「哈希已在本 isolate 出现过」的 token，
+ * 全新 token 的哈希不可能落在别的 isolate 的集合里，所以不会因为多 isolate 误判失效；
+ * 真正的防护始终是 double-submit + SameSite=Strict + 来源校验。
  */
 export const CSRF_COOKIE = 'folia_csrf';
 export const CSRF_FIELD = '_csrf';
@@ -100,26 +104,83 @@ async function consumeCsrfToken(token) {
 }
 
 /**
- * 校验登录 POST：Origin 同源 + 表单/Cookie 双份 token 相等 + 一次性。
+ * 归一化成 `scheme://host[:port]`；拿不到合法 http(s) 来源时返回空串。
+ *
+ * `Origin: null`（沙箱 iframe、非 http 文档、部分隐私模式/代理）和畸形值一律算「没给来源」，
+ * 交给 Referer 再判一次，而不是直接判失败——线上「登录请求来源不合法」误拦就是这么来的。
+ */
+function normalizeOrigin(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw || raw === 'null') return '';
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return '';
+    return parsed.origin;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 来源判定：
+ *   1) 有任何一个**能解析出来**的来源（Origin 或 Referer 的 origin），就必须命中其中之一：
+ *        origin === selfOrigin            // request.url 自己的源
+ *        || origin === env.PUBLIC_ORIGIN  // 归一化后的线上站点源（自定义域名 / 反向代理换 Host 时有差异）
+ *        || refererOrigin === selfOrigin  // 浏览器给不出 Origin，但同源 Referer 还在
+ *      否则 → 「来源不合法」。
+ *   2) 两个头都没有、或都解析不出 origin（`Origin: null` 这种不透明来源）→ 只剩 double-submit 判。
+ *
+ * 为什么这么改：旧判据只比 `new URL(origin).host`，而且 Origin 解析失败就立刻 403。
+ * Pages 后面隔着自定义域名 / 代理 / 隐私策略时，Origin 的字面 host 与 request.url 不一定相等，
+ * 一次误拦就是「管理员彻底登不进来」。
+ *
+ * 为什么不担心放宽：浏览器发起的跨站表单 POST 一定带**可解析**的 `Origin: <攻击者站点>`，
+ * 落进第 1 条照样 403；而「拿不到任何可解析来源」的请求既拿不到 HttpOnly 的 folia_csrf Cookie，
+ * 也过不了 SameSite=Strict，double-submit 仍然必须成立。
+ */
+function checkSource(request, url, env) {
+  const selfOrigin = url.origin;
+  const envOrigin = normalizeOrigin(env?.PUBLIC_ORIGIN);
+  const origin = normalizeOrigin(request.headers.get('origin'));
+  const refererOrigin = normalizeOrigin(request.headers.get('referer'));
+
+  const originOk = Boolean(origin) && (origin === selfOrigin || (envOrigin ? origin === envOrigin : false));
+  const refererOk = Boolean(refererOrigin) && refererOrigin === selfOrigin;
+  // 有没有「可用的来源信号」：Origin: null、畸形值都算没有
+  const hasSignal = Boolean(origin) || Boolean(refererOrigin);
+
+  return {
+    ok: hasSignal ? originOk || refererOk : true,
+    via: originOk ? 'origin' : refererOk ? 'referer' : hasSignal ? 'mismatch' : 'double-submit-only',
+    detail: {
+      selfOrigin,
+      envOrigin,
+      origin,
+      refererOrigin,
+      rawOrigin: String(request.headers.get('origin') ?? ''),
+    },
+  };
+}
+
+/**
+ * 校验登录 POST：来源（同上）+ 表单/Cookie 双份 token 相等 + 一次性。
+ * 两类失败给不同的提示：来源不合法 / 登录页过期（缺 token、token 不匹配、token 已用），
+ * 免得用户对着「来源不合法」反复重试一个其实只是 cookie 没带上的表单。
  * @returns {Promise<string>} 失败原因（空字符串表示通过）
  */
-async function checkCsrf(request, form, url) {
-  const origin = request.headers.get('origin');
-  if (origin) {
-    let host = '';
-    try {
-      host = new URL(origin).host;
-    } catch {
-      return '登录请求来源不合法，请从登录页重新进入。';
-    }
-    if (host !== url.host) return '登录请求来源不合法，请从登录页重新进入。';
+async function checkCsrf(request, form, url, env) {
+  const source = checkSource(request, url, env);
+  if (!source.ok) {
+    // 只记来源，绝不记 token
+    console.warn('[gate] 登录来源校验失败', source.via, JSON.stringify(source.detail));
+    return '登录请求来源不合法，请从登录页重新进入。';
   }
 
   const fromForm = String(form.get(CSRF_FIELD) ?? '').trim();
   const fromCookie = csrfTokenFromCookie(request);
-  if (!fromForm || !fromCookie) return '登录页已过期，请刷新重试';
-  if (!constantTimeEqual(fromForm, fromCookie)) return '登录页已过期，请刷新重试';
-  if (!(await consumeCsrfToken(fromForm))) return '登录页已过期，请刷新重试';
+  if (!fromForm || !fromCookie) return '登录页已过期（缺少校验令牌），请刷新重试';
+  if (!constantTimeEqual(fromForm, fromCookie)) return '登录页已过期（校验令牌不匹配），请刷新重试';
+  if (!(await consumeCsrfToken(fromForm))) return '登录页已过期（校验令牌已被使用），请刷新重试';
   return '';
 }
 
@@ -262,7 +323,7 @@ async function handleGate(context, url) {
   const target = safeNext(form.get('next'));
 
   // CSRF 校验放在 attemptLogin 之前：失败时不白烧一次 PBKDF2，也不占用登录限流计数。
-  const csrfError = await checkCsrf(request, form, url);
+  const csrfError = await checkCsrf(request, form, url, env);
   if (csrfError) {
     console.warn('[gate] 登录 CSRF 校验失败', url.pathname);
     return csrfLoginPageAfterPost(request, { status: 403, next: target, error: csrfError });
