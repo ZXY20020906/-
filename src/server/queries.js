@@ -7,7 +7,7 @@
 
 const PUBLIC_COLUMNS = `w.id, w.slug, w.title, w.description, w.subtag, w.category_id, w.kind, w.mime, w.bytes, w.width, w.height,
   w.duration_ms, w.tags, w.featured, w.sort_order, w.published_at, w.created_at, w.updated_at,
-  w.sha256, w.storage_key, w.thumb_key,
+  w.sha256, w.storage_key, w.thumb_key, w.variants,
   c.slug AS category_slug, c.name AS category_name`;
 
 const PUBLIC_FILTERS = `w.status = 'published' AND w.storage_key IS NOT NULL

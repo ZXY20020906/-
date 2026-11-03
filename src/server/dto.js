@@ -21,6 +21,34 @@ export function categoryDto(row) {
   };
 }
 
+/**
+ * 同一条壁纸的降档变体（目前是 1080p）。弱网用户靠它 5 秒出画面：
+ * 4K 原画 40–50 MB，1080p 只有 5–8 MB。
+ *
+ * DB 里 variants 是一列 JSON 文本（D1 迁移见 schema/014）。坏数据一律降级成
+ * 空数组 —— 变体是「锦上添花」，绝不能因为一行脏 JSON 让整条壁纸 500。
+ * 契约（docs/SITE-DOWNLOAD-API.md §1.1）要求按 bytes 升序、URL 同域，
+ * 所以这里统一用 publicUrl 生成，前缀跟着站点配置走。
+ */
+export function variantsDto(row, mediaBase = '') {
+  const raw = safeJsonParse(row?.variants, []);
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((item) => item && typeof item === 'object' && item.key && Number(item.bytes) > 0)
+    .map((item) => {
+      const height = Number(item.height) || null;
+      const bytes = Number(item.bytes);
+      return {
+        label: height ? `${height}p` : 'alt',
+        height,
+        bytes,
+        sha256: item.sha256 ?? null,
+        url: publicUrl(item.key, mediaBase),
+      };
+    })
+    .sort((a, b) => a.bytes - b.bytes);
+}
+
 export function wallpaperDto(row, { admin = false, mediaBase = '' } = {}) {
   const fullUrl = publicUrl(row.storage_key, mediaBase);
   // 没有缩略图时，只有原文件本身是图片才拿它顶替；
@@ -46,6 +74,8 @@ export function wallpaperDto(row, { admin = false, mediaBase = '' } = {}) {
       : null,
     url: fullUrl,
     thumbUrl,
+    // 降档变体：没有就是空数组，老客户端读不到也不会崩
+    variants: variantsDto(row, mediaBase),
     // 给插件做增量同步用：内容哈希 + 更新时间，没变就不用重新下载
     sha256: row.sha256 ?? null,
     updatedAt: Number(row.updated_at ?? 0),
