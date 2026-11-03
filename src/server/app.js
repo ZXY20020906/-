@@ -37,6 +37,7 @@ const DEFINITIONS = [
   // 壁纸
   { method: 'GET', path: '/api/admin/wallpapers', handler: wallpaperRoutes.list, auth: 'session' },
   { method: 'POST', path: '/api/admin/wallpapers', handler: wallpaperRoutes.create, auth: 'session' },
+  { method: 'POST', path: '/api/admin/wallpapers/approve-all', handler: wallpaperRoutes.approveAll, auth: 'session' },
   { method: 'POST', path: '/api/admin/wallpapers/reorder', handler: wallpaperRoutes.reorder, auth: 'session' },
   { method: 'GET', path: '/api/admin/wallpapers/:id', handler: wallpaperRoutes.get, auth: 'session' },
   { method: 'GET', path: '/api/admin/subtags', handler: subtagRoutes.list, auth: 'session' },

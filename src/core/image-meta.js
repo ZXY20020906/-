@@ -7,7 +7,8 @@
 export const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 export const MAX_VIDEO_BYTES = 60 * 1024 * 1024;
 /** 资源包（bootanimation.zip / WE 工程包）体积较大，给到 90MB——Cloudflare 单请求上限 100MB。 */
-export const MAX_BUNDLE_BYTES = 90 * 1024 * 1024;
+// 90MB 会整块读进内存，Worker 只有 128MB，和其余开销叠在一起容易 OOM；64MB 留足余量
+export const MAX_BUNDLE_BYTES = 64 * 1024 * 1024;
 export const MAX_UPLOAD_BYTES = Math.max(MAX_IMAGE_BYTES, MAX_VIDEO_BYTES, MAX_BUNDLE_BYTES);
 
 export const ALLOWED_MIME = Object.freeze([

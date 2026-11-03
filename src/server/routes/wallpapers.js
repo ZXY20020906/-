@@ -27,7 +27,7 @@ import {
 import { created, json, readJson } from '../http.js';
 import { wallpaperDto } from '../dto.js';
 import { assetKey, deleteAsset, mediaBaseFor, putAsset, thumbKey, verifyAsset } from '../storage.js';
-import { newId, safeJsonParse, sha256Bytes } from '../util.js';
+import { newId, safeJsonParse, sampleFingerprint, sha256Bytes } from '../util.js';
 import { buildReorderPlan, nextSortOrder } from '../../core/ordering.js';
 import { AUDIT_ACTION, writeAudit } from '../audit.js';
 import { allowedTagNames } from './tags.js';
@@ -230,7 +230,9 @@ export async function upload({ env, actor, request, params }) {
     }
   }
 
-  const key = assetKey(row.id, sha ?? `${Date.now()}${bytes.byteLength}`, meta.mime);
+  // 大文件没有完整 sha，用采样指纹做 key，避免 Date.now() 导致每次上传都生成新 URL
+  const keySeed = sha ?? await sampleFingerprint(bytes);
+  const key = assetKey(row.id, keySeed, meta.mime);
   await putAsset(env, key, bytes, meta.mime);
 
   // 写完立刻回读：D1 记账必须来自刚校验过的对象，否则就是「库里有、桶里没有」
@@ -316,6 +318,23 @@ export async function remove({ env, actor, params }) {
     detail: row.title,
   });
   return json({ deleted: true, id: row.id });
+}
+
+/**
+ * 一键把所有「已发布但未审核」的作品标记为已审核。
+ * 公开接口只下发 approved，所以存量作品上线前必须走一次这里（或逐条在后台点审核）。
+ */
+export async function approveAll({ env, actor }) {
+  assertCan(actor, ACTION.WALLPAPER_UPDATE);
+  await run(env, Q.approvePendingPublished, nowMs());
+  await writeAudit(env, {
+    actor,
+    action: AUDIT_ACTION.WALLPAPER_UPDATE,
+    targetType: 'wallpaper',
+    targetId: 'bulk',
+    detail: '批量通过审核（已发布未审核）',
+  });
+  return json({ approved: true });
 }
 
 export async function reorder({ env, actor, request }) {

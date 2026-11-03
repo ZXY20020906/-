@@ -746,6 +746,7 @@
         </select>
         <span class="spacer"></span>
         <button class="btn small ghost" type="button" data-action="reset-filters" title="清空搜索和所有筛选">重置</button>
+        <button class="btn small" type="button" data-action="approve-all" title="把已发布但未审核的作品全部标记为已审核">全部通过审核</button>
         <button class="btn small danger" type="button" data-action="bulk-delete" id="wp-bulk-del" disabled>删除选中</button>
         <span class="muted small" id="wp-total"></span>
       </div>
@@ -836,6 +837,14 @@
     if (state.importDirs.length) {
       scanImportDirs({ silent: true }).catch((error) => console.warn('[auto-import]', error.message));
     }
+  }
+
+  /** 一键通过审核：公开接口只下发 approved，新上传默认 pending */
+  async function approveAll() {
+    if (!window.confirm('把所有「已发布但未审核」的作品标记为已审核？')) return;
+    const data = await api('/admin/wallpapers/approve-all', { method: 'POST' });
+    toast(data.approved ? '已全部通过审核' : '已完成', 'ok');
+    await loadWallpapers();
   }
 
   async function loadWallpapers() {
@@ -2155,6 +2164,9 @@
         break;
       case 'delete-subtag':
         deleteSubtag(id, button.dataset.name || '');
+        break;
+      case 'approve-all':
+        approveAll().catch(reportError);
         break;
       case 'reset-filters':
         state.filters = { q: '', status: '', review: '', categoryId: '', tag: '', subtag: '', format: '' };

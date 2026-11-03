@@ -1,0 +1,31 @@
+# 每日对账（GitHub Actions）
+#
+# 用法：把本文件复制到 .github/workflows/reconcile.yml 并提交。
+# 注意：提交 workflow 文件需要令牌带 `workflow` 权限（细粒度令牌里叫「工作流程」），
+#       否则 GitHub 会拒绝推送。
+#
+# 需要 Secrets：FOLIA_PASSWORD = 管理员密码
+
+name: 每日对账
+on:
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 生成核对结果
+        env:
+          FOLIA_PASSWORD: ${{ secrets.FOLIA_PASSWORD }}
+        run: node tools/reconcile.mjs --apply
+      - name: 保留 SQL 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: reconcile-sql
+          path: reconcile.sql
+          if-no-files-found: ignore

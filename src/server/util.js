@@ -68,3 +68,18 @@ export function safeJsonParse(value, fallback) {
     return fallback;
   }
 }
+
+/**
+ * 大文件（>40MB）算不了完整 sha256：Worker 128MB 内存会炸。
+ * 取「首 1MB + 尾 1MB」做采样哈希当 key 种子——
+ * 内容变了 key 基本一定变（缓存不会脏），同一文件重复上传 key 也稳定（能识别重复）。
+ */
+export async function sampleFingerprint(bytes) {
+  const CHUNK = 1024 * 1024;
+  const head = bytes.subarray(0, Math.min(CHUNK, bytes.length));
+  const tail = bytes.subarray(Math.max(0, bytes.length - CHUNK));
+  const merged = new Uint8Array(head.length + tail.length);
+  merged.set(head, 0);
+  merged.set(tail, head.length);
+  return sha256Bytes(merged);
+}

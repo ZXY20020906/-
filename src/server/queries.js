@@ -12,6 +12,7 @@ const PUBLIC_COLUMNS = `w.id, w.slug, w.title, w.description, w.subtag, w.catego
 
 const PUBLIC_FILTERS = `w.status = 'published' AND w.storage_key IS NOT NULL
   AND w.verified_at IS NOT NULL
+  AND w.review_status = 'approved'
   AND (?1 IS NULL OR c.slug = ?1)
   AND (?2 IS NULL OR w.kind = ?2)
   AND (?3 IS NULL OR w.title LIKE ?3)
@@ -101,6 +102,9 @@ export const Q = {
       duration_ms = ?, sha256 = ?, kind = ?, updated_at = ? WHERE id = ?`,
   updateWallpaperThumb: `UPDATE wallpapers SET thumb_key = ?, updated_at = ? WHERE id = ?`,
   /** 上传回读成功后记账：verified_at + 编码信息 */
+  /** 批量审核：把待审核的已发布作品一次性标记为已审核 */
+  approvePendingPublished: `UPDATE wallpapers SET review_status = 'approved', updated_at = ?
+    WHERE review_status <> 'approved' AND status = 'published'`,
   markWallpaperVerified: `UPDATE wallpapers SET verified_at = ?, codec = ?, faststart = ? WHERE id = ?`,
   /** 对账发现问题时标记（公开接口据此过滤） */
   markWallpaperBroken: `UPDATE wallpapers SET verified_at = NULL, missing_reason = ? WHERE id = ?`,
