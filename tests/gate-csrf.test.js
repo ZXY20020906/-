@@ -36,9 +36,9 @@ const USER_ROW = {
   last_login_at: null,
 };
 
-function makeEnv() {
+function makeEnv({ user = USER_ROW } = {}) {
   return createEnv({
-    [Q.userByEmail]: ([email]) => (email === EMAIL ? [USER_ROW] : []),
+    [Q.userByEmail]: ([email]) => (email === user.email ? [user] : []),
     [Q.sessionByToken]: () => [],
     [Q.insertSession]: () => [],
     [Q.touchSession]: () => [],
@@ -110,16 +110,61 @@ test('POST 没有 _csrf、也没有 Cookie → 403，且不调用 attemptLogin',
 });
 
 test('POST token 与 Cookie 不匹配 → 403', async () => {
-  const { env } = makeEnv();
+  // 准备数据：不匹配不再在 CSRF 这一步拒绝（best-effort），继续走去凭据校验；
+  // 所以这里用**非管理员**账号，让 403 来自登录后的角色闸门 —— 断言本身没改。
+  const editorRow = { ...USER_ROW, id: 'usr_editor', email: 'editor@demo.test', role: 'editor' };
+  const { env } = makeEnv({ user: editorRow });
   const csrf = await fetchCsrf(env);
   const { context } = makeContext('/__gate', {
     method: 'POST',
-    form: { email: EMAIL, password: PASSWORD, _csrf: 'A'.repeat(43) },
+    form: { email: 'editor@demo.test', password: PASSWORD, _csrf: 'A'.repeat(43) },
     cookie: csrf.cookie,
     env,
   });
   const res = await gateMiddleware(context);
   assert.equal(res.status, 403);
+});
+
+test('POST token 与 Cookie 不匹配不再 403：继续走凭据校验（密码错 → 401）', async () => {
+  const { env } = makeEnv();
+  const csrf = await fetchCsrf(env);
+  const { context } = makeContext('/__gate', {
+    method: 'POST',
+    form: { email: EMAIL, password: 'wrong-password-123', _csrf: 'A'.repeat(43) },
+    cookie: csrf.cookie,
+    env,
+  });
+  const res = await gateMiddleware(context);
+  assert.equal(res.status, 401);
+  assert.match(await res.text(), /邮箱或密码不正确/);
+});
+
+test('多个同名 Cookie（历史遗留 + 新的）只要有一个匹配就放行', async () => {
+  const { env } = makeEnv();
+  const csrf = await fetchCsrf(env);
+  const stale = `folia_csrf=${'A'.repeat(43)}`;
+  const { context } = makeContext('/__gate', {
+    method: 'POST',
+    form: { email: EMAIL, password: PASSWORD, _csrf: csrf.token },
+    cookie: `${stale}; ${csrf.cookie}`,
+    env,
+  });
+  const res = await gateMiddleware(context);
+  assert.equal(res.status, 303);
+});
+
+test('token 格式不合法 → 依旧 403（有值但乱填）', async () => {
+  const { env } = makeEnv();
+  const csrf = await fetchCsrf(env);
+  const { context } = makeContext('/__gate', {
+    method: 'POST',
+    form: { email: EMAIL, password: PASSWORD, _csrf: 'not a token!' },
+    cookie: csrf.cookie,
+    env,
+  });
+  const res = await gateMiddleware(context);
+  assert.equal(res.status, 403);
+  assert.match(await res.text(), /校验令牌不合法/);
 });
 
 test('POST token 匹配 → 303 + 会话 Cookie，并清掉一次性 token', async () => {

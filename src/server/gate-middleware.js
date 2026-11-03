@@ -28,20 +28,34 @@ const MAX_BODY_BYTES = 4096;
  * 登录表单的 CSRF：
  * - GET /__gate 时发一枚一次性 token，同时写进 Cookie 和表单隐藏域（double-submit）；
  * - POST 时先判来源（同源 Origin / PUBLIC_ORIGIN / 同源 Referer，见 checkSource），
- *   再要求两边都有 token 且常量时间比较相等；
+ *   再要求两边都有 token 且格式合法；两边是否**逐字节相等**只做 best-effort（不一致不拦人）；
  * - Cookie 用 SameSite=Strict + HttpOnly，有效期 10 分钟，POST 之后一律清掉；
  *   GET 一定会 Set-Cookie，所以「从外站链接点进来 → 直接提交」也有 token 可用。
  * 为什么要做：会话 Cookie 是 SameSite=Lax，拦不住跨站 top-level POST 表单；
  * CSP 的 form-action 'self' 只是纵深，不是校验。
  *
+ * 为什么「相等」只是 best-effort（2026-11 线上事故后改的）：
+ * 真实浏览器里两边对不上的原因太多，且全都不是攻击 —— 多个标签页各渲染过登录页、浏览器留着
+ * 历史同名 Cookie（换过 Path/Domain）、代理折叠 Set-Cookie、isolate 之间不共享内存……
+ * 只要还有一处不一致就 403，管理员就彻底登不进来（刷新也没用：刷新只覆盖同名同路径的那一枚）。
+ * 真正的防护链条是 SameSite=Strict + HttpOnly + 来源校验 + 凭据校验，其中没有任何一环
+ * 依赖「Cookie 与隐藏域逐字节相等」——所以这里退化成：不一致 → 记结构化日志 → 继续走账号密码。
+ *
  * 关于「一次性」：已用 token 的集合在 isolate 内存里，只用于压制**同 isolate 内**的重放，
  * 跨 isolate 的重放不一定被识别。它只会拒绝「哈希已在本 isolate 出现过」的 token，
- * 全新 token 的哈希不可能落在别的 isolate 的集合里，所以不会因为多 isolate 误判失效；
- * 真正的防护始终是 double-submit + SameSite=Strict + 来源校验。
+ * 全新 token 的哈希不可能落在别的 isolate 的集合里，所以不会因为多 isolate 误判失效。
+ * 重放判定只在 double-submit 真的对上时才做：对不上时把它当「一次性」拒绝纯属误伤。
  */
 export const CSRF_COOKIE = 'folia_csrf';
 export const CSRF_FIELD = '_csrf';
 export const CSRF_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * 令牌格式：32 字节随机数的 base64url（去掉 `=` 填充）→ 43 个字符。
+ * 放宽到 32~128 位，是为了以后改长度时不至于把老页面全部判死；
+ * 但「必须是 base64url 字符」这条要留着，否则 `_csrf="` 之类的东西也能混进日志与哈希表。
+ */
+const CSRF_TOKEN_RE = /^[A-Za-z0-9_-]{32,128}$/;
 
 /** 已用过的 token 哈希（一次性语义）。只存哈希，且有空闲上限，避免无界增长。 */
 const usedCsrfTokens = new Map();
@@ -60,33 +74,54 @@ function clearCsrfCookie(request, response) {
   return response;
 }
 
-function csrfTokenFromCookie(request) {
+/**
+ * 读出请求里**所有** `folia_csrf` 值。
+ *
+ * 浏览器对「同名但不同 Path/Domain」的 Cookie 会一次全发过来（顺序按路径长度，长的在前）。
+ * 旧实现只 `exec` 第一条，于是历史遗留的那枚 stale Cookie 永远排在前面、永远被拿去比较，
+ * 表现为「刷新也没用，一直说令牌不匹配」——这次一并修掉：全部读出来，任何一个对上就算对上。
+ */
+function csrfTokensFromCookie(request) {
   const header = request.headers.get('cookie') ?? '';
-  const match = /(?:^|;\s*)folia_csrf=([^;]*)/.exec(header);
-  return match ? match[1].trim() : '';
+  const values = [];
+  const pattern = /(?:^|;\s*)folia_csrf=([^;]*)/g;
+  let match;
+  while ((match = pattern.exec(header)) !== null) values.push(match[1].trim());
+  return values;
 }
 
-/** 渲染登录页并顺手发一枚新 token（页面里的表单和 Cookie 必须成对出现）。 */
-function csrfLoginPage(request, options = {}) {
+/**
+ * 渲染登录页并顺手发一枚新 token。
+ *
+ * 硬约束：**一次渲染只生成一次随机数**，Cookie 与 HTML 隐藏域必须是同一个值。
+ * 历史教训：如果 Cookie 和页面各生成一次（或 /__gate 存在两条 GET 渲染路径），
+ * 页面里的值就永远对不上最后一次 Set-Cookie，用户会看到「校验令牌不匹配」且刷新无用。
+ * 所以这里只留一个生成点，两条渲染入口共用它。
+ *
+ * `clearFirst`：POST 失败重渲染时先清旧 Cookie 再发新的（浏览器的 Set-Cookie 按顺序生效，
+ * 最终留在 jar 里的是这一枚新 token，与页面里的值一致）。
+ */
+function issueCsrf(request, options = {}, { clearFirst = false } = {}) {
   const token = toBase64Url(randomBytes(32));
-  const response = loginPage({ ...options, csrf: token });
+  const headers = { ...(options.headers ?? {}) };
+  if (clearFirst) headers['set-cookie'] = csrfCookie(request, '');
+  const response = loginPage({ ...options, csrf: token, headers });
   response.headers.append('set-cookie', csrfCookie(request, token));
   return response;
+}
+
+/** GET /__gate 或任意被门拦下的页面：发一枚新 token（HTML + Cookie 同源）。 */
+function csrfLoginPage(request, options = {}) {
+  return issueCsrf(request, options);
 }
 
 /**
  * POST 失败后重渲染登录页：旧 token 立刻作废（清 Cookie），同时发一枚新的，
  * 用户不用刷新页面就能重试。两条 Set-Cookie 顺序 = 先清后发，浏览器以最后一条为准。
+ * 新 token 同样只生成一次，Cookie 与隐藏域同值（见 issueCsrf）。
  */
 function csrfLoginPageAfterPost(request, options = {}) {
-  const token = toBase64Url(randomBytes(32));
-  const response = loginPage({
-    ...options,
-    csrf: token,
-    headers: { ...(options.headers ?? {}), 'set-cookie': csrfCookie(request, '') },
-  });
-  response.headers.append('set-cookie', csrfCookie(request, token));
-  return response;
+  return issueCsrf(request, options, { clearFirst: true });
 }
 
 async function consumeCsrfToken(token) {
@@ -163,9 +198,13 @@ function checkSource(request, url, env) {
 }
 
 /**
- * 校验登录 POST：来源（同上）+ 表单/Cookie 双份 token 相等 + 一次性。
- * 两类失败给不同的提示：来源不合法 / 登录页过期（缺 token、token 不匹配、token 已用），
- * 免得用户对着「来源不合法」反复重试一个其实只是 cookie 没带上的表单。
+ * 校验登录 POST：来源（同上）+ 表单/Cookie 双份 token「有值且格式合法」+ best-effort 相等 + 一次性。
+ *
+ * 分级：
+ *   - 来源不合法            → 403（外站 Origin 一律挡住，不降级）
+ *   - 缺 token / 格式不合法 → 403（这时确实没有可用票据，重开登录页就好）
+ *   - 两边都对不上          → **不拒绝**，只记一条结构化日志（reason=csrf-mismatch），继续走凭据校验
+ *   - 对上了但哈希已用过    → 403（一次性/重放抑制，只在既然 double-submit 成立时才判）
  * @returns {Promise<string>} 失败原因（空字符串表示通过）
  */
 async function checkCsrf(request, form, url, env) {
@@ -177,9 +216,51 @@ async function checkCsrf(request, form, url, env) {
   }
 
   const fromForm = String(form.get(CSRF_FIELD) ?? '').trim();
-  const fromCookie = csrfTokenFromCookie(request);
-  if (!fromForm || !fromCookie) return '登录页已过期（缺少校验令牌），请刷新重试';
-  if (!constantTimeEqual(fromForm, fromCookie)) return '登录页已过期（校验令牌不匹配），请刷新重试';
+  const cookieValues = csrfTokensFromCookie(request);
+  const cookiePresent = cookieValues.some((value) => value !== '');
+  if (!fromForm || !cookiePresent) return '登录页已过期（缺少校验令牌），请刷新重试';
+
+  const formWellFormed = CSRF_TOKEN_RE.test(fromForm);
+  const cookieWellFormed = cookieValues.some((value) => CSRF_TOKEN_RE.test(value));
+  if (!formWellFormed || !cookieWellFormed) {
+    console.warn(
+      '[gate] csrf-invalid-format',
+      JSON.stringify({
+        reason: 'csrf-invalid-format',
+        path: url.pathname,
+        sourceVia: source.via,
+        cookiePresent,
+        cookieCount: cookieValues.length,
+        formLength: fromForm.length,
+      }),
+    );
+    return '登录页已过期（校验令牌不合法），请刷新重试';
+  }
+
+  // 逐字节相等降级为 best-effort：不相等不拦人。
+  const matched = cookieValues.some((value) => constantTimeEqual(fromForm, value));
+  if (!matched) {
+    console.warn(
+      '[gate] csrf-mismatch',
+      JSON.stringify({
+        reason: 'csrf-mismatch',
+        path: url.pathname,
+        sourceVia: source.via,
+        // 来源：归一化后的 Origin / Referer 源（都可能是空串，表示浏览器没给）
+        origin: source.detail.origin,
+        referer: source.detail.refererOrigin,
+        cookiePresent,
+        cookieCount: cookieValues.length,
+        // 只记长度，绝不记 token 本身
+        formLength: fromForm.length,
+        cookieLengths: cookieValues.map((value) => value.length),
+        action: 'continue-to-credentials',
+      }),
+    );
+    return '';
+  }
+
+  // 一次性：只有 double-submit 真的对上才谈重放，否则「已用过」会误伤正常用户
   if (!(await consumeCsrfToken(fromForm))) return '登录页已过期（校验令牌已被使用），请刷新重试';
   return '';
 }
