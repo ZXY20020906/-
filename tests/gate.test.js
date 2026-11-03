@@ -92,6 +92,19 @@ function makeContext(path, { method = 'GET', form, cookie, env, ip = '203.0.113.
 
 const loggedInCookie = `folia_session=${SESSION_TOKEN}; folia_device=${DEVICE_ID}`;
 
+/**
+ * 取一枚登录表单 CSRF：GET /__gate 会同时下发 folia_csrf Cookie 与表单隐藏域。
+ * 登录 POST 现在强制要求这一对（见 TODO-04），所以下面的登录用例必须先拿票。
+ */
+async function csrfPair(env, ip = '203.0.113.7') {
+  const { context } = makeContext('/__gate', { env: env ?? makeEnv().env, ip });
+  const res = await gateMiddleware(context);
+  const cookie = (res.headers.getSetCookie().find((c) => c.startsWith('folia_csrf=')) ?? '').split(';')[0];
+  const html = await res.text();
+  const match = /name="_csrf" value="([^"]*)"/.exec(html);
+  return { cookie, token: match ? match[1] : '' };
+}
+
 beforeEach(() => resetAll());
 
 test('未登录：页面给登录页，未放行的接口给 site_locked', async () => {
@@ -206,9 +219,11 @@ test('停用账号即使一切匹配也进不来', async () => {
 
 test('登录成功：303 + 同时下发会话与设备两枚 Cookie', async () => {
   const { env } = makeEnv();
+  const csrf = await csrfPair(env);
   const { context } = makeContext('/__gate', {
     method: 'POST',
-    form: { email: EMAIL, password: PASSWORD, next: '/admin/' },
+    form: { email: EMAIL, password: PASSWORD, next: '/admin/', _csrf: csrf.token },
+    cookie: csrf.cookie,
     env,
   });
   const res = await gateMiddleware(context);
@@ -228,9 +243,11 @@ test('登录成功：303 + 同时下发会话与设备两枚 Cookie', async () =
 
 test('密码错误：留在登录页并提示', async () => {
   const { env } = makeEnv();
+  const csrf = await csrfPair(env);
   const { context } = makeContext('/__gate', {
     method: 'POST',
-    form: { email: EMAIL, password: 'wrong-password-123' },
+    form: { email: EMAIL, password: 'wrong-password-123', _csrf: csrf.token },
+    cookie: csrf.cookie,
     env,
   });
   const res = await gateMiddleware(context);
@@ -241,13 +258,23 @@ test('密码错误：留在登录页并提示', async () => {
 test('连续输错会限流', async () => {
   const { env } = makeEnv();
   for (let i = 0; i < 5; i += 1) {
+    const csrf = await csrfPair(env, '198.51.100.9');
     const { context } = makeContext('/__gate', {
-      method: 'POST', form: { email: EMAIL, password: 'wrong-password-123' }, env, ip: '198.51.100.9',
+      method: 'POST',
+      form: { email: EMAIL, password: 'wrong-password-123', _csrf: csrf.token },
+      cookie: csrf.cookie,
+      env,
+      ip: '198.51.100.9',
     });
     assert.equal((await gateMiddleware(context)).status, 401);
   }
+  const csrf = await csrfPair(env, '198.51.100.9');
   const blocked = makeContext('/__gate', {
-    method: 'POST', form: { email: EMAIL, password: 'wrong-password-123' }, env, ip: '198.51.100.9',
+    method: 'POST',
+    form: { email: EMAIL, password: 'wrong-password-123', _csrf: csrf.token },
+    cookie: csrf.cookie,
+    env,
+    ip: '198.51.100.9',
   });
   const res = await gateMiddleware(blocked.context);
   assert.equal(res.status, 429);
@@ -285,8 +312,12 @@ test('编辑会话也进不来：清会话并提示只有管理员', async () =>
 test('编辑账号登录被拒：不发会话、立刻销毁', async () => {
   const editorRow = { ...USER_ROW, id: 'usr_editor', email: 'editor@demo.test', role: 'editor' };
   const { env, find } = makeEnv({ user: editorRow });
+  const csrf = await csrfPair(env);
   const { context } = makeContext('/__gate', {
-    method: 'POST', form: { email: 'editor@demo.test', password: PASSWORD, next: '/' }, env,
+    method: 'POST',
+    form: { email: 'editor@demo.test', password: PASSWORD, next: '/', _csrf: csrf.token },
+    cookie: csrf.cookie,
+    env,
   });
   const res = await gateMiddleware(context);
   assert.equal(res.status, 403);

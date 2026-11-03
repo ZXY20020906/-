@@ -3,8 +3,9 @@
  * 权限只在 routes/* 里用 assertCan 判定，路由表不重复声明，避免两处规则打架。
  */
 import { assertSafeRequest, corsHeaders, failure, methodNotAllowed, preflight } from './http.js';
-import { readSession } from './session.js';
-import { HttpError, notFound, unauthorized } from '../core/errors.js';
+import { readSession, clientIp } from './session.js';
+import { hit } from './rate-limit.js';
+import { HttpError, notFound, tooManyRequests, unauthorized } from '../core/errors.js';
 import * as authRoutes from './routes/auth.js';
 import * as publicRoutes from './routes/public.js';
 import * as wallpaperRoutes from './routes/wallpapers.js';
@@ -103,13 +104,44 @@ function compile(definition) {
 
 const ROUTES = DEFINITIONS.map(compile);
 
+/**
+ * 公开接口缓存键的参数白名单。
+ *
+ * 为什么要这么干：缓存键原来是整个 url.toString()，于是 `?x=1` 这种随机参数
+ * 每次都能绕过边缘缓存、直接打到 D1 —— 一个脚本就能把库打满。
+ * 现在只把路由真正会读的参数按固定顺序拼回 key，未知参数一律丢弃。
+ *
+ * 注意「按固定顺序重新 append」而不是在原 URL 上 delete：URLSearchParams 的
+ * 顺序取决于请求方写法，同一个逻辑请求换一下参数顺序就会变成另一个 key。
+ *
+ * 列表来自 routes/public.js（wallpapers / tags / subtags / categories）实际读取的参数；
+ * `type` 是 /api/plugin/feed 自己的筛选参数，也必须留在 key 里，否则插件拿错清单。
+ */
+export const CACHE_PARAMS = [
+  'category', 'kind', 'q', 'sort', 'featured', 'page', 'cursor', 'limit', 'tag', 'aspect', 'subtag', 'type',
+];
+
+export function cacheKeyUrl(url) {
+  const normalized = new URL(url.origin + url.pathname);
+  for (const name of CACHE_PARAMS) {
+    for (const value of url.searchParams.getAll(name)) normalized.searchParams.append(name, value);
+  }
+  return normalized.toString();
+}
+
+/** 公开读接口的频率上限：每 IP 每分钟 120 次（isolate 内存计数，见 rate-limit.js 的局限说明）。 */
+export const PUBLIC_RATE = { max: 120, windowMs: 60 * 1000 };
+
 function match(method, pathname) {
+  // HEAD 与 GET 同义：HTTP 语义要求二者行为一致（只是不要 body）。
+  // 路由表只声明 GET，不映射的话 HEAD 探针会拿到 405，边缘缓存命中标记也没法验证（TASK §5 A7）。
+  const effective = method === 'HEAD' ? 'GET' : method;
   const byPath = [];
   for (const route of ROUTES) {
     const result = route.pattern.exec(pathname);
     if (!result) continue;
     byPath.push(route);
-    if (route.method !== method) continue;
+    if (route.method !== effective) continue;
     const params = {};
     route.keys.forEach((key, index) => {
       params[key] = decodeURIComponent(result[index + 1]);
@@ -149,6 +181,19 @@ export async function handle(request, env) {
       throw notFound('接口不存在');
     }
 
+    // 公开读接口限速（只对带 CORS 的公开 GET/HEAD 生效）。
+    // 这是 isolate 内存计数的兜底；真正抗打要在 Cloudflare 控制台给 /api/public/* 配 Rate Limiting 规则。
+    if (route.cors && (request.method === 'GET' || request.method === 'HEAD')) {
+      const rl = hit(`pub:${clientIp(request)}`, PUBLIC_RATE);
+      if (rl.limited) {
+        const limited = failure(tooManyRequests(`请求过于频繁，请 ${rl.retryAfter} 秒后再试`));
+        const headers = new Headers(limited.headers);
+        headers.set('retry-after', String(Math.max(1, rl.retryAfter)));
+        for (const [key, value] of Object.entries(corsHeaders(env))) headers.set(key, value);
+        return new Response(limited.body, { status: limited.status, headers });
+      }
+    }
+
     let actor = null;
     if (route.auth === 'session') {
       const session = await readSession(env, request);
@@ -157,20 +202,21 @@ export async function handle(request, env) {
     }
 
     // 公开只读接口在边缘缓存 30 秒：插件反复打开列表时不用每次都查 D1。
-    // 只缓存 GET 的公开路由，带身份的管理接口一律不缓存。
+    // 只缓存公开路由（GET/HEAD），带身份的管理接口一律不缓存。
+    // cacheKey 只吃白名单参数（cacheKeyUrl），未知 query 不会把缓存击穿。
     const edgeCacheable = route.cors
-      && request.method === 'GET'
+      && (request.method === 'GET' || request.method === 'HEAD')
       && typeof caches !== 'undefined'
       && caches.default;
-    const cacheKey = edgeCacheable ? new Request(url.toString(), { method: 'GET' }) : null;
+    const cacheKey = edgeCacheable ? new Request(cacheKeyUrl(url), { method: 'GET' }) : null;
 
     if (edgeCacheable) {
-      const hit = await caches.default.match(cacheKey);
-      if (hit) {
-        const headers = new Headers(hit.headers);
+      const cached = await caches.default.match(cacheKey);
+      if (cached) {
+        const headers = new Headers(cached.headers);
         for (const [key, value] of Object.entries(corsHeaders(env))) headers.set(key, value);
         headers.set('x-folia-edge', 'HIT');
-        return new Response(hit.body, { status: hit.status, headers });
+        return new Response(cached.body, { status: cached.status, headers });
       }
     }
 
@@ -181,7 +227,9 @@ export async function handle(request, env) {
       const headers = new Headers(final.headers);
       headers.set('cache-control', 'public, max-age=30, stale-while-revalidate=60');
       headers.set('x-folia-edge', 'MISS');
-      await caches.default.put(cacheKey, new Response(final.clone().body, { status: 200, headers }));
+      await caches.default.put(cacheKey, new Response(final.clone().body, { status: 200, headers: new Headers(headers) }));
+      // 回源响应也带 x-folia-edge: MISS，线上探针才能区分「回源」和「命中」
+      return new Response(final.body, { status: final.status, headers });
     }
 
     return final;

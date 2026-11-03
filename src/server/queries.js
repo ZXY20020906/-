@@ -108,6 +108,19 @@ export const Q = {
   markWallpaperVerified: `UPDATE wallpapers SET verified_at = ?, codec = ?, faststart = ? WHERE id = ?`,
   /** 对账发现问题时标记（公开接口据此过滤） */
   markWallpaperBroken: `UPDATE wallpapers SET verified_at = NULL, missing_reason = ? WHERE id = ?`,
+  /** 探测 codec/faststart 列是否已迁移：返回 2 行表示都在。 */
+  pragmaWallpaperColumns: `SELECT name FROM pragma_table_info('wallpapers') WHERE name IN ('codec', 'faststart')`,
+  /** 通用列探测（schema/013 的 content_fingerprint 用）：有行=列在 */
+  wallpaperColumnExists: `SELECT name FROM pragma_table_info('wallpapers') WHERE name = ? LIMIT 1`,
+  /** 通用表探测（schema/013 的 upload_usage 用）：有行=表在 */
+  tableExists: `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1`,
+  /** 大文件内容指纹：仅当 content_fingerprint 列存在时才查/写 */
+  wallpaperFingerprintTaken: `SELECT id, title FROM wallpapers WHERE content_fingerprint = ? LIMIT 1`,
+  updateWallpaperFingerprint: `UPDATE wallpapers SET content_fingerprint = ?, updated_at = ? WHERE id = ?`,
+  /** 上传配额计数（schema/013 的 upload_usage）：按天 + 账号累加字节数 */
+  uploadUsageGet: `SELECT bytes FROM upload_usage WHERE day = ? AND actor_id = ? LIMIT 1`,
+  uploadUsageAdd: `INSERT INTO upload_usage (day, actor_id, bytes) VALUES (?, ?, ?)
+    ON CONFLICT(day, actor_id) DO UPDATE SET bytes = bytes + excluded.bytes`,
   clearWallpaperAsset: `UPDATE wallpapers SET storage_key = NULL, mime = NULL, bytes = 0, width = NULL,
       height = NULL, sha256 = NULL, status = 'draft', updated_at = ? WHERE id = ?`,
   deleteWallpaper: `DELETE FROM wallpapers WHERE id = ?`,

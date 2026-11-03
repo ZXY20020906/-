@@ -5,11 +5,18 @@
  * 1. 设备绑定：登录时服务端再发一个随机 folia_device Cookie，库里只存它的 sha256。
  *    之后每个请求必须同时带上会话 Cookie 和设备 Cookie，且两者哈希匹配。
  *    只偷到一枚 folia_session（代理日志、截图、单条复制）用不了。
- * 2. 闲置超时：库里记 last_seen_at，超过 60 分钟没活动就要求重新登录；
- *    有活动时最多每分钟刷新一次，避免每个静态资源都写库。
+ * 2. 闲置超时：库里记 last_seen_at，闲置超过 SESSION_IDLE_MS（60 分钟）就要求重新登录；
+ *    有活动时最多每分钟刷新一次 last_seen_at，避免每个静态资源都写库。
+ *
+ * 过期口径（只有两条，别记混）：
+ * - 闲置过期：now - last_seen_at > SESSION_IDLE_MS（60 分钟）→ 删会话，要求重新登录；
+ * - 绝对过期：expires_at = 创建时间 + SESSION_TTL_MS（7 天）。touchSession 只刷新
+ *   last_seen_at，**不延长** expires_at，所以「7 天」是真正的绝对上限（滑动续期是刻意不做的：
+ *   会话一旦泄漏，最迟 7 天必然失效；改这个行为属于安全策略变更，需单独立项）。
  *
  * Cookie 策略：HttpOnly + SameSite=Lax + Path=/ + Secure（HTTPS），且不带 Max-Age，
- * 关掉浏览器就消失。
+ * 关掉浏览器就消失。「关浏览器消失」只是浏览器侧行为，**不等于服务端过期**：
+ * 服务端仍按上面的 60 分钟闲置 + 7 天绝对过期两条独立判定。
  */
 import { Q } from './queries.js';
 import { first, run } from './db.js';

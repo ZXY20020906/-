@@ -27,16 +27,16 @@ const NO_STORE = {
 export const PAGE_HEADERS = { ...NO_STORE, 'content-security-policy': CSP };
 
 /**
- * @param {{next?: string, error?: string, status?: number, retryAfter?: number, headers?: Record<string,string>}} [options]
+ * @param {{next?: string, error?: string, status?: number, retryAfter?: number, csrf?: string, headers?: Record<string,string>}} [options]
  * @returns {Response}
  */
-export function loginPage({ next = '/', error = '', status = 401, retryAfter = 0, headers: extra = {} } = {}) {
+export function loginPage({ next = '/', error = '', status = 401, retryAfter = 0, csrf = '', headers: extra = {} } = {}) {
   const headers = { ...PAGE_HEADERS, 'content-type': 'text/html; charset=utf-8', ...extra };
   if (status === 429) headers['retry-after'] = String(Math.max(1, Math.ceil(Number(retryAfter) || 60)));
-  return new Response(renderLoginPage({ next, error }), { status, headers });
+  return new Response(renderLoginPage({ next, error, csrf }), { status, headers });
 }
 
-export function renderLoginPage({ next = '/', error = '' } = {}) {
+export function renderLoginPage({ next = '/', error = '', csrf = '' } = {}) {
   const errorBlock = error ? `<p class="err" role="alert">${esc(error)}</p>` : '';
   return `<!doctype html>
 <html lang="zh-CN">
@@ -132,6 +132,7 @@ export function renderLoginPage({ next = '/', error = '' } = {}) {
                autocomplete="current-password" placeholder="••••••••">
       </div>
       <input type="hidden" name="next" value="${esc(next)}">
+      <input type="hidden" name="_csrf" value="${esc(csrf)}">
       <button type="submit">进入</button>
     </form>
     ${errorBlock}

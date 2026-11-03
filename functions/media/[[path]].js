@@ -28,7 +28,18 @@ function missing(message = '文件不存在') {
   });
 }
 
-function parseRange(header, size) {
+/**
+ * Range 解析：三态返回，避免调用方猜。
+ *
+ *   { range: {start, end} }  可以满足 → 206
+ *   { unsatisfiable: true }  语法合法但要不到（start >= size 或对象 0 字节）→ 416
+ *   null                     语法不合法 → 忽略 Range，照常回 200 全量
+ *
+ * 为什么要区分后两者：越界不能当成「没写 Range」——`bytes=999999999-` 退化成
+ * 200 + 整个文件，等于让客户端白拉几十 MB。HTTP 规范要求 416 + `content-range: bytes * /size`。
+ * 反过来 `bytes=5-2`（起止颠倒）属于语法错误，按规范忽略 Range 回 200 就行，不该 416。
+ */
+export function parseRange(header, size) {
   const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
   if (!match) return null;
   const startRaw = match[1];
@@ -37,6 +48,7 @@ function parseRange(header, size) {
 
   let start;
   let end;
+  let explicitEnd = false;
   if (!startRaw) {
     const suffix = Number(endRaw);
     if (!Number.isFinite(suffix) || suffix <= 0) return null;
@@ -44,12 +56,34 @@ function parseRange(header, size) {
     end = size - 1;
   } else {
     start = Number(startRaw);
+    explicitEnd = Boolean(endRaw);
     end = endRaw ? Number(endRaw) : size - 1;
   }
   if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
-  // 越界不是「没写 Range」，必须回 416 而不是 200 全量
-  if (start > end || start >= size) return { invalid: true };
-  return { start, end: Math.min(end, size - 1) };
+  // 空对象：任何 Range 都要不到内容
+  if (size === 0) return { unsatisfiable: true };
+  // 起点越界：必须在 start > end 之前判定，否则 `bytes=999999999-` 会被误判成语法错误而回 200 全量
+  if (start >= size) return { unsatisfiable: true };
+  // 两端都是显式数字但 start > end（`bytes=5-2`）→ 语法不合法，忽略 Range
+  if (explicitEnd && start > end) return null;
+  return { range: { start, end: Math.min(end, size - 1) } };
+}
+
+/**
+ * 416：body 必须为空，`content-range: bytes * /size` 让客户端知道真实大小。
+ * 不复用 missing()（那是 404），也不写进 caches.default（416 不该被缓存）。
+ */
+function rangeNotSatisfiable(size) {
+  return new Response(null, {
+    status: 416,
+    headers: {
+      'content-range': `bytes */${size}`,
+      'accept-ranges': 'bytes',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+      ...CORS,
+    },
+  });
 }
 
 export async function onRequestGet(context) {
@@ -100,15 +134,11 @@ export async function onRequestGet(context) {
     headers.set('content-disposition', `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`);
   }
 
-  const range = !wantsDownload && rangeHeader ? parseRange(rangeHeader, size) : null;
+  // 三态：unsatisfiable 先拦（416），合法区间才走 206，其余（语法不合法）忽略 Range
+  const parsed = !wantsDownload && rangeHeader ? parseRange(rangeHeader, size) : null;
+  if (parsed?.unsatisfiable) return rangeNotSatisfiable(size);
 
-  if (range && range.invalid) {
-    return new Response(null, {
-      status: 416,
-      headers: { ...CORS, 'accept-ranges': 'bytes', 'content-range': `bytes */${size}` },
-    });
-  }
-
+  const range = parsed?.range ?? null;
   if (range) {
     const partial = await env.BUCKET.get(key, { range: { offset: range.start, length: range.end - range.start + 1 } });
     if (!partial) return missing();

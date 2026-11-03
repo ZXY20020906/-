@@ -22,7 +22,8 @@ import {
   ALLOWED_MIME, limitForMime, kindMatchesMime, readDurationMs, readMediaMeta, readVideoInfo,
 } from '../../core/image-meta.js';
 import {
-  badRequest, conflict, internal, notFound, payloadTooLarge, storageVerifyFailed, unsupportedMedia,
+  badRequest, conflict, HttpError, internal, notFound, payloadTooLarge, storageVerifyFailed, tooManyRequests,
+  unsupportedMedia,
 } from '../../core/errors.js';
 import { created, json, readJson } from '../http.js';
 import { wallpaperDto } from '../dto.js';
@@ -31,6 +32,106 @@ import { newId, safeJsonParse, sampleFingerprint, sha256Bytes } from '../util.js
 import { buildReorderPlan, nextSortOrder } from '../../core/ordering.js';
 import { AUDIT_ACTION, writeAudit } from '../audit.js';
 import { allowedTagNames } from './tags.js';
+import { hit } from '../rate-limit.js';
+import { clientIp } from '../session.js';
+
+/** 大文件跳过完整 sha256 的阈值；测试可用 env.UPLOAD_HASH_LIMIT 调小来覆盖大文件分支。 */
+export const HASH_LIMIT = 40 * 1024 * 1024;
+const DEFAULT_DAILY_BYTES = 1024 * 1024 * 1024;
+
+/**
+ * 上传限流：账号级 30 次/小时 + IP 级 60 次/小时，两层都要有。
+ * 只做账号级的话，一个账号换 IP 就能绕过；只做 IP 级的话，同 IP 上多个账号会互相顶。
+ * 已知局限：rate-limit.js 是 isolate 内存计数，不是全局配额（Cloudflare 控制台的
+ * Rate Limiting 规则才是真正的兜底）。
+ */
+export const UPLOAD_ACTOR_MAX = 30;
+export const UPLOAD_IP_MAX = 60;
+const UPLOAD_WINDOW_MS = 60 * 60 * 1000;
+
+function assertUploadRate(actor, request) {
+  const byActor = hit(`upload:${actor.id}`, { max: UPLOAD_ACTOR_MAX, windowMs: UPLOAD_WINDOW_MS });
+  if (byActor.limited) throw tooManyRequests(`上传过于频繁，请 ${byActor.retryAfter} 秒后再试`);
+  const byIp = hit(`upload-ip:${clientIp(request)}`, { max: UPLOAD_IP_MAX, windowMs: UPLOAD_WINDOW_MS });
+  if (byIp.limited) throw tooManyRequests(`上传过于频繁，请 ${byIp.retryAfter} 秒后再试`);
+}
+
+/**
+ * upload_usage 表来自 schema/013。缺表时只降级（跳过配额记账并 warn 一次），
+ * 绝不让上传 500 —— 和 codec/faststart 的探测一个模式。
+ */
+let uploadUsageReady = null;
+let warnedNoUsageTable = false;
+async function supportsUploadUsage(env) {
+  if (uploadUsageReady === true) return true;
+  try {
+    const rows = await all(env, Q.tableExists, 'upload_usage');
+    if (rows.length > 0) {
+      uploadUsageReady = true;
+      return true;
+    }
+    if (!warnedNoUsageTable) {
+      warnedNoUsageTable = true;
+      console.warn('[upload] 没有 upload_usage 表（schema/013 未执行），跳过每日配额记账');
+    }
+    return false;
+  } catch (error) {
+    if (!warnedNoUsageTable) {
+      warnedNoUsageTable = true;
+      console.warn('[upload] 探测 upload_usage 表失败，跳过每日配额记账', error?.message ?? error);
+    }
+    return false;
+  }
+}
+
+function usageDay(now = Date.now()) {
+  return new Date(now).toISOString().slice(0, 10);
+}
+
+/** 每日字节配额（默认 1 GiB / 账号 / 天，env.UPLOAD_DAILY_BYTES 可调）。 */
+async function assertDailyQuota(env, actor, bytes) {
+  if (!(await supportsUploadUsage(env))) return;
+  const limit = Number(env.UPLOAD_DAILY_BYTES ?? DEFAULT_DAILY_BYTES) || DEFAULT_DAILY_BYTES;
+  try {
+    const used = Number((await first(env, Q.uploadUsageGet, usageDay(), actor.id))?.bytes ?? 0);
+    if (used + bytes > limit) {
+      throw tooManyRequests('今天的上传容量已经用完，请明天再试');
+    }
+  } catch (error) {
+    // 429 必须原样抛出去；其余（查库失败）只降级，不能让容量统计把上传卡死
+    if (error instanceof HttpError) throw error;
+    console.warn('[upload] 读取上传用量失败，跳过配额校验', error?.message ?? error);
+  }
+}
+
+/** 记账失败不阻断上传：容量统计是审计用途，不能反过来把文件卡住。 */
+async function recordDailyUsage(env, actor, bytes) {
+  if (!(await supportsUploadUsage(env))) return;
+  try {
+    await run(env, Q.uploadUsageAdd, usageDay(), actor.id, bytes);
+  } catch (error) {
+    console.warn('[upload] 记录上传用量失败', error?.message ?? error);
+  }
+}
+
+/**
+ * content_fingerprint 列来自 schema/013。列不在就跳过指纹去重（老库照常能传）。
+ * 只缓存「有」这个结果：缺列时保持每次探测，避免测试/灰度环境切换后被永久写死。
+ */
+let fingerprintColumnReady = null;
+async function supportsFingerprintColumn(env) {
+  if (fingerprintColumnReady === true) return true;
+  try {
+    const rows = await all(env, Q.wallpaperColumnExists, 'content_fingerprint');
+    if (rows.length > 0) {
+      fingerprintColumnReady = true;
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
 
 function likePattern(raw) {
   if (!raw) return null;
@@ -193,6 +294,7 @@ export async function upload({ env, actor, request, params }) {
   const row = await loadWallpaper(env, params.id);
   assertCan(actor, ACTION.ASSET_UPLOAD);
   assertCan(actor, ACTION.WALLPAPER_UPDATE, row);
+  assertUploadRate(actor, request);
 
   const declared = Number(request.headers.get('content-length') ?? 0);
   if (declared && declared > MAX_UPLOAD_BYTES) {
@@ -212,17 +314,21 @@ export async function upload({ env, actor, request, params }) {
   if (bytes.byteLength > limitForMime(meta.mime)) {
     throw payloadTooLarge(`${meta.mime} 最大 ${Math.round(limitForMime(meta.mime) / 1024 / 1024)} MB`);
   }
+
+  // 每日字节配额：先校验再写盘，超了直接 429，别等 90MB 传完才拒
+  await assertDailyQuota(env, actor, bytes.byteLength);
+
   // 类型不再让人手选：传视频就是动态、传图片就是静态；
   // zip 保留原来的类型（皮肤包是静态，开机动画包是动态）。
   const nextKind = meta.mime.startsWith('video/')
     ? 'dynamic'
     : meta.mime.startsWith('image/') ? 'static' : row.kind;
 
-  // 大文件跳过哈希：Worker 内存只有 128MB，对 80MB+ 的文件再算一遍 sha256 容易被打爆。
-  // 代价是超大资源包不做去重，可以接受。
-  const HASH_LIMIT = 40 * 1024 * 1024;
+  // 大文件跳过完整 sha256：Worker 内存只有 128MB，对 80MB+ 的文件再算一遍 sha256 容易被打爆。
+  // 也不能拿 Date.now() 当 key —— 那样同一个文件每次上传都是新对象，R2 里只会堆垃圾。
+  const hashLimit = Number(env.UPLOAD_HASH_LIMIT ?? HASH_LIMIT) || HASH_LIMIT;
   let sha = null;
-  if (bytes.byteLength <= HASH_LIMIT) {
+  if (bytes.byteLength <= hashLimit) {
     sha = await sha256Bytes(bytes);
     const duplicate = await first(env, Q.wallpaperShaTaken, sha);
     if (duplicate && duplicate.id !== row.id) {
@@ -230,8 +336,18 @@ export async function upload({ env, actor, request, params }) {
     }
   }
 
-  // 大文件没有完整 sha，用采样指纹做 key，避免 Date.now() 导致每次上传都生成新 URL
+  // 大文件没有完整 sha，用「首 1MB + 尾 1MB」的采样指纹做内容寻址：
+  // 同一个文件稳定得到同一个 key（能去重、URL 不会每次都变），内容变了 key 基本必变。
   const keySeed = sha ?? await sampleFingerprint(bytes);
+
+  // 指纹去重：只在 content_fingerprint 列存在时生效（schema/013；老库跳过）
+  if (!sha && (await supportsFingerprintColumn(env))) {
+    const duplicate = await first(env, Q.wallpaperFingerprintTaken, keySeed);
+    if (duplicate && duplicate.id !== row.id) {
+      throw conflict('这个文件已经在库里了', { wallpaperId: duplicate.id, title: duplicate.title });
+    }
+  }
+
   const key = assetKey(row.id, keySeed, meta.mime);
   await putAsset(env, key, bytes, meta.mime);
 
@@ -257,6 +373,19 @@ export async function upload({ env, actor, request, params }) {
     nowMs(), videoInfo.codec, videoInfo.faststart, row.id,
   );
 
+  // 大文件的内容指纹单独落进 content_fingerprint（schema/013；列不在就跳过）。
+  // 刻意不写进 sha256：那一列是对外输出的真 sha256，写个采样值会让 dto 说谎。
+  if (!sha && (await supportsFingerprintColumn(env))) {
+    try {
+      await run(env, Q.updateWallpaperFingerprint, keySeed, nowMs(), row.id);
+    } catch (error) {
+      console.warn('[upload] 写入 content_fingerprint 失败', error?.message ?? error);
+    }
+  }
+
+  // 配额记账放在落盘校验通过之后：失败的上传不该占用户当天的额度
+  await recordDailyUsage(env, actor, check.size);
+
   await writeAudit(env, {
     actor,
     action: AUDIT_ACTION.WALLPAPER_ASSET,
@@ -278,6 +407,8 @@ export async function uploadThumb({ env, actor, request, params }) {
   const row = await loadWallpaper(env, params.id);
   assertCan(actor, ACTION.ASSET_UPLOAD);
   assertCan(actor, ACTION.WALLPAPER_UPDATE, row);
+  // 缩略图也计入同一套限流与配额：否则可以靠反复传小图把 R2 写爆
+  assertUploadRate(actor, request);
 
   const MAX = 2 * 1024 * 1024;
   const declared = Number(request.headers.get('content-length') ?? 0);
@@ -291,6 +422,8 @@ export async function uploadThumb({ env, actor, request, params }) {
   const meta = readMediaMeta(bytes);
   if (!meta.mime || !meta.mime.startsWith('image/')) throw unsupportedMedia('缩略图必须是图片');
 
+  await assertDailyQuota(env, actor, bytes.byteLength);
+
   const sha = await sha256Bytes(bytes);
   const key = thumbKey(row.id, sha, meta.mime);
   await putAsset(env, key, bytes, meta.mime);
@@ -301,6 +434,7 @@ export async function uploadThumb({ env, actor, request, params }) {
   }
   if (row.thumb_key && row.thumb_key !== key) await deleteAsset(env, row.thumb_key);
   await run(env, Q.updateWallpaperThumb, key, nowMs(), row.id);
+  await recordDailyUsage(env, actor, bytes.byteLength);
 
   return json({ thumbUrl: `/media/${key}`, width: meta.width, height: meta.height });
 }

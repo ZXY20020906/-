@@ -15,13 +15,14 @@ import { all, count, first, run } from '../db.js';
 import { nowMs } from '../db.js';
 import { ACTION, assertCan, ROLE } from '../../core/permissions.js';
 import { cleanId, parseMemberCreate, parseMemberPatch } from '../../core/validate.js';
-import { badRequest, conflict, forbidden, notFound } from '../../core/errors.js';
+import { badRequest, conflict, forbidden, notFound, tooManyRequests } from '../../core/errors.js';
 import { created, json, readJson } from '../http.js';
 import { userDto } from '../dto.js';
 import { hashPassword } from '../password.js';
 import { destroyAllSessions } from '../session.js';
 import { AUDIT_ACTION, writeAudit } from '../audit.js';
-import { constantTimeEqual, newId, sha256Hex } from '../util.js';
+import { newId, constantTimeEqual, sha256Hex } from '../util.js';
+import { hit } from '../rate-limit.js';
 
 async function loadMember(env, id) {
   const row = await first(env, Q.userById, cleanId(id, 'id'));
@@ -139,11 +140,16 @@ export async function remove({ env, actor, request, params }) {
     throw forbidden('站点还没配置删除口令：在 Cloudflare Pages 项目里设置 ADMIN_PASSCODE 后重试');
   }
 
+  // 口令爆破限流：15 分钟内最多 5 次（放在读 body 之前，省得先解析一遍请求体；
+  // 也放在「是否配置口令」之后 —— 配置缺失是运维问题，不该烧掉用户的尝试次数）
+  const rl = hit(`passcode:${actor.id}`, { max: 5, windowMs: 15 * 60 * 1000 });
+  if (rl.limited) throw tooManyRequests(`口令尝试过于频繁，请 ${rl.retryAfter} 秒后再试`);
+
   const body = await readJson(request);
   const given = typeof body.passcode === 'string' ? body.passcode.trim() : '';
   if (!given) throw badRequest('删除成员需要输入删除口令', { field: 'passcode' });
 
-  // 两边都过一遍 sha256 再比，避免按字符比较泄时间
+  // 两边都过一遍 sha256 再比（长度固定），比较本身用常量时间，避免逐字节短路泄时间
   const [givenHash, expectedHash] = await Promise.all([sha256Hex(given), sha256Hex(expected)]);
   if (!constantTimeEqual(givenHash, expectedHash)) {
     await writeAudit(env, {
