@@ -1,0 +1,272 @@
+/* 编辑模式：画廊变成工作台时才会用到的样式。
+   没权限的成员根本看不到这些元素（JS 不渲染），这里的规则也只在 body.editing 下生效。 */
+
+/* ------------------------------------------------------------ 顶栏开关 */
+.edit-toggle.active {
+  color: #fff;
+  background: rgba(124, 108, 255, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(124, 108, 255, 0.4);
+}
+
+/* ------------------------------------------------------------ 底部工具条 */
+.edit-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(124, 108, 255, 0.35);
+  background: rgba(18, 18, 24, 0.92);
+  box-shadow: 0 18px 40px -18px rgba(0, 0, 0, 0.9);
+  backdrop-filter: blur(10px);
+}
+
+.edit-bar[hidden] { display: none; }
+
+.edit-bar-label {
+  padding: 0 10px;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  color: #b9b2ff;
+  white-space: nowrap;
+}
+
+.edit-bar-btn {
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 6px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.edit-bar-btn:hover { background: rgba(124, 108, 255, 0.22); }
+.edit-bar-btn.ghost { background: transparent; color: var(--muted); }
+.edit-bar-btn.ghost:hover { color: var(--text); }
+
+/* ------------------------------------------------------------ 卡片上的操作 */
+.card-admin {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+.card:hover .card-admin,
+.card:focus-within .card-admin { opacity: 1; transform: none; }
+
+.admin-tool {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--text);
+  background: rgba(10, 10, 12, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+}
+
+.admin-tool:hover { background: rgba(124, 108, 255, 0.85); border-color: transparent; }
+.admin-tool.danger:hover { background: rgba(248, 113, 113, 0.9); }
+
+.admin-status {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 2px 8px;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--text);
+  background: rgba(10, 10, 12, 0.8);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  pointer-events: none;
+}
+
+.admin-status[data-state="draft"] { color: #fbbf24; border-color: rgba(251, 191, 36, 0.45); }
+.admin-status[data-state="hidden"] { color: var(--muted); }
+
+/* 编辑模式下类型角标让位给操作按钮：类型在标签和模块里也能看出来 */
+body.editing .card > .badge { display: none; }
+
+@media (hover: none) {
+  .card-admin { opacity: 1; transform: none; }
+  body.editing .like-btn { display: none; }
+}
+
+/* 编辑模式下收藏按钮会挡住操作条，先让位 */
+body.editing .like-btn { opacity: 0; pointer-events: none; }
+
+/* 公开接口才认排序 / 标签 / 分辨率筛选，编辑模式下先藏起来，避免界面说谎 */
+body.editing #filters,
+body.editing .sort-field { display: none; }
+
+/* ------------------------------------------------------------ 弹层 */
+.sheet {
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--bg-soft);
+  color: var(--text);
+  width: min(560px, calc(100vw - 32px));
+  max-height: calc(100vh - 80px);
+  overflow: auto;
+}
+
+.sheet::backdrop { background: rgba(0, 0, 0, 0.66); backdrop-filter: blur(3px); }
+
+.sheet > form { display: grid; gap: 12px; padding: 22px; }
+.sheet h3 { font-size: 16px; }
+
+.field-row,
+.check-row,
+.drop-file {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.check-row { grid-template-columns: auto 1fr; align-items: center; }
+
+.field-row input,
+.field-row select,
+.cat-create input,
+.cat-name {
+  width: 100%;
+  font: inherit;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 9px 12px;
+  outline: none;
+}
+
+.field-row input:focus,
+.field-row select:focus,
+.cat-create input:focus,
+.cat-name:focus { border-color: var(--accent); }
+
+.drop-file {
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  padding: 18px;
+  text-align: center;
+}
+
+.sheet-hint { margin: 0; font-size: 12px; color: var(--muted); }
+
+.sheet footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+
+.btn {
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg-card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 14px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn:hover { border-color: #3a3f4e; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.danger { border-color: #4a2a2a; color: var(--danger); }
+.btn.ghost { background: transparent; }
+.btn.small { padding: 4px 9px; font-size: 12px; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.tag-pick {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+
+.tag-pick legend { font-size: 12px; color: var(--muted); padding: 0 4px; }
+.tag-pick-item { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
+
+.upload-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  max-height: 160px;
+  overflow: auto;
+}
+
+.upload-list li.ok { color: var(--ok); }
+.upload-list li.bad { color: var(--danger); }
+
+/* ------------------------------------------------------------ 分类管理 */
+.sheet-wide { width: min(720px, calc(100vw - 32px)); }
+
+.cat-manage { padding: 20px 22px; display: grid; gap: 12px; }
+.cat-manage header { display: flex; align-items: center; justify-content: space-between; }
+.cat-manage-list { display: grid; gap: 6px; }
+
+.cat-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg-card);
+}
+
+.cat-order { display: flex; gap: 2px; }
+
+.icon-btn {
+  font: inherit;
+  font-size: 12px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  width: 24px;
+  height: 24px;
+  cursor: pointer;
+}
+
+.icon-btn:hover { color: var(--text); background: rgba(255, 255, 255, 0.08); }
+.icon-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.icon-btn.danger:hover { color: var(--danger); background: rgba(248, 113, 113, 0.12); }
+
+.cat-main { display: grid; gap: 2px; min-width: 0; }
+.cat-meta { font-size: 11px; color: var(--muted); }
+.cat-public { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+
+.cat-create { display: flex; gap: 8px; }
+.cat-create input { flex: 1; }
+
+@media (max-width: 640px) {
+  .edit-bar { left: 12px; right: 12px; transform: none; overflow-x: auto; }
+  .cat-row { grid-template-columns: auto 1fr auto; }
+  .cat-public { grid-column: 2 / -1; }
+}

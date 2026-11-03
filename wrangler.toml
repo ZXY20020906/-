@@ -1,0 +1,25 @@
+# 如果你已有 wrangler.toml / wrangler.jsonc，不要直接覆盖：把下面三段合并进去即可。
+name = "folia"
+compatibility_date = "2026-09-01"
+pages_build_output_dir = "./public"
+
+# 壁纸元数据、账号、分类、审计日志
+[[d1_databases]]
+binding = "DB"
+database_name = "folia"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+# 壁纸原图 / 视频
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "folia-wallpapers"
+
+[vars]
+# 线上站点来源，用于校验管理接口的 Origin
+PUBLIC_ORIGIN = "https://folia-major-3t6.pages.dev"
+# 可选：给 R2 绑自定义域名后填在这里，媒体直链就会走它（省 Worker 请求）。
+# 留空则回落到 /media/<key>，由 Worker 从 R2 出图。
+# MEDIA_BASE = "https://img.example.com"
+
+# 密钥不要写在这里，用命令行设置：
+#   wrangler pages secret put BOOTSTRAP_TOKEN

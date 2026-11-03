@@ -1,0 +1,16 @@
+{
+  "name": "folia-admin",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Folia 壁纸库：壁纸新增/管理、分类维护与角色权限模块（Cloudflare Pages Functions + D1 + R2）",
+  "scripts": {
+    "test": "node tools/run-tests.mjs",
+    "check": "node tools/check-syntax.mjs && node tools/check-ui.mjs",
+    "check:sql": "node tools/dump-queries.mjs && python tools/check-sql.py",
+    "import": "node tools/import-wallpapers.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

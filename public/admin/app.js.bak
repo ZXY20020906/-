@@ -1,0 +1,1502 @@
+/* Folia 壁纸管理后台 —— 无构建、无依赖，直接由 Pages 静态托管。 */
+(() => {
+  'use strict';
+
+  const state = {
+    user: null,
+    view: 'wallpapers',
+    categories: [],
+    wallpapers: { items: [], total: 0 },
+    members: [],
+    audit: [],
+    filters: { q: '', status: '', kind: '', categoryId: '' },
+    tagVocabulary: [],
+    booted: false,
+  };
+
+  // --------------------------------------------------------------- 基础工具
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+  const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  const esc = (value) => String(value === null || value === undefined ? '' : value)
+    .replace(/[&<>"']/g, (ch) => ESCAPES[ch]);
+
+  const ACCEPT = 'image/png,image/jpeg,image/webp,image/avif,image/gif,video/mp4,video/webm,application/zip,.zip';
+
+  function isBundleAsset(item) {
+    return item && item.mime === 'application/zip';
+  }
+
+  function thumbHtml(item) {
+    if (!item.url) return '<div class="thumb-empty">无文件</div>';
+    if (isBundleAsset(item)) return '<div class="thumb-bundle">ZIP</div>';
+    if (item.mime && item.mime.startsWith('video/')) {
+      return `<video class="thumb" src="${esc(item.url)}" muted playsinline preload="metadata"></video>`;
+    }
+    return `<img class="thumb" src="${esc(item.url)}" alt="" loading="lazy">`;
+  }
+
+  function formatDuration(ms) {
+    const value = Number(ms);
+    if (!Number.isFinite(value) || value <= 0) return '';
+    if (value < 60_000) return `${(value / 1000).toFixed(1)}s`;
+    return `${Math.floor(value / 60_000)}:${String(Math.round((value % 60_000) / 1000)).padStart(2, '0')}`;
+  }
+
+  function formatBytes(n) {
+    const value = Number(n || 0);
+    if (!value) return '—';
+    if (value < 1024) return `${value} B`;
+    if (value < 1024 * 1024) return `${(value / 1024).toFixed(0)} KB`;
+    return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  }
+
+  function formatTime(ms) {
+    if (!ms) return '—';
+    const d = new Date(Number(ms));
+    if (Number.isNaN(d.getTime())) return '—';
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  function debounce(fn, wait) {
+    let timer = null;
+    return (...args) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => fn(...args), wait);
+    };
+  }
+
+  const STATUS_LABEL = { published: '已发布', draft: '草稿', hidden: '已隐藏' };
+  /** 创意工坊的标签 → 站内四个标签的映射（没映射到的就不打标签） */
+  const WE_TAG_MAP = {
+    Anime: '动漫',
+    Cartoon: '动漫',
+    Game: '游戏',
+    Girls: '明星',
+    Girl: '明星',
+    Fantasy: '自然风景',
+    Nature: '自然风景',
+    Abstract: '自然风景',
+    Landscape: '自然风景',
+  };
+  const ROLE_LABEL = { admin: '管理员', editor: '编辑' };
+  const AUDIT_LABEL = {
+    'auth.login': '登录',
+    'auth.login_failed': '登录失败',
+    'auth.logout': '退出',
+    'auth.password_changed': '修改密码',
+    'auth.setup': '初始化',
+    'wallpaper.create': '新建壁纸',
+    'wallpaper.update': '更新壁纸',
+    'wallpaper.asset_upload': '上传文件',
+    'wallpaper.delete': '删除壁纸',
+    'wallpaper.reorder': '壁纸排序',
+    'category.create': '新建分类',
+    'category.update': '更新分类',
+    'category.delete': '删除分类',
+    'category.reorder': '分类排序',
+    'member.create': '新增成员',
+    'member.update': '更新成员',
+    'member.delete': '删除成员',
+  };
+
+  const isAdmin = () => Boolean(state.user && state.user.capabilities.includes('member:manage'));
+  const canPublish = () => Boolean(state.user && state.user.capabilities.includes('wallpaper:publish'));
+
+  // ------------------------------------------------------------------ 请求
+  async function api(path, options = {}) {
+    const { method = 'GET', body, raw = false, headers = {} } = options;
+    const init = {
+      method,
+      credentials: 'same-origin',
+      headers: { 'x-folia-client': 'admin', ...headers },
+    };
+    if (body !== undefined && !raw) {
+      init.headers['content-type'] = 'application/json';
+      init.body = JSON.stringify(body);
+    }
+    const response = await fetch(`/api${path}`, init);
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+    if (response.status === 401) {
+      state.user = null;
+      showAuth('login');
+      throw new Error('登录已过期，请重新登录');
+    }
+    if (!response.ok || !payload || payload.ok === false) {
+      const error = new Error((payload && payload.error && payload.error.message) || `请求失败（${response.status}）`);
+      error.status = response.status;
+      error.details = payload && payload.error ? payload.error.details : null;
+      error.code = payload && payload.error ? payload.error.code : null;
+      throw error;
+    }
+    return payload.data;
+  }
+
+  function putAsset(wallpaperId, file, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', `/api/admin/wallpapers/${encodeURIComponent(wallpaperId)}/asset`);
+      xhr.setRequestHeader('x-folia-client', 'admin');
+      xhr.setRequestHeader('content-type', file.type || 'application/octet-stream');
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable && onProgress) onProgress(event.loaded / event.total);
+      };
+      xhr.onload = () => {
+        let payload = null;
+        try {
+          payload = JSON.parse(xhr.responseText);
+        } catch {
+          payload = null;
+        }
+        if (xhr.status >= 200 && xhr.status < 300 && payload && payload.ok) {
+          resolve(payload.data);
+        } else {
+          const message = (payload && payload.error && payload.error.message) || `上传失败（${xhr.status}）`;
+          const error = new Error(message);
+          error.status = xhr.status;
+          error.details = payload && payload.error ? payload.error.details : null;
+          reject(error);
+        }
+      };
+      xhr.onerror = () => reject(new Error('网络中断，上传失败'));
+      xhr.send(file);
+    });
+  }
+
+  // ------------------------------------------------------------------ 提示
+  function toast(message, kind = 'info', ttl = 4000) {
+    const node = document.createElement('div');
+    node.className = `toast ${kind}`;
+    node.textContent = message;
+    $('#toasts').appendChild(node);
+    setTimeout(() => {
+      node.style.opacity = '0';
+      setTimeout(() => node.remove(), 200);
+    }, ttl);
+  }
+
+  function reportError(error) {
+    if (!error || !state.user) return;
+    toast(error.message || '操作失败', 'error', 6000);
+  }
+
+  // ------------------------------------------------------------------ 弹窗
+  function openDialog(html, onMount) {
+    const dialog = $('#dialog');
+    dialog.innerHTML = html;
+    if (typeof dialog.showModal === 'function') dialog.showModal();
+    else dialog.setAttribute('open', '');
+    if (onMount) onMount(dialog);
+    return dialog;
+  }
+
+  function closeDialog() {
+    const dialog = $('#dialog');
+    if (typeof dialog.close === 'function') dialog.close();
+    else dialog.removeAttribute('open');
+    dialog.innerHTML = '';
+  }
+
+  // ------------------------------------------------------------------ 认证
+  function showAuth(mode) {
+    $('#boot').classList.add('hidden');
+    $('#app').classList.add('hidden');
+    $('#auth').classList.remove('hidden');
+    const isSetup = mode === 'setup';
+    $('#login-form').classList.toggle('hidden', isSetup);
+    $('#setup-form').classList.toggle('hidden', !isSetup);
+    $('#auth-hint').textContent = isSetup
+      ? '第一次使用：创建第一位管理员。令牌就是你在 Cloudflare 设置的 BOOTSTRAP_TOKEN。'
+      : '用管理员或编辑账号登录';
+    const focus = isSetup ? $('#setup-token') : $('#login-email');
+    if (focus) focus.focus();
+  }
+
+  async function boot() {
+    try {
+      const meta = await api('/meta');
+      if (!meta.initialized) {
+        showAuth('setup');
+        return;
+      }
+    } catch {
+      /* 探测失败就按已初始化处理，让登录报错更直接 */
+    }
+    try {
+      const me = await api('/auth/me');
+      state.user = me.user;
+      await enterApp();
+    } catch {
+      showAuth('login');
+    }
+  }
+
+  async function doLogin(event) {
+    event.preventDefault();
+    const button = $('#login-form button[type="submit"]');
+    button.disabled = true;
+    button.textContent = '登录中…';
+    try {
+      const data = await api('/auth/login', {
+        method: 'POST',
+        body: { email: $('#login-email').value.trim(), password: $('#login-password').value },
+      });
+      state.user = data.user;
+      $('#login-password').value = '';
+      await enterApp();
+    } catch (error) {
+      toast(error.message, 'error', 5000);
+    } finally {
+      button.disabled = false;
+      button.textContent = '登录';
+    }
+  }
+
+  async function doSetup(event) {
+    event.preventDefault();
+    const button = $('#setup-form button[type="submit"]');
+    button.disabled = true;
+    button.textContent = '创建中…';
+    try {
+      const data = await api('/setup', {
+        method: 'POST',
+        body: {
+          token: $('#setup-token').value.trim(),
+          email: $('#setup-email').value.trim(),
+          name: $('#setup-name').value.trim(),
+          password: $('#setup-password').value,
+        },
+      });
+      state.user = data.user;
+      toast('管理员已创建', 'ok');
+      await enterApp();
+    } catch (error) {
+      toast(error.message, 'error', 6000);
+    } finally {
+      button.disabled = false;
+      button.textContent = '创建管理员';
+    }
+  }
+
+  async function enterApp() {
+    state.booted = true;
+    $('#auth').classList.add('hidden');
+    $('#boot').classList.add('hidden');
+    $('#app').classList.remove('hidden');
+    $('#who-name').textContent = state.user.name || state.user.email;
+    $('#who-role').textContent = `${ROLE_LABEL[state.user.role] || state.user.role} · ${state.user.email}`;
+    $$('.nav-item[data-admin-only]').forEach((node) => {
+      node.classList.toggle('hidden', !isAdmin());
+    });
+    // 标签词表是固定的，从公开接口取一次，避免前端再抄一份
+    try {
+      const vocabulary = await api('/public/tags');
+      state.tagVocabulary = (vocabulary.tags ?? []).map((entry) => entry.tag);
+    } catch {
+      state.tagVocabulary = [];
+    }
+    await loadCategories();
+    await switchView('wallpapers');
+  }
+
+  async function doLogout() {
+    try {
+      await api('/auth/logout', { method: 'POST' });
+    } catch {
+      /* 退出失败也让本地回到登录页 */
+    }
+    state.user = null;
+    showAuth('login');
+  }
+
+  function openPasswordDialog() {
+    openDialog(`
+      <form id="password-form">
+        <h3>修改密码</h3>
+        <p class="hint">修改后所有设备都需要重新登录。</p>
+        <label>当前密码<input id="pw-current" type="password" autocomplete="current-password" required></label>
+        <label>新密码<input id="pw-new" type="password" autocomplete="new-password" required minlength="10"></label>
+        <label>再输一次<input id="pw-confirm" type="password" autocomplete="new-password" required minlength="10"></label>
+        <footer>
+          <button type="button" class="btn ghost" data-close>取消</button>
+          <button type="submit" class="btn primary">保存</button>
+        </footer>
+      </form>
+    `, (dialog) => {
+      $('[data-close]', dialog).addEventListener('click', closeDialog);
+      $('#password-form', dialog).addEventListener('submit', async (event) => {
+        event.preventDefault();
+        if ($('#pw-new').value !== $('#pw-confirm').value) {
+          toast('两次输入的新密码不一致', 'error');
+          return;
+        }
+        try {
+          await api('/auth/password', {
+            method: 'POST',
+            body: { currentPassword: $('#pw-current').value, newPassword: $('#pw-new').value },
+          });
+          closeDialog();
+          toast('密码已更新', 'ok');
+        } catch (error) {
+          reportError(error);
+        }
+      });
+    });
+  }
+
+  // ------------------------------------------------------------------ 导航
+  async function switchView(view) {
+    if (!state.booted) return;
+    if ((view === 'members' || view === 'audit') && !isAdmin()) {
+      toast('只有管理员可以进入这一页', 'error');
+      return;
+    }
+    state.view = view;
+    $$('.nav-item').forEach((node) => node.classList.toggle('active', node.dataset.view === view));
+    const titles = { wallpapers: '壁纸', categories: '分类', members: '成员', audit: '审计日志' };
+    $('#view-title').textContent = titles[view] || view;
+    $('#view-actions').innerHTML = '';
+    $('#view').innerHTML = '<p class="muted">加载中…</p>';
+    try {
+      if (view === 'wallpapers') await mountWallpapers();
+      else if (view === 'categories') mountCategories();
+      else if (view === 'members') await mountMembers();
+      else if (view === 'audit') await mountAudit();
+    } catch (error) {
+      $('#view').innerHTML = `<p class="empty">${esc(error.message)}</p>`;
+    }
+  }
+
+  // ------------------------------------------------------------------ 分类数据
+  async function loadCategories() {
+    const data = await api('/admin/categories');
+    state.categories = data.categories;
+    return state.categories;
+  }
+
+  function categoryOptions(selectedId) {
+    const rows = state.categories.map(
+      (category) => `<option value="${esc(category.id)}"${category.id === selectedId ? ' selected' : ''}>${esc(category.name)}</option>`,
+    );
+    return `<option value=""${selectedId ? '' : ' selected'}>未分类</option>${rows.join('')}`;
+  }
+
+  // ------------------------------------------------------------------ 壁纸
+  async function mountWallpapers() {
+    $('#view-actions').innerHTML = `
+      <button class="btn" type="button" data-action="import-local">批量导入本地文件</button>
+      <button class="btn primary" type="button" data-action="new-wallpaper">＋ 新增作品</button>`;
+    $('#view').innerHTML = `
+      <div class="toolbar">
+        <input type="search" id="wp-q" placeholder="搜索标题…" value="${esc(state.filters.q)}">
+        <select id="wp-kind">
+          <option value="">全部类型</option>
+          <option value="static">静态</option>
+          <option value="dynamic">动态</option>
+        </select>
+        <select id="wp-cat"><option value="">全部分类</option></select>
+        <span class="spacer"></span>
+        <span class="muted small" id="wp-total"></span>
+      </div>
+      <div id="wp-table"><p class="muted">加载中…</p></div>
+    `;
+
+    $('#wp-cat').innerHTML = categoryOptions(state.filters.categoryId).replace('未分类', '全部分类');
+    $('#wp-kind').value = state.filters.kind;
+
+    $('#wp-q').addEventListener('input', debounce((event) => {
+      state.filters.q = event.target.value.trim();
+      loadWallpapers().catch(reportError);
+    }, 250));
+    $('#wp-kind').addEventListener('change', (event) => {
+      state.filters.kind = event.target.value;
+      loadWallpapers().catch(reportError);
+    });
+    $('#wp-cat').addEventListener('change', (event) => {
+      state.filters.categoryId = event.target.value;
+      loadWallpapers().catch(reportError);
+    });
+
+    await loadWallpapers();
+  }
+
+  async function loadWallpapers() {
+    const params = new URLSearchParams();
+    if (state.filters.q) params.set('q', state.filters.q);
+    if (state.filters.kind) params.set('kind', state.filters.kind);
+    if (state.filters.categoryId) params.set('categoryId', state.filters.categoryId);
+    // 不按状态过滤：一次取回，页面上分「已发布 / 草稿 / 已下线」三段展示
+    params.set('limit', '200');
+    const data = await api(`/admin/wallpapers?${params.toString()}`);
+    state.wallpapers = data;
+    const total = $('#wp-total');
+    if (total) total.textContent = `共 ${data.total} 条`;
+    renderWallpaperRows();
+  }
+
+  const STATUS_GROUPS = [
+    { key: 'published', label: '已发布' },
+    { key: 'draft', label: '草稿' },
+    { key: 'hidden', label: '已下线' },
+  ];
+
+  function wallpaperRowHtml(item) {
+    const thumb = thumbHtml(item);
+    const canEdit = isAdmin() || item.createdBy === state.user.id;
+    const actions = [];
+    if (canEdit) {
+      actions.push(`<button class="btn small" type="button" data-action="upload-wallpaper" data-id="${esc(item.id)}">${item.hasAsset ? '换文件' : '上传'}</button>`);
+      actions.push(`<button class="btn small" type="button" data-action="edit-wallpaper" data-id="${esc(item.id)}">编辑</button>`);
+    }
+    if (canPublish()) {
+      actions.push(item.status === 'published'
+        ? `<button class="btn small" type="button" data-action="unpublish" data-id="${esc(item.id)}">下线</button>`
+        : `<button class="btn small primary" type="button" data-action="publish" data-id="${esc(item.id)}">发布</button>`);
+    }
+    if (isAdmin()) {
+      actions.push(`<button class="btn small danger" type="button" data-action="delete-wallpaper" data-id="${esc(item.id)}">删除</button>`);
+    }
+    const catSelect = canEdit
+      ? `<select class="small" data-action="select-category" data-id="${esc(item.id)}">${categoryOptions(item.category ? item.category.id : '')}</select>`
+      : esc(item.category ? item.category.name : '未分类');
+    return `
+      <tr>
+        <td>${thumb}</td>
+        <td>
+          <div class="title-cell">
+            <strong>${esc(item.title)}</strong>
+            <code>${esc(item.slug)}</code>
+          </div>
+        </td>
+        <td class="hide-sm">${catSelect}</td>
+        <td><span class="badge ${esc(item.status)}">${esc(STATUS_LABEL[item.status] || item.status)}</span>${item.featured ? ' <span class="badge">置顶</span>' : ''}</td>
+        <td class="hide-sm">${item.width ? `${item.width}×${item.height}` : '—'}${item.durationMs ? ` · ${formatDuration(item.durationMs)}` : ''}<br><span class="muted small">${formatBytes(item.bytes)}</span></td>
+        <td class="hide-sm muted small">${esc(item.creatorEmail || '—')}</td>
+        <td class="actions">${actions.join('')}</td>
+      </tr>`;
+  }
+
+  function renderWallpaperRows() {
+    const host = $('#wp-table');
+    if (!host) return;
+    const items = state.wallpapers.items;
+    if (!items.length) {
+      host.innerHTML = '<p class="empty">还没有作品。点右上角「新增作品」或「批量导入本地文件」。</p>';
+      return;
+    }
+    host.innerHTML = STATUS_GROUPS.map((group) => {
+      const rows = items.filter((item) => item.status === group.key);
+      const body = rows.length
+        ? `<table class="table">
+             <thead>
+               <tr>
+                 <th></th><th>标题</th><th class="hide-sm">分类</th><th>状态</th>
+                 <th class="hide-sm">尺寸 / 体积</th><th class="hide-sm">上传者</th><th>操作</th>
+               </tr>
+             </thead>
+             <tbody>${rows.map(wallpaperRowHtml).join('')}</tbody>
+           </table>`
+        : '<p class="empty small">暂无</p>';
+      return `<section class="status-group">
+        <h3 class="group-title">${group.label}<span class="count">${rows.length}</span></h3>
+        ${body}
+      </section>`;
+    }).join('');
+  }
+
+  function tagPickerHtml(item) {
+    const selected = new Set(item && item.tags ? item.tags : []);
+    const options = state.tagVocabulary.length ? state.tagVocabulary : [];
+    return `<div class="tag-picker" id="wp-tags">
+      ${options.map((tag) => `<label class="tag-option">
+        <input type="checkbox" value="${esc(tag)}"${selected.has(tag) ? ' checked' : ''}> ${esc(tag)}
+      </label>`).join('')}
+    </div>`;
+  }
+
+  /**
+   * 从 Wallpaper Engine 的创意工坊目录批量导入。
+   * 浏览器不允许直接读盘符路径，所以让用户选文件夹（webkitdirectory），
+   * 我们按 project.json 认出一件作品，再挑出视频或预览图。
+   */
+  /** Cloudflare 单次请求上限 100MB，Worker 又要把文件读进内存，55MB 是稳妥的天花板 */
+  const MAX_IMPORT_BYTES = 55 * 1024 * 1024;
+
+  // ---- 目录句柄持久化：选过一次 workshop 目录后，下次一键复用 ----
+  function idbOpen() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open('folia-admin', 1);
+      request.onupgradeneeded = () => request.result.createObjectStore('handles');
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async function idbGet(key) {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const request = db.transaction('handles', 'readonly').objectStore('handles').get(key);
+      request.onsuccess = () => resolve(request.result ?? null);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async function idbSet(key, value) {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('handles', 'readwrite');
+      tx.objectStore('handles').put(value, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function walkDirectory(dirHandle, prefix = '', out = []) {
+    for await (const [name, handle] of dirHandle.entries()) {
+      const path = prefix ? `${prefix}/${name}` : name;
+      if (handle.kind === 'directory') {
+        await walkDirectory(handle, path, out);
+      } else {
+        const file = await handle.getFile();
+        try {
+          Object.defineProperty(file, '_rel', { value: path, configurable: true });
+        } catch { /* 某些环境不允许扩展 File，退化成按文件名匹配 */ }
+        out.push(file);
+      }
+    }
+    return out;
+  }
+
+  /** @returns {Promise<{status:'ok', files:File[]}|{status:'cancel'}|{status:'unsupported'}>} */
+  async function pickWorkshopDirectory({ forcePick = false } = {}) {
+    if (!window.showDirectoryPicker) return { status: 'unsupported' };
+    try {
+      if (!forcePick) {
+        const saved = await idbGet('we-workshop').catch(() => null);
+        if (saved) {
+          const permission = await saved.queryPermission({ mode: 'read' }).catch(() => 'denied');
+          if (permission === 'granted') return { status: 'ok', files: await walkDirectory(saved) };
+        }
+      }
+      const handle = await window.showDirectoryPicker({ id: 'we-workshop', mode: 'read' });
+      await idbSet('we-workshop', handle);
+      return { status: 'ok', files: await walkDirectory(handle) };
+    } catch (error) {
+      if (error && error.name === 'AbortError') return { status: 'cancel' };
+      console.warn('[workshop] 目录访问失败，回退到手动选择', error);
+      return { status: 'unsupported' };
+    }
+  }
+
+  function openWorkshopImport() {
+    openDialog(`
+      <form id="wep-form">
+        <h3>从 Wallpaper Engine 导入</h3>
+        <p class="hint">选择 Steam 的创意工坊目录，通常是：<br>
+          <code>D:\\SteamLibrary\\steamapps\\workshop\\content\\431960</code></p>
+        <div class="row">
+          <label>放到哪个模块
+            <select id="wep-module">
+              ${state.categories.map((c) => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('')}
+            </select>
+          </label>
+          <label>导入后
+            <select id="wep-publish">
+              <option value="1">直接发布</option>
+              <option value="0">先存草稿</option>
+            </select>
+          </label>
+        </div>
+        <label class="small"><input type="checkbox" id="wep-previews" checked> 同时导入场景壁纸的预览图（.pkg 无法直接上传）</label>
+        <div class="dropzone" id="wep-pick">
+          <strong>点击选择 workshop 文件夹</strong>
+          <span class="small" id="wep-status">只会读取 project.json 和视频/预览图，不上传 .pkg</span>
+        </div>
+        <button type="button" class="btn small ghost" id="wep-change">换一个目录 / 重新扫描</button>
+        <div id="wep-list"></div>
+        <footer>
+          <button type="button" class="btn ghost" data-close>取消</button>
+          <button type="submit" class="btn primary" id="wep-start" disabled>开始导入</button>
+        </footer>
+      </form>
+    `, (dialog) => {
+      let entries = [];
+      let picked = new Set();
+      $('[data-close]', dialog).addEventListener('click', closeDialog);
+
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.webkitdirectory = true;
+      input.multiple = true;
+      input.className = 'hidden';
+      dialog.appendChild(input);
+
+      const renderList = () => {
+        const host = $('#wep-list', dialog);
+        if (!entries.length) { host.innerHTML = ''; return; }
+        host.innerHTML = `<p class="hint">识别到 ${entries.length} 件作品，已选 ${picked.size} 件</p>
+          <div class="wep-items">${entries.map((entry, index) => `
+            <label class="wep-item${entry.skipped ? ' skipped' : ''}">
+              <input type="checkbox" data-index="${index}" ${picked.has(index) ? 'checked' : ''} ${entry.skipped ? 'disabled' : ''}>
+              <span class="wep-title">${esc(entry.title)}</span>
+              <span class="wep-meta">${esc(entry.kindLabel)}${entry.note ? ` · ${esc(entry.note)}` : ''}</span>
+            </label>`).join('')}</div>`;
+        $('#wep-start', dialog).disabled = picked.size === 0;
+      };
+
+      const collect = (files) => {
+        const all = [...files];
+        const projects = all.filter((file) => file.name === 'project.json');
+        if (!projects.length) {
+          $('#wep-status', dialog).textContent = '这个文件夹里没找到 project.json——请选到 431960 这一层';
+          return [];
+        }
+        const wantPreviews = $('#wep-previews', dialog).checked;
+        const list = [];
+        for (const pj of projects) {
+          const rel = pj._rel || pj.webkitRelativePath || pj.name;
+          const dir = rel.slice(0, rel.lastIndexOf('/'));
+          const siblings = all.filter((file) => (file._rel || file.webkitRelativePath || '').startsWith(`${dir}/`));
+          const video = siblings.find((file) => /\.(mp4|webm)$/i.test(file.name));
+          const preview = siblings.find((file) => /^preview\.(jpe?g|png|gif)$/i.test(file.name));
+          const entry = {
+            dir,
+            title: '',
+            tags: [],
+            kind: '',
+            kindLabel: '',
+            file: null,
+            note: '',
+            skipped: false,
+          };
+          entry.rawJson = pj;
+          list.push(entry);
+
+          if (video) {
+            entry.file = video;
+            entry.kind = 'dynamic';
+            entry.kindLabel = '视频';
+          } else if (preview && wantPreviews) {
+            entry.file = preview;
+            entry.kind = 'static';
+            entry.kindLabel = '场景预览';
+            entry.note = '原文件是 .pkg，只能放预览图';
+          } else {
+            entry.skipped = true;
+            entry.kindLabel = '场景包';
+            entry.note = '跳过（.pkg 无法上传）';
+          }
+
+          // 体积超限的直接标出来，别等传到一半失败
+          if (entry.file && entry.file.size > MAX_IMPORT_BYTES) {
+            entry.skipped = true;
+            entry.note = `${(entry.file.size / 1048576).toFixed(0)}MB，超过 55MB 上限，需先压缩`;
+          }
+        }
+        return list;
+      };
+
+      const handleFiles = async (files) => {
+        $('#wep-status', dialog).textContent = '正在读取…';
+        entries = collect(files);
+        // 逐个读 project.json 拿标题和标签
+        for (const entry of entries) {
+          try {
+            const meta = JSON.parse(await entry.rawJson.text());
+            entry.title = String(meta.title || entry.dir.split('/').pop()).slice(0, 120);
+            entry.tags = [...new Set((meta.tags ?? []).map((t) => WE_TAG_MAP[t]).filter(Boolean))];
+          } catch {
+            entry.title = entry.dir.split('/').pop();
+          }
+        }
+        picked = new Set(entries.map((entry, index) => index).filter((index) => !entries[index].skipped));
+        $('#wep-status', dialog).textContent = `共 ${entries.length} 件`;
+        renderList();
+      };
+
+      input.addEventListener('change', () => handleFiles(input.files));
+
+      // 打开就尝试用上次记住的目录直接扫描——这样"一点就看见"不用再翻文件夹
+      (async () => {
+        if (!window.showDirectoryPicker) return;
+        const saved = await idbGet('we-workshop').catch(() => null);
+        if (!saved) return;
+        const permission = await saved.queryPermission({ mode: 'read' }).catch(() => 'denied');
+        if (permission !== 'granted') return;
+        $('#wep-status', dialog).textContent = '正在扫描上次的目录…';
+        await handleFiles(await walkDirectory(saved));
+        if (!entries.length) {
+          $('#wep-status', dialog).textContent = '上次的目录里没有作品，点下面「换一个目录」';
+        }
+      })();
+
+      $('#wep-pick', dialog).addEventListener('click', async () => {
+        // 有记住且已授权的目录就直接扫描，否则才弹选择器
+        const result = await pickWorkshopDirectory();
+        if (result.status === 'ok') { await handleFiles(result.files); return; }
+        if (result.status === 'cancel') return;
+        input.click();
+      });
+
+      $('#wep-change', dialog).addEventListener('click', async () => {
+        await idbSet('we-workshop', null).catch(() => {});
+        const result = await pickWorkshopDirectory({ forcePick: true });
+        if (result.status === 'ok') await handleFiles(result.files);
+        else if (result.status === 'unsupported') input.click();
+      });
+
+      dialog.addEventListener('change', (event) => {
+        const box = event.target.closest('input[data-index]');
+        if (!box) return;
+        const index = Number(box.dataset.index);
+        if (box.checked) picked.add(index); else picked.delete(index);
+        $('#wep-start', dialog).disabled = picked.size === 0;
+        const hint = $('#wep-list p.hint', dialog);
+        if (hint) hint.textContent = `识别到 ${entries.length} 件作品，已选 ${picked.size} 件`;
+      });
+
+      $('#wep-form', dialog).addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const start = $('#wep-start', dialog);
+        const moduleId = $('#wep-module', dialog).value;
+        const publish = $('#wep-publish', dialog).value === '1';
+        const queue = [...picked].map((index) => entries[index]);
+        start.disabled = true;
+        let done = 0;
+        const failed = [];
+
+        for (const entry of queue) {
+          start.textContent = `导入中 ${done + 1}/${queue.length}`;
+          try {
+            const created = await api('/admin/wallpapers', {
+              method: 'POST',
+              body: {
+                title: entry.kind === 'static' ? `${entry.title}（预览）` : entry.title,
+                kind: entry.kind,
+                categoryId: moduleId,
+                tags: entry.tags,
+              },
+            });
+            const id = created.wallpaper.id;
+            await putAsset(id, entry.file, (ratio) => {
+              start.textContent = `${done + 1}/${queue.length} · ${Math.round(ratio * 100)}%`;
+            });
+            if (publish) {
+              await api(`/admin/wallpapers/${encodeURIComponent(id)}`, { method: 'PATCH', body: { status: 'published' } });
+            }
+            done += 1;
+          } catch (error) {
+            failed.push(`${entry.title}：${error.message}`);
+          }
+        }
+
+        closeDialog();
+        if (failed.length) {
+          toast(`导入完成：成功 ${done}，失败 ${failed.length}`, 'error', 8000);
+          console.warn('[workshop import] 失败明细', failed);
+        } else {
+          toast(`已导入 ${done} 件`, 'ok');
+        }
+        await loadWallpapers();
+      });
+    });
+  }
+
+  /** 批量导入本地文件：多选，标题取文件名，导完再逐条改也可以 */
+  function openLocalImport() {
+    openDialog(`
+      <form id="loc-form">
+        <h3>批量导入本地文件</h3>
+        <p class="hint">图片 png/jpg/webp/avif/gif，视频 mp4/webm，单个不超过 55MB。<br>
+          标题取文件名（去掉扩展名），标签导入后可以再勾。</p>
+        <div class="row">
+          <label>放到哪个模块
+            <select id="loc-module">
+              ${state.categories.map((c) => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('')}
+            </select>
+          </label>
+          <label>导入后
+            <select id="loc-publish">
+              <option value="1">直接发布</option>
+              <option value="0">先存草稿</option>
+            </select>
+          </label>
+        </div>
+        <div class="dropzone" id="loc-pick">
+          <strong>点击选择文件（可多选）</strong>
+          <span class="small" id="loc-status">还没有选择文件</span>
+        </div>
+        <div id="loc-list"></div>
+        <footer>
+          <button type="button" class="btn ghost" data-close>取消</button>
+          <button type="submit" class="btn primary" id="loc-start" disabled>开始导入</button>
+        </footer>
+      </form>
+    `, (dialog) => {
+      let entries = [];
+      let picked = new Set();
+      $('[data-close]', dialog).addEventListener('click', closeDialog);
+
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.multiple = true;
+      input.accept = 'image/png,image/jpeg,image/webp,image/avif,image/gif,video/mp4,video/webm';
+      input.className = 'hidden';
+      dialog.appendChild(input);
+
+      const renderList = () => {
+        const host = $('#loc-list', dialog);
+        if (!entries.length) { host.innerHTML = ''; return; }
+        host.innerHTML = `<p class="hint">已选 ${picked.size} / ${entries.length} 个文件</p>
+          <div class="wep-items">${entries.map((entry, index) => `
+            <label class="wep-item${entry.skipped ? ' skipped' : ''}">
+              <input type="checkbox" data-index="${index}" ${picked.has(index) ? 'checked' : ''} ${entry.skipped ? 'disabled' : ''}>
+              <span class="wep-title">${esc(entry.title)}</span>
+              <span class="wep-meta">${esc(entry.kindLabel)} · ${(entry.file.size / 1048576).toFixed(1)}MB</span>
+            </label>`).join('')}</div>`;
+        $('#loc-start', dialog).disabled = picked.size === 0;
+      };
+
+      input.addEventListener('change', () => {
+        entries = [...input.files].map((file) => {
+          const entry = {
+            file,
+            title: file.name.replace(/\.[^.]+$/, '').slice(0, 120),
+            kind: /\.(mp4|webm)$/i.test(file.name) ? 'dynamic' : 'static',
+            kindLabel: /\.(mp4|webm)$/i.test(file.name) ? '视频' : '图片',
+            skipped: false,
+          };
+          if (file.size > MAX_IMPORT_BYTES) {
+            entry.skipped = true;
+            entry.kindLabel = `${(file.size / 1048576).toFixed(0)}MB 超限`;
+          }
+          return entry;
+        });
+        picked = new Set(entries.map((_, index) => index).filter((index) => !entries[index].skipped));
+        $('#loc-status', dialog).textContent = `共 ${entries.length} 个文件`;
+        renderList();
+      });
+
+      $('#loc-pick', dialog).addEventListener('click', () => input.click());
+
+      dialog.addEventListener('change', (event) => {
+        const box = event.target.closest('input[data-index]');
+        if (!box) return;
+        const index = Number(box.dataset.index);
+        if (box.checked) picked.add(index); else picked.delete(index);
+        $('#loc-start', dialog).disabled = picked.size === 0;
+        const hint = $('#loc-list p.hint', dialog);
+        if (hint) hint.textContent = `已选 ${picked.size} / ${entries.length} 个文件`;
+      });
+
+      $('#loc-form', dialog).addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const start = $('#loc-start', dialog);
+        const moduleId = $('#loc-module', dialog).value;
+        const publish = $('#loc-publish', dialog).value === '1';
+        const queue = [...picked].map((index) => entries[index]);
+        start.disabled = true;
+        let done = 0;
+        const failed = [];
+
+        for (const entry of queue) {
+          start.textContent = `导入中 ${done + 1}/${queue.length}`;
+          try {
+            const created = await api('/admin/wallpapers', {
+              method: 'POST',
+              body: { title: entry.title, kind: entry.kind, categoryId: moduleId, tags: [] },
+            });
+            const id = created.wallpaper.id;
+            await putAsset(id, entry.file, (ratio) => {
+              start.textContent = `${done + 1}/${queue.length} · ${Math.round(ratio * 100)}%`;
+            });
+            if (publish) {
+              await api(`/admin/wallpapers/${encodeURIComponent(id)}`, { method: 'PATCH', body: { status: 'published' } });
+            }
+            done += 1;
+          } catch (error) {
+            failed.push(`${entry.title}：${error.message}`);
+          }
+        }
+
+        closeDialog();
+        toast(failed.length ? `成功 ${done}，失败 ${failed.length}` : `已导入 ${done} 个文件`, failed.length ? 'error' : 'ok', 8000);
+        if (failed.length) console.warn('[local import] 失败明细', failed);
+        await loadWallpapers();
+      });
+    });
+  }
+
+  function wallpaperDialog(item) {
+    const editing = Boolean(item);
+    const kind = item ? item.kind : 'static';    openDialog(`
+      <form id="wallpaper-form">
+        <h3>${editing ? '编辑壁纸' : '新增壁纸'}</h3>
+        <label>标题<input id="wp-title" required maxlength="120" value="${esc(item ? item.title : '')}" placeholder="例如：夜雨霓虹"></label>
+        <div class="row">
+          <label>类型
+            <select id="wp-kind-input">
+              <option value="static"${kind === 'static' ? ' selected' : ''}>静态（图片）</option>
+              <option value="dynamic"${kind === 'dynamic' ? ' selected' : ''}>动态（视频 / 开机动画包）</option>
+            </select>
+          </label>
+          <label>分类<select id="wp-category">${categoryOptions(item && item.category ? item.category.id : '')}</select></label>
+        </div>
+        <label>标签${tagPickerHtml(item)}</label>
+        ${canPublish() ? `
+          <div class="row">
+            <label>状态
+              <select id="wp-status-input">
+                <option value="draft"${item && item.status === 'draft' ? ' selected' : ''}>草稿</option>
+                <option value="published"${item && item.status === 'published' ? ' selected' : ''}>已发布</option>
+                <option value="hidden"${item && item.status === 'hidden' ? ' selected' : ''}>已隐藏</option>
+              </select>
+            </label>
+            <label>置顶
+              <select id="wp-featured">
+                <option value="0"${item && item.featured ? '' : ' selected'}>不置顶</option>
+                <option value="1"${item && item.featured ? ' selected' : ''}>置顶</option>
+              </select>
+            </label>
+          </div>` : ''}
+        ${editing ? '' : `
+          <div class="dropzone" id="wp-drop">
+            <strong>拖入文件，或点击选择</strong>
+            <span class="small">图片 PNG/JPG/WebP/AVIF ≤ 20MB；视频 mp4/webm ≤ 60MB；开机动画包 zip ≤ 80MB</span>
+            <div class="small" id="wp-file-name" style="margin-top:6px"></div>
+          </div>`}
+        <p class="hint" id="wp-progress"></p>
+        <footer>
+          <button type="button" class="btn ghost" data-close>取消</button>
+          <button type="submit" class="btn primary">${editing ? '保存' : '创建'}</button>
+        </footer>
+      </form>
+    `, (dialog) => {
+      let chosenFile = null;
+      $('[data-close]', dialog).addEventListener('click', closeDialog);
+
+      const drop = $('#wp-drop', dialog);
+      if (drop) {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = ACCEPT;
+        input.className = 'hidden';
+        dialog.appendChild(input);
+        const accept = (file) => {
+          chosenFile = file;
+          $('#wp-file-name', dialog).textContent = file ? `${file.name} · ${formatBytes(file.size)}` : '';
+        };
+        drop.addEventListener('click', () => input.click());
+        input.addEventListener('change', () => accept(input.files[0] || null));
+        drop.addEventListener('dragover', (event) => {
+          event.preventDefault();
+          drop.classList.add('dragover');
+        });
+        drop.addEventListener('dragleave', () => drop.classList.remove('dragover'));
+        drop.addEventListener('drop', (event) => {
+          event.preventDefault();
+          drop.classList.remove('dragover');
+          if (event.dataTransfer.files.length) accept(event.dataTransfer.files[0]);
+        });
+      }
+
+      $('#wallpaper-form', dialog).addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const submit = event.target.querySelector('button[type="submit"]');
+        submit.disabled = true;
+        const original = submit.textContent;
+        try {
+          const body = {
+            title: $('#wp-title', dialog).value.trim(),
+            kind: $('#wp-kind-input', dialog).value,
+            categoryId: $('#wp-category', dialog).value || null,
+            tags: $$('#wp-tags input:checked', dialog).map((node) => node.value),
+          };
+          if (canPublish()) {
+            body.status = $('#wp-status-input', dialog).value;
+            body.featured = $('#wp-featured', dialog).value === '1';
+          }
+
+          if (editing) {
+            await api(`/admin/wallpapers/${encodeURIComponent(item.id)}`, { method: 'PATCH', body });
+            closeDialog();
+            toast('已保存', 'ok');
+          } else {
+            const data = await api('/admin/wallpapers', { method: 'POST', body });
+            const id = data.wallpaper.id;
+            if (chosenFile) {
+              submit.textContent = '上传中…';
+              await putAsset(id, chosenFile, (ratio) => {
+                $('#wp-progress', dialog).textContent = `已上传 ${Math.round(ratio * 100)}%`;
+              });
+            }
+            closeDialog();
+            toast(chosenFile ? '壁纸已创建并上传' : '壁纸草稿已创建', 'ok');
+          }
+          await loadWallpapers();
+        } catch (error) {
+          submit.disabled = false;
+          submit.textContent = original;
+          if (error.details && error.details.wallpaperId) {
+            toast(`${error.message}（可搜索「${error.details.title}」找到它）`, 'error', 7000);
+          } else {
+            reportError(error);
+          }
+        }
+      });
+    });
+  }
+
+  async function uploadForExisting(id) {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = ACCEPT;
+    input.addEventListener('change', async () => {
+      const file = input.files && input.files[0];
+      if (!file) return;
+      const toastNode = document.createElement('div');
+      toastNode.className = 'toast';
+      toastNode.textContent = '上传中 0%';
+      $('#toasts').appendChild(toastNode);
+      try {
+        await putAsset(id, file, (ratio) => {
+          toastNode.textContent = `上传中 ${Math.round(ratio * 100)}%`;
+        });
+        toastNode.remove();
+        toast('文件已更新', 'ok');
+        await loadWallpapers();
+      } catch (error) {
+        toastNode.remove();
+        reportError(error);
+      }
+    });
+    input.click();
+  }
+
+  async function patchWallpaper(id, body, successMessage) {
+    try {
+      await api(`/admin/wallpapers/${encodeURIComponent(id)}`, { method: 'PATCH', body });
+      if (successMessage) toast(successMessage, 'ok');
+      await loadWallpapers();
+      return true;
+    } catch (error) {
+      reportError(error);
+      return false;
+    }
+  }
+
+  async function deleteWallpaper(id) {
+    const target = state.wallpapers.items.find((item) => item.id === id);
+    if (!window.confirm(`确定删除「${target ? target.title : id}」？文件也会从存储里删除，无法恢复。`)) return;
+    try {
+      await api(`/admin/wallpapers/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      toast('已删除', 'ok');
+      await loadWallpapers();
+    } catch (error) {
+      reportError(error);
+    }
+  }
+
+  // ------------------------------------------------------------------ 分类页
+  function mountCategories() {
+    $('#view-actions').innerHTML = '<button class="btn primary" type="button" data-action="new-category">＋ 新建分类</button>';
+    $('#view').innerHTML = `
+      <p class="muted small" style="margin-top:0">
+        「全部」「收藏」是前台虚拟状态，不需要在这里建。这里维护的是真实分类，顺序就是前台的标签顺序。
+      </p>
+      <div id="cat-table"></div>`;
+    renderCategoryRows();
+  }
+
+  function renderCategoryRows() {
+    const host = $('#cat-table');
+    if (!host) return;
+    if (!state.categories.length) {
+      host.innerHTML = '<p class="empty">还没有分类，先建一个「动态」试试。</p>';
+      return;
+    }
+    const rows = state.categories.map((category, index) => `
+      <tr>
+        <td>
+          <button class="btn small ghost" type="button" data-action="category-up" data-id="${esc(category.id)}" ${index === 0 ? 'disabled' : ''}>↑</button>
+          <button class="btn small ghost" type="button" data-action="category-down" data-id="${esc(category.id)}" ${index === state.categories.length - 1 ? 'disabled' : ''}>↓</button>
+        </td>
+        <td><input data-field="name" data-id="${esc(category.id)}" value="${esc(category.name)}" maxlength="40"></td>
+        <td class="hide-sm"><code class="muted small">${esc(category.slug)}</code></td>
+        <td class="hide-sm">${category.wallpaperCount} 张 / 已发布 ${category.publishedCount}</td>
+        <td><label class="small"><input type="checkbox" data-field="isPublic" data-id="${esc(category.id)}" ${category.isPublic ? 'checked' : ''}> 前台可见</label></td>
+        <td class="actions">
+          <button class="btn small" type="button" data-action="save-category" data-id="${esc(category.id)}">保存</button>
+          <button class="btn small danger" type="button" data-action="delete-category" data-id="${esc(category.id)}">删除</button>
+        </td>
+      </tr>`).join('');
+
+    host.innerHTML = `
+      <table class="table">
+        <thead><tr><th>顺序</th><th>名称</th><th class="hide-sm">slug</th><th class="hide-sm">壁纸数</th><th>前台</th><th>操作</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  function openCategoryDialog() {
+    openDialog(`
+      <form id="category-form">
+        <h3>新建分类</h3>
+        <label>名称<input id="cat-name" required maxlength="40" placeholder="例如：极简"></label>
+        <label>描述（可选）<input id="cat-desc" maxlength="400"></label>
+        <label class="small"><input type="checkbox" id="cat-public" checked> 前台可见</label>
+        <footer>
+          <button type="button" class="btn ghost" data-close>取消</button>
+          <button type="submit" class="btn primary">创建</button>
+        </footer>
+      </form>
+    `, (dialog) => {
+      $('[data-close]', dialog).addEventListener('click', closeDialog);
+      $('#category-form', dialog).addEventListener('submit', async (event) => {
+        event.preventDefault();
+        try {
+          await api('/admin/categories', {
+            method: 'POST',
+            body: {
+              name: $('#cat-name', dialog).value.trim(),
+              description: $('#cat-desc', dialog).value.trim(),
+              isPublic: $('#cat-public', dialog).checked,
+            },
+          });
+          closeDialog();
+          toast('分类已创建', 'ok');
+          await loadCategories();
+          renderCategoryRows();
+        } catch (error) {
+          reportError(error);
+        }
+      });
+    });
+  }
+
+  async function saveCategory(id) {
+    const name = $(`input[data-field="name"][data-id="${id}"]`).value.trim();
+    const isPublic = $(`input[data-field="isPublic"][data-id="${id}"]`).checked;
+    try {
+      await api(`/admin/categories/${encodeURIComponent(id)}`, { method: 'PATCH', body: { name, isPublic } });
+      toast('分类已保存', 'ok');
+      await loadCategories();
+      renderCategoryRows();
+    } catch (error) {
+      reportError(error);
+    }
+  }
+
+  async function deleteCategory(id) {
+    const target = state.categories.find((category) => category.id === id);
+    const label = target ? target.name : id;
+    if (!window.confirm(`删除分类「${label}」？`)) return;
+    try {
+      await api(`/admin/categories/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    } catch (error) {
+      const count = error.details && error.details.wallpaperCount;
+      if (error.status === 409 && count) {
+        if (!window.confirm(`「${label}」下还有 ${count} 张壁纸。是否把它们改为「未分类」并删除该分类？`)) return;
+        try {
+          await api(`/admin/categories/${encodeURIComponent(id)}?strategy=detach`, { method: 'DELETE' });
+        } catch (inner) {
+          reportError(inner);
+          return;
+        }
+      } else {
+        reportError(error);
+        return;
+      }
+    }
+    toast('分类已删除', 'ok');
+    await loadCategories();
+    renderCategoryRows();
+  }
+
+  async function moveCategory(id, direction) {
+    const index = state.categories.findIndex((category) => category.id === id);
+    const swapWith = index + direction;
+    if (index < 0 || swapWith < 0 || swapWith >= state.categories.length) return;
+    const next = state.categories.slice();
+    const [moved] = next.splice(index, 1);
+    next.splice(swapWith, 0, moved);
+    state.categories = next;
+    renderCategoryRows();
+    try {
+      await api('/admin/categories/reorder', { method: 'POST', body: { ids: next.map((category) => category.id) } });
+      await loadCategories();
+      renderCategoryRows();
+    } catch (error) {
+      reportError(error);
+      await loadCategories();
+      renderCategoryRows();
+    }
+  }
+
+  // ------------------------------------------------------------------ 成员页
+  async function mountMembers() {
+    $('#view-actions').innerHTML = '<button class="btn primary" type="button" data-action="new-member">＋ 新增成员</button>';
+    const data = await api('/admin/members');
+    state.members = data.members;
+    renderMembers();
+  }
+
+  function renderMembers() {
+    const rows = state.members.map((member) => {
+      const self = member.id === state.user.id;
+      return `
+        <tr>
+          <td><div class="title-cell"><strong>${esc(member.name)}</strong><code>${esc(member.email)}</code></div></td>
+          <td>
+            <select data-field="role" data-id="${esc(member.id)}" ${self ? 'disabled' : ''}>
+              <option value="editor"${member.role === 'editor' ? ' selected' : ''}>编辑</option>
+              <option value="admin"${member.role === 'admin' ? ' selected' : ''}>管理员</option>
+            </select>
+          </td>
+          <td>${member.active ? '<span class="badge published">启用</span>' : '<span class="badge off">停用</span>'}</td>
+          <td class="hide-sm muted small">${formatTime(member.lastLoginAt)}</td>
+          <td class="actions">
+            ${self ? '<span class="muted small">当前账号</span>' : `<button class="btn small" type="button" data-action="save-member" data-id="${esc(member.id)}">保存</button>`}
+            ${self ? '' : `<button class="btn small ghost" type="button" data-action="toggle-member" data-id="${esc(member.id)}" data-active="${member.active ? '1' : '0'}">${member.active ? '停用' : '启用'}</button>`}
+            ${self ? '' : `<button class="btn small ghost" type="button" data-action="reset-password" data-id="${esc(member.id)}" data-email="${esc(member.email)}">重置密码</button>`}
+            ${self ? '' : `<button class="btn small danger" type="button" data-action="delete-member" data-id="${esc(member.id)}" data-email="${esc(member.email)}">删除</button>`}
+          </td>
+        </tr>`;
+    }).join('');
+
+    $('#view').innerHTML = `
+      <p class="muted small" style="margin-top:0">
+        编辑可以上传壁纸、维护自己上传的草稿、选择分类；管理员还能发布、删除、管理分类与成员。
+      </p>
+      <table class="table">
+        <thead><tr><th>成员</th><th>角色</th><th>状态</th><th class="hide-sm">最后登录</th><th>操作</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="5" class="muted">还没有成员</td></tr>'}</tbody>
+      </table>`;
+  }
+
+  function openMemberDialog() {
+    openDialog(`
+      <form id="member-form">
+        <h3>新增成员</h3>
+        <label>邮箱<input id="member-email" type="email" required></label>
+        <label>显示名<input id="member-name" required maxlength="60"></label>
+        <label>角色
+          <select id="member-role">
+            <option value="editor">编辑</option>
+            <option value="admin">管理员</option>
+          </select>
+        </label>
+        <label>初始密码<input id="member-password" type="password" required minlength="10" autocomplete="new-password"></label>
+        <p class="hint">把邮箱和初始密码告诉对方，登录后请提醒他自行修改密码。</p>
+        <footer>
+          <button type="button" class="btn ghost" data-close>取消</button>
+          <button type="submit" class="btn primary">创建</button>
+        </footer>
+      </form>
+    `, (dialog) => {
+      $('[data-close]', dialog).addEventListener('click', closeDialog);
+      $('#member-form', dialog).addEventListener('submit', async (event) => {
+        event.preventDefault();
+        try {
+          await api('/admin/members', {
+            method: 'POST',
+            body: {
+              email: $('#member-email', dialog).value.trim(),
+              name: $('#member-name', dialog).value.trim(),
+              role: $('#member-role', dialog).value,
+              password: $('#member-password', dialog).value,
+            },
+          });
+          closeDialog();
+          toast('成员已创建', 'ok');
+          await mountMembers();
+        } catch (error) {
+          reportError(error);
+        }
+      });
+    });
+  }
+
+  async function saveMember(id) {
+    const role = $(`select[data-field="role"][data-id="${id}"]`).value;
+    try {
+      await api(`/admin/members/${encodeURIComponent(id)}`, { method: 'PATCH', body: { role } });
+      toast('已保存', 'ok');
+      await mountMembers();
+    } catch (error) {
+      reportError(error);
+      await mountMembers();
+    }
+  }
+
+  async function deleteMember(id, email) {
+    const label = email || id;
+    if (!window.confirm(`删除成员「${label}」？\n\n账号和登录状态会立即失效。他上传的壁纸会保留，但作者一栏会变空。`)) return;
+    try {
+      await api(`/admin/members/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      toast('已删除', 'ok');
+      await mountMembers();
+    } catch (error) {
+      reportError(error);
+    }
+  }
+
+  async function toggleMember(id, active) {    if (!window.confirm(active ? '停用后该成员立即无法登录，确定？' : '重新启用该成员？')) return;
+    try {
+      await api(`/admin/members/${encodeURIComponent(id)}`, { method: 'PATCH', body: { active: !active } });
+      toast(active ? '已停用' : '已启用', 'ok');
+      await mountMembers();
+    } catch (error) {
+      reportError(error);
+    }
+  }
+
+  function openResetPassword(id, email) {
+    openDialog(`
+      <form id="reset-form">
+        <h3>重置密码</h3>
+        <p class="hint">为 ${esc(email)} 设置新密码。该成员的所有登录状态会立即失效。</p>
+        <label>新密码<input id="reset-password" type="password" required minlength="10" autocomplete="new-password"></label>
+        <footer>
+          <button type="button" class="btn ghost" data-close>取消</button>
+          <button type="submit" class="btn primary">重置</button>
+        </footer>
+      </form>
+    `, (dialog) => {
+      $('[data-close]', dialog).addEventListener('click', closeDialog);
+      $('#reset-form', dialog).addEventListener('submit', async (event) => {
+        event.preventDefault();
+        try {
+          await api(`/admin/members/${encodeURIComponent(id)}`, {
+            method: 'PATCH',
+            body: { password: $('#reset-password', dialog).value },
+          });
+          closeDialog();
+          toast('密码已重置', 'ok');
+          await mountMembers();
+        } catch (error) {
+          reportError(error);
+        }
+      });
+    });
+  }
+
+  // ------------------------------------------------------------------ 审计页
+  async function mountAudit() {
+    const data = await api('/admin/audit?limit=150');
+    state.audit = data.items;
+    const rows = state.audit.map((entry) => `
+      <tr>
+        <td class="muted small" style="white-space:nowrap">${formatTime(entry.at)}</td>
+        <td><span class="badge">${esc(AUDIT_LABEL[entry.action] || entry.action)}</span></td>
+        <td class="hide-sm">${esc(entry.actorEmail || '—')}</td>
+        <td class="hide-sm">${esc(entry.targetType)}${entry.targetId ? ` · ${esc(entry.targetId.slice(0, 14))}` : ''}</td>
+        <td class="muted small">${esc(entry.detail)}</td>
+      </tr>`).join('');
+    $('#view').innerHTML = `
+      <p class="muted small" style="margin-top:0">最近 150 条写操作记录。谁改了什么，这里都有。</p>
+      <table class="table">
+        <thead><tr><th>时间</th><th>动作</th><th class="hide-sm">操作人</th><th class="hide-sm">对象</th><th>详情</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="5" class="muted">暂无记录</td></tr>'}</tbody>
+      </table>`;
+  }
+
+  // ------------------------------------------------------------------ 事件
+  document.addEventListener('click', (event) => {
+    const navButton = event.target.closest('.nav-item');
+    if (navButton) {
+      switchView(navButton.dataset.view).catch(reportError);
+      return;
+    }
+    const button = event.target.closest('[data-action]');
+    if (!button) return;
+    const { action, id } = button.dataset;
+    const item = id ? state.wallpapers.items.find((row) => row.id === id) : null;
+
+    switch (action) {
+      case 'new-wallpaper':
+        wallpaperDialog(null);
+        break;
+      case 'import-workshop':
+        openWorkshopImport();
+        break;
+      case 'import-local':
+        openLocalImport();
+        break;
+      case 'edit-wallpaper':
+        if (item) wallpaperDialog(item);
+        break;
+      case 'upload-wallpaper':
+        if (id) uploadForExisting(id);
+        break;
+      case 'publish':
+        patchWallpaper(id, { status: 'published' }, '已发布').catch(reportError);
+        break;
+      case 'unpublish':
+        patchWallpaper(id, { status: 'draft' }, '已下线').catch(reportError);
+        break;
+      case 'delete-wallpaper':
+        deleteWallpaper(id);
+        break;
+      case 'new-category':
+        openCategoryDialog();
+        break;
+      case 'save-category':
+        saveCategory(id);
+        break;
+      case 'delete-category':
+        deleteCategory(id);
+        break;
+      case 'category-up':
+        moveCategory(id, -1);
+        break;
+      case 'category-down':
+        moveCategory(id, 1);
+        break;
+      case 'new-member':
+        openMemberDialog();
+        break;
+      case 'save-member':
+        saveMember(id);
+        break;
+      case 'toggle-member':
+        toggleMember(id, button.dataset.active === '1');
+        break;
+      case 'reset-password':
+        openResetPassword(id, button.dataset.email || '');
+        break;
+      case 'delete-member':
+        deleteMember(id, button.dataset.email || '');
+        break;
+      default:
+        break;
+    }
+  });
+
+  document.addEventListener('change', (event) => {
+    const select = event.target.closest('select[data-action="select-category"]');
+    if (!select) return;
+    const id = select.dataset.id;
+    const categoryId = select.value || null;
+    patchWallpaper(id, { categoryId }, '分类已更新').catch(reportError);
+  });
+
+  document.addEventListener('DOMContentLoaded', () => {
+    $('#login-form').addEventListener('submit', doLogin);
+    $('#setup-form').addEventListener('submit', doSetup);
+    $('#btn-logout').addEventListener('click', doLogout);
+    $('#btn-password').addEventListener('click', openPasswordDialog);
+    $('#dialog').addEventListener('cancel', (event) => {
+      event.preventDefault();
+      closeDialog();
+    });
+    boot();
+  });
+})();

@@ -1,0 +1,24 @@
+# 依赖与构建产物
+node_modules/
+.wrangler/
+build/
+
+# 本地密钥 / 日志
+.dev.vars
+*.log
+.DS_Store
+
+# 部署包：由 src/public/functions 同步生成，不入库
+deploy/
+
+# 一次性排查产物
+.pw/
+.rethumb/
+*.bundle
+export-*.json
+export-raw.txt
+export2-raw.txt
+current-ids.json
+restore-deleted.sql
+hide-broken.sql
+probe.*

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Folia · 壁纸库</title>
+  <meta name="description" content="Folia 壁纸库：静态与动态壁纸、皮肤包。原图托管在 Cloudflare R2。">
+  <meta name="theme-color" content="#0a0a0c">
+  <meta property="og:title" content="Folia · 壁纸库">
+  <meta property="og:type" content="website">
+  <link rel="preconnect" href="/">
+  <link rel="stylesheet" href="/assets/site.css">
+  <link rel="stylesheet" href="/assets/editor.css">
+</head>
+<body>
+  <a class="skip" href="#grid">跳到壁纸列表</a>
+
+  <header class="head">
+    <a class="brand" href="/">Folia <span>· 壁纸库</span></a>
+    <div class="head-actions">
+      <button class="ghost" type="button" data-action="copy-link">复制链接</button>
+      <button class="ghost" type="button" data-action="help">帮助</button>
+      <a class="ghost" href="/admin/">管理</a>
+      <a class="ghost" href="/__gate?logout=1">退出</a>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs" role="tablist" aria-label="壁纸分类"></nav>
+
+  <div class="filters" id="filters"></div>
+
+  <section class="toolbar">
+    <p class="count" id="result-count">正在加载…</p>
+    <div class="toolbar-controls">
+      <label class="field sort-field">
+        <span>排序</span>
+        <select id="sort">
+          <option value="recent">最近添加</option>
+          <option value="name">名称</option>
+          <option value="size">文件大小</option>
+          <option value="resolution">分辨率</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>搜索</span>
+        <input id="search" type="search" placeholder="标题关键词" autocomplete="off">
+      </label>
+    </div>
+  </section>
+
+  <p class="module-note" id="module-note" hidden></p>
+
+  <main class="grid" id="grid" tabindex="-1"></main>
+  <div class="more">
+    <nav class="pager" id="pager" aria-label="分页" hidden>
+      <button class="pager-step" type="button" data-page="first" aria-label="第一页">«</button>
+      <button class="pager-step" type="button" data-page="prev" aria-label="上一页">‹</button>
+      <span class="pager-jump">
+        <input id="pager-input" type="number" min="1" step="1" inputmode="numeric" aria-label="跳到第几页">
+        <span class="pager-total">/ <span id="pager-total">1</span></span>
+      </span>
+      <button class="pager-step" type="button" data-page="next" aria-label="下一页">›</button>
+      <button class="pager-step" type="button" data-page="last" aria-label="最后一页">»</button>
+    </nav>
+  </div>
+
+  <dialog class="viewer" id="viewer">
+    <div class="viewer-stage" id="viewer-stage"></div>
+    <button class="viewer-nav prev" type="button" data-action="prev" aria-label="上一张">←</button>
+    <button class="viewer-nav next" type="button" data-action="next" aria-label="下一张">→</button>
+    <div class="viewer-bar">
+      <div class="viewer-info">
+        <h3 id="viewer-title">—</h3>
+        <p id="viewer-desc" class="viewer-desc" hidden></p>
+        <p id="viewer-spec" class="muted"></p>
+      </div>
+      <div class="viewer-actions">
+        <button class="btn primary" type="button" data-action="apply">应用（复制直链）</button>
+        <button class="btn" type="button" data-action="open-original">打开原图</button>
+        <button class="btn" type="button" id="viewer-favorite" data-action="favorite">喜欢</button>
+        <button class="btn ghost" type="button" data-action="close-viewer">关闭</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog class="help" id="help-dialog">
+    <h2>怎么用</h2>
+    <ul>
+      <li><strong>点开任意一张</strong>：看原图、复制直链、加入轮换。</li>
+      <li><strong>← →</strong>：在当前列表里逐张切换，不需要关掉再点。</li>
+      <li><strong>喜欢</strong>：存在你这台设备的浏览器里，不上传、不跨设备。</li>
+      <li><strong>轮换列表</strong>：最多 20 张，状态编在链接的 <code>#r=</code> 里，分享链接即分享列表。</li>
+      <li><strong>应用（复制直链）</strong>：拿到 R2 上的原图地址，粘到壁纸软件里就能用。</li>
+      <li><strong>编辑</strong>：管理员/编辑在右上角点「编辑」，就能在这张页面上改标题、换分类、传新作品——不用再开另一个后台。</li>
+      <li><strong>管理</strong>：成员、审计日志、批量导入在「编辑 → 高级」里。</li>
+    </ul>
+    <form method="dialog"><button class="btn" type="submit">知道了</button></form>
+  </dialog>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <script type="module" src="/assets/gallery.js"></script>
+</body>
+</html>
