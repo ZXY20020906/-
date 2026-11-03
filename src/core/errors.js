@@ -35,5 +35,8 @@ export const unsupportedMedia = (message = '不支持的文件类型', details =
 export const tooManyRequests = (message = '尝试过于频繁，请稍后再试') =>
   new HttpError(429, 'too_many_requests', message);
 
+export const storageVerifyFailed = (message = 'R2 写入校验失败（对象缺失或大小不符），请重试') =>
+  new HttpError(500, 'storage-verify-failed', message);
+
 export const internal = (message = '服务器内部错误') =>
   new HttpError(500, 'internal_error', message);

@@ -21,7 +21,7 @@ import { userDto } from '../dto.js';
 import { hashPassword } from '../password.js';
 import { destroyAllSessions } from '../session.js';
 import { AUDIT_ACTION, writeAudit } from '../audit.js';
-import { newId, sha256Hex } from '../util.js';
+import { constantTimeEqual, newId, sha256Hex } from '../util.js';
 
 async function loadMember(env, id) {
   const row = await first(env, Q.userById, cleanId(id, 'id'));
@@ -145,7 +145,7 @@ export async function remove({ env, actor, request, params }) {
 
   // 两边都过一遍 sha256 再比，避免按字符比较泄时间
   const [givenHash, expectedHash] = await Promise.all([sha256Hex(given), sha256Hex(expected)]);
-  if (givenHash !== expectedHash) {
+  if (!constantTimeEqual(givenHash, expectedHash)) {
     await writeAudit(env, {
       actor,
       action: AUDIT_ACTION.LOGIN_FAILED,

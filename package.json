@@ -8,7 +8,10 @@
     "test": "node tools/run-tests.mjs",
     "check": "node tools/check-syntax.mjs && node tools/check-ui.mjs",
     "check:sql": "node tools/dump-queries.mjs && python tools/check-sql.py",
-    "import": "node tools/import-wallpapers.mjs"
+    "import": "node tools/import-wallpapers.mjs",
+    "deploy": "node tools/sync-deploy.mjs && wrangler pages deploy ./deploy --project-name=folia --branch=main --commit-dirty=true",
+    "reconcile": "node tools/reconcile.mjs",
+    "reconcile:apply": "node tools/reconcile.mjs --apply"
   },
   "engines": {
     "node": ">=20"

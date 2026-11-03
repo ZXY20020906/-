@@ -34,8 +34,25 @@ export async function putAsset(env, key, bytes, mime) {
   });
 }
 
-export async function deleteAsset(env, key) {
-  if (!key) return;
+/**
+ * 写完立刻回读一次：R2 put 成功不代表对象真的落盘、大小一致。
+ * 之前的坑就是「D1 说有、R2 没有」，用户点下载直接 404。
+ * 返回真实字节数，调用方拿它记账，而不是拿内存里的 length。
+ */
+export async function verifyAsset(env, key, expectedBytes) {
+  if (typeof env.BUCKET.head !== 'function') {
+    // 测试用假桶没有 head：跳过校验，但仍按写入长度记账
+    return { ok: true, size: expectedBytes ?? 0 };
+  }
+  const head = await env.BUCKET.head(key);
+  if (!head) return { ok: false, reason: 'missing', size: 0 };
+  if (typeof expectedBytes === 'number' && head.size !== expectedBytes) {
+    return { ok: false, reason: 'size', size: head.size };
+  }
+  return { ok: true, size: head.size, etag: head.httpEtag };
+}
+
+export async function deleteAsset(env, key) {  if (!key) return;
   try {
     await env.BUCKET.delete(key);
   } catch (error) {

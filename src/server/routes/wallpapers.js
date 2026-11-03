@@ -19,14 +19,14 @@ import {
 import { KINDS, REVIEW_STATUSES, STATUSES } from '../../core/validate.js';
 import { uniqueSlug } from '../../core/slug.js';
 import {
-  ALLOWED_MIME, limitForMime, kindMatchesMime, readDurationMs, readMediaMeta,
+  ALLOWED_MIME, limitForMime, kindMatchesMime, readDurationMs, readMediaMeta, readVideoInfo,
 } from '../../core/image-meta.js';
 import {
-  badRequest, conflict, notFound, payloadTooLarge, unsupportedMedia,
+  badRequest, conflict, internal, notFound, payloadTooLarge, storageVerifyFailed, unsupportedMedia,
 } from '../../core/errors.js';
 import { created, json, readJson } from '../http.js';
 import { wallpaperDto } from '../dto.js';
-import { assetKey, deleteAsset, mediaBaseFor, putAsset, thumbKey } from '../storage.js';
+import { assetKey, deleteAsset, mediaBaseFor, putAsset, thumbKey, verifyAsset } from '../storage.js';
 import { newId, safeJsonParse, sha256Bytes } from '../util.js';
 import { buildReorderPlan, nextSortOrder } from '../../core/ordering.js';
 import { AUDIT_ACTION, writeAudit } from '../audit.js';
@@ -232,13 +232,27 @@ export async function upload({ env, actor, request, params }) {
 
   const key = assetKey(row.id, sha ?? `${Date.now()}${bytes.byteLength}`, meta.mime);
   await putAsset(env, key, bytes, meta.mime);
+
+  // 写完立刻回读：D1 记账必须来自刚校验过的对象，否则就是「库里有、桶里没有」
+  const check = await verifyAsset(env, key, bytes.byteLength);
+  if (!check.ok) {
+    await deleteAsset(env, key);
+    throw storageVerifyFailed(check.reason === 'size'
+      ? `上传校验失败：R2 里的对象大小不一致（写入 ${bytes.byteLength}，实际 ${check.size}）`
+      : '上传校验失败：R2 里找不到刚写入的对象，请重试');
+  }
   if (row.storage_key && row.storage_key !== key) await deleteAsset(env, row.storage_key);
 
-  // 视频顺便读时长：开机动画是按秒循环的，这个数字比体积更有用
+  // 视频顺便读时长和编码信息：开机动画是按秒循环的，moov 位置决定能不能边下边播
   const durationMs = readDurationMs(bytes, meta.mime);
+  const videoInfo = readVideoInfo(bytes, meta.mime);
   await run(
     env, Q.updateWallpaperAsset,
-    key, meta.mime, bytes.byteLength, meta.width, meta.height, durationMs, sha, nextKind, nowMs(), row.id,
+    key, meta.mime, check.size, meta.width, meta.height, durationMs, sha, nextKind, nowMs(), row.id,
+  );
+  await run(
+    env, Q.markWallpaperVerified,
+    nowMs(), videoInfo.codec, videoInfo.faststart, row.id,
   );
 
   await writeAudit(env, {
@@ -278,6 +292,11 @@ export async function uploadThumb({ env, actor, request, params }) {
   const sha = await sha256Bytes(bytes);
   const key = thumbKey(row.id, sha, meta.mime);
   await putAsset(env, key, bytes, meta.mime);
+  const thumbCheck = await verifyAsset(env, key, bytes.byteLength);
+  if (!thumbCheck.ok) {
+    await deleteAsset(env, key);
+    throw storageVerifyFailed('缩略图写入校验失败，请重试');
+  }
   if (row.thumb_key && row.thumb_key !== key) await deleteAsset(env, row.thumb_key);
   await run(env, Q.updateWallpaperThumb, key, nowMs(), row.id);
 

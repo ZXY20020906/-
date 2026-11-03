@@ -5,7 +5,7 @@
  * 1. 设备绑定：登录时服务端再发一个随机 folia_device Cookie，库里只存它的 sha256。
  *    之后每个请求必须同时带上会话 Cookie 和设备 Cookie，且两者哈希匹配。
  *    只偷到一枚 folia_session（代理日志、截图、单条复制）用不了。
- * 2. 闲置超时：库里记 last_seen_at，超过 30 分钟没活动就要求重新登录；
+ * 2. 闲置超时：库里记 last_seen_at，超过 60 分钟没活动就要求重新登录；
  *    有活动时最多每分钟刷新一次，避免每个静态资源都写库。
  *
  * Cookie 策略：HttpOnly + SameSite=Lax + Path=/ + Secure（HTTPS），且不带 Max-Age，

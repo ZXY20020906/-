@@ -243,6 +243,61 @@ export function readDurationMs(bytes, mime) {
   return null;
 }
 
+/**
+ * 视频编码 + faststart 检测（只读判断，不拒绝上传）。
+ * - codec：扫 moov 里的 sample entry fourcc，hvc1/hev1 = H.265（浏览器多数解不了）
+ * - faststart：moov 是否出现在 mdat 之前；否则要下完整个文件才能起播
+ * 用 box 头逐个跳，不做完整解析，几 MB 的文件几十毫秒内出结果。
+ */
+export function readVideoInfo(bytes, mime) {
+  if (!isVideoMime(mime) || !bytes || bytes.length < 16) return { codec: null, faststart: null };
+  if (mime === 'video/webm') return { codec: sniffWebmCodec(bytes), faststart: null };
+
+  let offset = 0;
+  let moovAt = -1;
+  let mdatAt = -1;
+  const limit = bytes.length;
+  for (let guard = 0; guard < 64 && offset + 8 <= limit; guard += 1) {
+    const size = be32(bytes, offset);
+    const type = String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
+    if (type === 'moov' && moovAt < 0) moovAt = offset;
+    if (type === 'mdat' && mdatAt < 0) mdatAt = offset;
+    if (type === 'moov' || type === 'mdat') break;
+    if (!size || size < 8) break;
+    offset += size;
+  }
+
+  const codec = moovAt >= 0 ? sniffMp4Codec(bytes, moovAt) : null;
+  const faststart = moovAt < 0 || mdatAt < 0 ? null : moovAt < mdatAt;
+  return { codec, faststart };
+}
+
+function sniffMp4Codec(bytes, start) {
+  const known = ['avc1', 'hvc1', 'hev1', 'av01', 'vp09', 'mp4v'];
+  const end = Math.min(bytes.length - 4, start + 4 * 1024 * 1024);
+  for (let i = start; i < end; i += 1) {
+    for (const code of known) {
+      if (bytes[i] === code.charCodeAt(0)
+        && bytes[i + 1] === code.charCodeAt(1)
+        && bytes[i + 2] === code.charCodeAt(2)
+        && bytes[i + 3] === code.charCodeAt(3)) {
+        return code === 'avc1' ? 'h264' : code === 'av01' ? 'av1' : code === 'hvc1' || code === 'hev1' ? 'hevc' : code;
+      }
+    }
+  }
+  return null;
+}
+
+function sniffWebmCodec(bytes) {
+  const text = String.fromCharCode(...bytes.subarray(0, Math.min(bytes.length, 4096)));
+  if (text.includes('V_MPEG4/ISO/AVC')) return 'h264';
+  if (text.includes('V_MPEGH/ISO/HEVC')) return 'hevc';
+  if (text.includes('V_VP9')) return 'vp9';
+  if (text.includes('V_VP8')) return 'vp8';
+  if (text.includes('V_AV1')) return 'av1';
+  return null;
+}
+
 export function limitForMime(mime) {
   if (isBundleMime(mime)) return MAX_BUNDLE_BYTES;
   return isVideoMime(mime) ? MAX_VIDEO_BYTES : MAX_IMAGE_BYTES;

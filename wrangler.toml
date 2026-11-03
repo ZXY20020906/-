@@ -7,7 +7,7 @@ pages_build_output_dir = "./public"
 [[d1_databases]]
 binding = "DB"
 database_name = "folia"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "64761fc2-cd88-46f4-b08f-c2b08d5b667f"
 
 # 壁纸原图 / 视频
 [[r2_buckets]]
@@ -16,7 +16,7 @@ bucket_name = "folia-wallpapers"
 
 [vars]
 # 线上站点来源，用于校验管理接口的 Origin
-PUBLIC_ORIGIN = "https://folia-major-3t6.pages.dev"
+PUBLIC_ORIGIN = "https://folia-5ve.pages.dev"
 # 可选：给 R2 绑自定义域名后填在这里，媒体直链就会走它（省 Worker 请求）。
 # 留空则回落到 /media/<key>，由 Worker 从 R2 出图。
 # MEDIA_BASE = "https://img.example.com"

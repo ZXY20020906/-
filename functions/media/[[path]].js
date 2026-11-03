@@ -47,7 +47,8 @@ function parseRange(header, size) {
     end = endRaw ? Number(endRaw) : size - 1;
   }
   if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
-  if (start > end || start >= size) return null;
+  // 越界不是「没写 Range」，必须回 416 而不是 200 全量
+  if (start > end || start >= size) return { invalid: true };
   return { start, end: Math.min(end, size - 1) };
 }
 
@@ -100,6 +101,13 @@ export async function onRequestGet(context) {
   }
 
   const range = !wantsDownload && rangeHeader ? parseRange(rangeHeader, size) : null;
+
+  if (range && range.invalid) {
+    return new Response(null, {
+      status: 416,
+      headers: { ...CORS, 'accept-ranges': 'bytes', 'content-range': `bytes */${size}` },
+    });
+  }
 
   if (range) {
     const partial = await env.BUCKET.get(key, { range: { offset: range.start, length: range.end - range.start + 1 } });

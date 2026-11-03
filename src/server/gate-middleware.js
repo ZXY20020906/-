@@ -29,6 +29,7 @@ const AUTH_EXEMPT = new Set([
   '/api/auth/logout',
   '/api/auth/me',
   '/api/meta',
+  '/api/setup', // 空库初始化：靠 BOOTSTRAP_TOKEN + countUsers 自校验
 ]);
 
 /**

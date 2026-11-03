@@ -23,6 +23,8 @@ const DEFAULT_HANDLERS = {
     { id: 'tag_anime', name: '动漫', sort_order: 30 },
     { id: 'tag_game', name: '游戏', sort_order: 40 },
   ]),
+  // 上传成功后的记账（verified_at / codec / faststart），用例不关心具体值
+  [Q.markWallpaperVerified]: () => [],
 };
 
 export function createEnv(handlers, { bucket } = {}) {

@@ -1,4 +1,7 @@
-/** 输出给前端的形状。DB 行 → DTO，避免把 storage_key / sha256 之类的内部字段直接暴露。 */
+/**
+ * 输出给前端的形状。DB 行 → DTO。
+ * storage_key 是内部字段不暴露；sha256 对外输出（插件用它做增量下载判断）。
+ */
 import { safeJsonParse } from './util.js';
 import { publicUrl } from './storage.js';
 import { capabilitiesFor, ROLE_LABELS } from '../core/permissions.js';
