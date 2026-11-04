@@ -56,7 +56,7 @@ mvhd（type 之后）：version+flags(4) → 时间戳(4 或 8) → timescale(4)
 批量导入同一批片子（标题用文件名）：
 
 ```bash
-FOLIA_URL=https://folia-major-3t6.pages.dev \
+FOLIA_URL=https://folia-5ve.pages.dev \
 FOLIA_EMAIL=admin@example.com \
 FOLIA_PASSWORD='******' \
 node tools/import-wallpapers.mjs ./boot-clips --category boot-animation --publish
@@ -80,7 +80,7 @@ GET /media/wallpapers/wp_x/abc.mp4?download=DeepSeek%E5%BC%80%E6%9C%BA.mp4
 `?cat=` 是深链，直接把某个模块发给别人：
 
 ```
-https://folia-major-3t6.pages.dev/?cat=boot-animation
+https://folia-5ve.pages.dev/?cat=boot-animation
 ```
 
 轮换列表仍然走 `#r=`，两者可以同时存在：

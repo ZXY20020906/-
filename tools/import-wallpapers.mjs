@@ -3,7 +3,7 @@
  * 先用接口登录，再逐张「建草稿 → 传文件 →（可选）发布」，失败的不影响后面的。
  *
  * 用法：
- *   FOLIA_URL=https://folia-major-3t6.pages.dev \
+ *   FOLIA_URL=https://folia-5ve.pages.dev \
  *   FOLIA_EMAIL=admin@example.com \
  *   FOLIA_PASSWORD='******' \
  *   node tools/import-wallpapers.mjs ./wallpapers --category dynamic --publish

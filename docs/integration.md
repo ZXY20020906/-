@@ -63,7 +63,7 @@ binding = "BUCKET"
 bucket_name = "folia-wallpapers"
 
 [vars]
-PUBLIC_ORIGIN = "https://folia-major-3t6.pages.dev"
+PUBLIC_ORIGIN = "https://folia-5ve.pages.dev"
 ```
 
 `binding` 的名字必须是 `DB` 和 `BUCKET`，代码里写死了（`env.DB` / `env.BUCKET`）。想换名字就全局替换，别只改配置。
@@ -112,10 +112,7 @@ cp folia-admin/public/assets/* public/assets/
 
 ## 6. 部署并验证
 
-```bash
-npx wrangler pages deploy <你的构建输出目录> --project-name folia
-# 或：git push（如果走 Git 集成）
-```
+只走 push 到 `main`：Cloudflare Pages 项目 `folia` 已接入本仓库，push 后自动构建（构建命令为空、输出目录 `public`）。**不要**在本地执行 `npx wrangler pages deploy ... --project-name folia` 直传——那会用本地工作树覆盖线上、与仓库不一致、也无法回滚。详见 README「部署纪律」。
 
 按顺序验这 5 个点：
 
@@ -153,7 +150,7 @@ MEDIA_BASE = "https://img.example.com"
 先建你需要的分类（比如「极简」「赛博」「风景」），再批量导入本地图库：
 
 ```bash
-FOLIA_URL=https://folia-major-3t6.pages.dev \
+FOLIA_URL=https://folia-5ve.pages.dev \
 FOLIA_EMAIL=你的管理员邮箱 \
 FOLIA_PASSWORD='你的密码' \
 node tools/import-wallpapers.mjs ./wallpapers --category dynamic --publish
@@ -198,7 +195,7 @@ Cloudflare Workers 的 WebCrypto 对 PBKDF2 迭代次数**硬上限是 100000**�
 Pages 会把未知路径回退成 `index.html`。前端 `detectMode()` 因此按 `content-type` 判断，而不是只看状态码；你自己写探活逻辑时也要这样。
 
 **`wrangler.toml` 里的 `[vars]` 会覆盖面板上设的环境变量**
-用 `wrangler pages deploy` 部署时，`[vars]` 是权威来源，面板里手动加的明文变量会被冲掉（secret 不受影响）。要加的变量写进 toml。
+用 Git 集成构建（push 到 `main`）时，`[vars]` 是权威来源，面板里手动加的明文变量会被冲掉（secret 不受影响）。要加的变量写进 toml。
 
 **上传 413**
 Cloudflare 免费版请求体上限 100MB，但这个模块自己限了图片 20MB / 视频 60MB。改 `src/core/image-meta.js` 的 `MAX_IMAGE_BYTES` 和 `MAX_VIDEO_BYTES`。
