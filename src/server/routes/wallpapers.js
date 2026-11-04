@@ -31,6 +31,7 @@ import { assetKey, deleteAsset, mediaBaseFor, putAsset, thumbKey, verifyAsset } 
 import { newId, safeJsonParse, sampleFingerprint, sha256Bytes } from '../util.js';
 import { buildReorderPlan, nextSortOrder } from '../../core/ordering.js';
 import { AUDIT_ACTION, writeAudit } from '../audit.js';
+import { MEDIA_ACTOR, setMediaIdentity } from '../media-audit.js';
 import { allowedTagNames } from './tags.js';
 import { hit } from '../rate-limit.js';
 import { clientIp } from '../session.js';
@@ -375,10 +376,19 @@ export async function upload({ env, actor, request, params }) {
   // 视频顺便读时长和编码信息：开机动画是按秒循环的，moov 位置决定能不能边下边播
   const durationMs = readDurationMs(bytes, meta.mime);
   const videoInfo = readVideoInfo(bytes, meta.mime);
-  await run(
-    env, Q.updateWallpaperAsset,
-    key, meta.mime, check.size, meta.width, meta.height, durationMs, sha, nextKind, nowMs(), row.id,
-  );
+  // 媒体三列（storage_key/bytes/sha256）统一走 setMediaIdentity：
+  // 它先 UPDATE，再把 schema/015 触发器刚写入的审计行补上 changed_by。
+  await setMediaIdentity(env, row.id, {
+    storageKey: key,
+    mime: meta.mime,
+    bytes: check.size,
+    width: meta.width,
+    height: meta.height,
+    durationMs,
+    sha256: sha,
+    kind: nextKind,
+    actor: row.storage_key ? MEDIA_ACTOR.REPLACE : MEDIA_ACTOR.UPLOAD,
+  });
   await run(
     env, Q.markWallpaperVerified,
     nowMs(), videoInfo.codec, videoInfo.faststart, row.id,

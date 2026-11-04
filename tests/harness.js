@@ -25,6 +25,9 @@ const DEFAULT_HANDLERS = {
   ]),
   // 上传成功后的记账（verified_at / codec / faststart），用例不关心具体值
   [Q.markWallpaperVerified]: () => [],
+  // schema/015 的审计补标注：假环境没有 media_audit 表，注册成 no-op 避免 warn 噪音；
+  // 真实行为（触发器 + changed_by）由 tests/media-audit.test.js 用真 SQLite 验证。
+  [Q.mediaAuditAnnotate]: () => [],
   /**
    * 筛选面板（facets）的聚合。假环境不跑 SQL，默认给「没有可统计的条目」；
    * 计数语义（GROUP BY / json_each / UNION ALL）由 tests/public-facets.test.js 用真 SQLite 验证，

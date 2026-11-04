@@ -160,6 +160,17 @@ export const Q = {
       review_status = ?, tags = ?, featured = ?, sort_order = ?, updated_at = ?, published_at = ? WHERE id = ?`,
   updateWallpaperAsset: `UPDATE wallpapers SET storage_key = ?, mime = ?, bytes = ?, width = ?, height = ?,
       duration_ms = ?, sha256 = ?, kind = ?, updated_at = ? WHERE id = ?`,
+  /** 只改媒体三列（工具重算 sha256/bytes 用）；不碰 mime/width/height/kind。 */
+  updateMediaIdentity: `UPDATE wallpapers SET storage_key = ?, bytes = ?, sha256 = ?, updated_at = ? WHERE id = ?`,
+  /**
+   * schema/015：媒体审计的 actor 只能应用层补（触发器看不到调用方）。
+   * 只改最近一条「还没标注」的行，且限定在本次 UPDATE 的时间窗内，
+   * 避免把更早的、由外部工具写下的 NULL 行误算到这次上传头上。
+   */
+  mediaAuditAnnotate: `UPDATE media_audit SET changed_by = ?
+    WHERE id = (SELECT id FROM media_audit
+      WHERE wallpaper_id = ? AND changed_by IS NULL AND changed_at >= ?
+      ORDER BY changed_at DESC, id DESC LIMIT 1)`,
   updateWallpaperThumb: `UPDATE wallpapers SET thumb_key = ?, updated_at = ? WHERE id = ?`,
   /** 上传回读成功后记账：verified_at + 编码信息 */
   /** 批量审核：把待审核的已发布作品一次性标记为已审核 */
