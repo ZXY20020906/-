@@ -15,10 +15,9 @@
 3. **D1 的 `bytes` 与 `sha256` 必须来自同一份已校验的文件，成对更新。**
    禁止「按 HEAD 长度改 `bytes`、`sha256` 留旧值」——那是把真实故障伪装成「记录不准」，比不修更糟。
 
-> 位数口径：`docs/r2.md` 记录的历史是「新建 12 位、修被污染的旧 key 用 16 位」。
-> 从现在起**统一 16 位**。`src/server/storage.js` 的 `assetKey()` 目前仍是 `slice(0, 12)`，
-> 改成 16 位是**待执行**的代码改动；在它切换前，后台上传产出的是 12 位键，
-> 别手工造一个 16 位键去顶替同一条记录——要么都等切换，要么都用 16 位手工补齐后再改 D1。
+> 位数口径：**已统一 16 位**——`src/server/storage.js` 的 `assetKey()` / `thumbKey()` 是
+> `slice(0, 16)`（常量 `HASH_PREFIX_LEN`），本文件按 16 位写。历史 12 位对象**保留不动**，
+> 不做批量改名、也不指回旧键；`docs/r2.md` 里那三条被污染的历史 key 是 12 位，属于既成事实。
 
 ## 2. 标准流程（七步）
 
@@ -45,7 +44,8 @@ $size = (Get-Item -LiteralPath $file).Length
 
 这两个值就是后面 D1 要写的数，**不要再算第二遍**（第二遍的文件可能已经不是同一份）。
 
-> 注意：>40MB 的文件走后台上传时不算完整 sha256（Worker 内存限制，改用首尾 1MB 采样指纹做 key），
+> 注意：>40MB 的文件走后台上传时不算完整 sha256（Worker 的 CPU 预算装不下这个 digest，
+> 改用首尾 1MB 采样指纹做 key，并打一条 `upload: sha256 skipped (>40MB)` 的 warn），
 > 此时 D1 的 `sha256` 为 `NULL`。这类记录第 3 节第 3 条不适用，只能靠手算的 `$sha` 自己比对。
 
 ### 第 3 步 生成 key
@@ -140,6 +140,10 @@ $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $tmp).Hash.ToLower()
 Remove-Item -LiteralPath $tmp -Force
 "GOT=$got" ; "EXP=$expectSha" ; ($got -eq $expectSha)
 ```
+
+> 若该记录 `sha256` 为 `NULL`（>40MB 文件，服务端不算完整 sha256，只在日志里留
+> `upload: sha256 skipped (>40MB), integrity verification unavailable`），第③条不适用：
+> 必须用 ①+② 双长度检查兜底，并在后台记录里标注「无 sha256，仅长度校验」。
 
 **④ API（加 `_ts` 绕缓存）已返回新 url 与新 bytes**
 

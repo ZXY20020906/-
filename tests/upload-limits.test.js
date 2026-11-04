@@ -152,7 +152,7 @@ test('大文件指纹：key 用内容指纹而不是 13 位时间戳，且只写
   assert.equal(puts.length, 1, 'putAsset 只调用一次');
   const [, keyPart] = /^wallpapers\/wp_1\/([^.]*)\.png$/.exec(puts[0].key) ?? [];
   assert.ok(keyPart, `key 形状不对：${puts[0].key}`);
-  assert.match(keyPart, /^[0-9a-f]{12}$/, 'key 第二段应当是十六进制指纹，不是时间戳');
+  assert.match(keyPart, /^[0-9a-f]{16}$/, 'key 第二段应当是十六进制指纹，不是时间戳');
   assert.doesNotMatch(keyPart, /^\d{13}$/, '不能再是 Date.now()');
 
   // 大文件不写 sha256（那一列是对外输出的真 sha256），但回读校验仍然执行
@@ -194,7 +194,7 @@ test('小文件分支不回归：仍然算 sha256 并做 sha 去重', async () =
   const { env, calls, puts } = uploadEnv();
   const res = await putAsset(env);
   assert.equal(res.status, 200);
-  assert.match(puts[0].key, /^wallpapers\/wp_1\/[0-9a-f]{12}\.png$/);
+  assert.match(puts[0].key, /^wallpapers\/wp_1\/[0-9a-f]{16}\.png$/);
   const update = calls.find((c) => c.sql === Q.updateWallpaperAsset);
   assert.match(update.args[6], /^[0-9a-f]{64}$/, '小文件必须写真 sha256');
   assert.equal(calls.some((c) => c.sql === Q.updateWallpaperFingerprint), false);

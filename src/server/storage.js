@@ -1,15 +1,27 @@
 /** R2 对象读写。key 里带内容哈希，所以可以放心用 immutable 缓存。 */
 import { EXT_BY_MIME } from '../core/image-meta.js';
 
+/**
+ * key 里的哈希前缀长度。曾用 12 位；2026-11-04「同址双版本」事故说明 12 位太短——
+ * 内容换过的重打包没换 key，同名覆盖后旧 URL 上长期并存两个版本。统一扩到 16 位，
+ * 让"新内容落在从未服务过的 URL"这件事在位数上就成立。见 docs/r2.md / docs/UPLOAD-SOP.md。
+ */
+export const HASH_PREFIX_LEN = 16;
+
+/** 去掉 id 里的非法字符，避免把路径分隔符带进 key */
+function safeId(wallpaperId) {
+  return String(wallpaperId).replace(/[^A-Za-z0-9_-]/g, '');
+}
+
 export function assetKey(wallpaperId, sha256, mime) {
   const ext = EXT_BY_MIME[mime] ?? 'bin';
-  return `wallpapers/${String(wallpaperId).replace(/[^A-Za-z0-9_-]/g, '')}/${sha256.slice(0, 12)}.${ext}`;
+  return `wallpapers/${safeId(wallpaperId)}/${sha256.slice(0, HASH_PREFIX_LEN)}.${ext}`;
 }
 
 /** 缩略图单独放 thumbs/ 前缀，方便以后整体清理或换尺寸策略 */
 export function thumbKey(wallpaperId, sha256, mime) {
   const ext = EXT_BY_MIME[mime] ?? 'webp';
-  return `thumbs/${String(wallpaperId).replace(/[^A-Za-z0-9_-]/g, '')}/${sha256.slice(0, 12)}.${ext}`;
+  return `thumbs/${safeId(wallpaperId)}/${sha256.slice(0, HASH_PREFIX_LEN)}.${ext}`;
 }
 
 /**

@@ -37,9 +37,9 @@ function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-/** 和线上一致：wallpapers/<id>/<sha 前 12 位>.<ext> */
+/** 和线上一致：wallpapers/<id>/<sha 前 16 位>.<ext>（与 src/server/storage.js 的 HASH_PREFIX_LEN 对齐） */
 function assetKey(id, hash, ext) {
-  return `wallpapers/${id}/${hash.slice(0, 12)}.${ext}`;
+  return `wallpapers/${id}/${hash.slice(0, 16)}.${ext}`;
 }
 
 const EXT_BY_MIME = {

@@ -22,7 +22,7 @@
        → /media/<key> 或 https://img.example.com/<key>（R2：原图/视频）
 ```
 
-- key 规则 `wallpapers/<id>/<sha256前12位>.<ext>`，内容一变 key 就变，所以能放心给一年 `immutable` 缓存。
+- key 规则 `wallpapers/<id>/<sha256前16位>.<ext>`，内容一变 key 就变，所以能放心给一年 `immutable` 缓存。
 - 换 R2 自定义域名只改一个变量 `MEDIA_BASE`，代码不动。
 - 视频支持 `Range`（206），拖进度条不重下整段。
 

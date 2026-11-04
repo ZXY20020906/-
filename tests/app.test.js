@@ -280,7 +280,7 @@ test('上传：真 PNG 写入 R2 并记录尺寸', async () => {
   }));
   assert.equal(res.status, 200);
   assert.equal(puts.length, 1);
-  assert.match(puts[0].key, /^wallpapers\/wp_1\/[0-9a-f]{12}\.png$/);
+  assert.match(puts[0].key, /^wallpapers\/wp_1\/[0-9a-f]{16}\.png$/);
   assert.equal(puts[0].options.httpMetadata.contentType, 'image/png');
   assert.match(res.body.data.url, /^\/media\//);
 });

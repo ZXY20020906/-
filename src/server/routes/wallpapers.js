@@ -324,8 +324,9 @@ export async function upload({ env, actor, request, params }) {
     ? 'dynamic'
     : meta.mime.startsWith('image/') ? 'static' : row.kind;
 
-  // 大文件跳过完整 sha256：Worker 内存只有 128MB，对 80MB+ 的文件再算一遍 sha256 容易被打爆。
-  // 也不能拿 Date.now() 当 key —— 那样同一个文件每次上传都是新对象，R2 里只会堆垃圾。
+  // 大文件跳过完整 sha256：Worker 只有有限的 CPU 预算（免费档 10ms/请求），
+  // 40MB+ 的 digest 会把它吃穿并抛 exceededCpu。也不能拿 Date.now() 当 key ——
+  // 那样同一个文件每次上传都是新对象，R2 里只会堆垃圾。
   const hashLimit = Number(env.UPLOAD_HASH_LIMIT ?? HASH_LIMIT) || HASH_LIMIT;
   let sha = null;
   if (bytes.byteLength <= hashLimit) {
@@ -349,6 +350,16 @@ export async function upload({ env, actor, request, params }) {
   }
 
   const key = assetKey(row.id, keySeed, meta.mime);
+
+  if (!sha) {
+    // 大文件不算完整 sha256，D1 的 sha256 列会是 NULL —— "全量下载比对 sha256" 这条验收
+    // 对这一条记录无解。留一条 warn（而不是静默留空），让后来人知道这是设计取舍不是漏写；
+    // 兜底只能靠 HEAD 长度 + Range 总量双长度检查（见 docs/UPLOAD-SOP.md 第 3 节）。
+    console.warn(
+      `[upload] sha256 skipped (>40MB), integrity verification unavailable — wallpaper=${row.id} size=${bytes.byteLength} hashLimit=${hashLimit} key=${key}`,
+    );
+  }
+
   await putAsset(env, key, bytes, meta.mime);
 
   // 写完立刻回读：D1 记账必须来自刚校验过的对象，否则就是「库里有、桶里没有」

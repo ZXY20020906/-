@@ -33,7 +33,7 @@ const PUBLIC_READ_PREFIXES = ['/media/'];
 ```
 
 - 放开的只有「已发布」数据：`/api/public/wallpapers` 本来就不会返回草稿和下线作品。
-- `/media/*` 的 key 形如 `wallpapers/<wp_id>/<内容哈希前12位>.<ext>`，既不可枚举，换内容还会换 key。
+- `/media/*` 的 key 形如 `wallpapers/<wp_id>/<内容哈希前16位>.<ext>`，既不可枚举，换内容还会换 key。
 - 写接口一个都没放：POST/PATCH/DELETE 仍然要管理员会话，`/api/public/categories`、`/api/plugin/feed` 这些也**没有**顺手放开。
 - 这两个路由的 CORS 是 `*`（只读、无 Cookie 身份），所以插件从任意源 fetch 都能读。
 
