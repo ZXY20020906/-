@@ -1,11 +1,13 @@
 /**
  * 公开只读接口（给前台壁纸库用，无需登录）：
  *   GET /api/public/categories
- *   GET /api/public/wallpapers?category=&kind=&q=&sort=&featured=1&page=&cursor=&limit=
+ *   GET /api/public/tags?category=
+ *   GET /api/public/subtags?category=&tag=
+ *   GET /api/public/wallpapers?category=&kind=&q=&sort=&featured=1&tag=&aspect=&subtag=&page=&cursor=&limit=
  *   GET /api/public/wallpapers/:slug
  */
 import { Q } from '../queries.js';
-import { PUBLIC_LIST_BY_SORT, PUBLIC_SUBTAGS } from '../queries.js';
+import { PUBLIC_FACETS, PUBLIC_LIST_BY_SORT, PUBLIC_SUBTAGS } from '../queries.js';
 import { all, first } from '../db.js';
 import { cursorForSort, decodeCursor, normalizeCursor } from '../../core/pagination.js';
 import { cleanEnum, parseLimit, parsePage, parseSort } from '../../core/validate.js';
@@ -24,6 +26,70 @@ function likePattern(raw) {
   return cleaned ? `%${cleaned}%` : null;
 }
 
+/** 标签筛选：单个标签名最长 30 字；一次最多 20 个（再多就不像人点的了）。 */
+const TAG_VALUE_MAX = 30;
+const TAG_MAX_VALUES = 20;
+
+/** facets 里 tags / subtags 最多给多少个（按 count 降序）。 */
+const FACET_LIMIT = 50;
+
+/**
+ * 解析 `tag` 参数：逗号分隔的多值，语义是 **OR**（命中任意一个标签即算匹配）。
+ *
+ * 库里的 `wallpapers.tags` 是 JSON 数组文本，所以这里转成 JSON 数组字符串交给
+ * `json_each`（见 queries.js 的 tagMatch），一个占位符搞定多值。
+ * 单值输入与旧版完全一致：清洗规则（剔掉 `% _ \ "`）、长度上限、`filters.tag` 输出都不变。
+ */
+function parseTagFilter(raw) {
+  const text = String(raw ?? '').replace(/[%_\\"]/g, '').trim();
+  if (!text) return { values: [], json: null };
+  const values = [];
+  for (const part of text.split(',')) {
+    const value = part.trim();
+    if (!value) continue;
+    // 与旧版一致：单个标签过长是 400，而不是悄悄截断
+    if (value.length > TAG_VALUE_MAX) throw badRequest('tag 参数过长');
+    if (!values.includes(value)) values.push(value);
+  }
+  if (values.length > TAG_MAX_VALUES) throw badRequest(`tag 参数过多（最多 ${TAG_MAX_VALUES} 个）`);
+  return { values, json: values.length ? JSON.stringify(values) : null };
+}
+
+/**
+ * 聚合行 → facets。
+ * 三种 facet 共用一条 SQL（UNION ALL），路由这里只做分桶、排序和 50 条上限，
+ * 所以「按条件统计」的语义全在 SQL 里，JS 不会和 SQL 各算一套。
+ */
+function facetsFromRows(rows) {
+  const categories = [];
+  const tags = [];
+  const subtags = [];
+  for (const row of rows) {
+    const count = Number(row?.n ?? 0);
+    if (!(count > 0)) continue;
+    if (row.facet === 'category') {
+      if (!row.id) continue;
+      categories.push({ id: row.id, slug: row.slug ?? null, name: row.name ?? null, count });
+    } else if (row.facet === 'tag') {
+      if (typeof row.value === 'string' && row.value) tags.push({ name: row.value, count });
+    } else if (row.facet === 'subtag') {
+      if (typeof row.value === 'string' && row.value) subtags.push({ name: row.value, count });
+    }
+  }
+  // 排序用码位比较（不依赖 ICU/locale），保证不同运行环境下同一份数据顺序一致
+  const byName = (a, b) => (String(a.name ?? '') < String(b.name ?? '') ? -1 : String(a.name ?? '') > String(b.name ?? '') ? 1 : 0);
+  const byCount = (a, b) => b.count - a.count || byName(a, b);
+  // 分类按 count 降序，同数按 id 升序：面板计数是按 id 取的，顺序只需稳定
+  categories.sort((a, b) => b.count - a.count || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  tags.sort(byCount);
+  subtags.sort(byCount);
+  return {
+    categories,
+    tags: tags.slice(0, FACET_LIMIT),
+    subtags: subtags.slice(0, FACET_LIMIT),
+  };
+}
+
 export async function listCategories({ env }) {
   const rows = await all(env, Q.listPublicCategories);
   return json({ categories: rows.map(categoryDto) });
@@ -38,10 +104,9 @@ export async function listWallpapers({ env, url, request }) {
   if (category && category.length > 80) throw badRequest('category 参数过长');
   const featuredOnly = params.get('featured') === '1' || params.get('featured') === 'true' ? 1 : 0;
   const like = likePattern(params.get('q'));
-  // 标签：tags 是 JSON 数组字符串，用 %"标签"% 精确匹配其中一项
+  // 标签：可多值（逗号分隔，OR）；`filters.tag` 仍然回显清洗后的原始字符串，字段语义不变。
   const tagRaw = params.get('tag')?.trim().replace(/[%_\\"]/g, '') ?? '';
-  if (tagRaw.length > 30) throw badRequest('tag 参数过长');
-  const tagLike = tagRaw ? `%"${tagRaw}"%` : null;
+  const tagFilter = parseTagFilter(tagRaw);
   const aspect = parseAspect(params.get('aspect'));
 
   // page 是给「1 2 3 4」这种页码翻页用的；cursor 继续服务无限滚动和插件。
@@ -59,11 +124,16 @@ export async function listWallpapers({ env, url, request }) {
   if (!sql) throw badRequest('不支持的排序方式');
 
   const subtag = String(params.get('subtag') ?? '').replace(/[%_\\]/g, '').trim().slice(0, 40) || null;
-  const rows = await all(env, sql, category, kind, like, featuredOnly, cursorKey, cursorId, limit + 1, tagLike, aspect, offset, subtag);
+  const rows = await all(env, sql, category, kind, like, featuredOnly, cursorKey, cursorId, limit + 1, tagFilter.json, aspect, offset, subtag);
   const total = Number((await first(
     env, Q.publicCount,
-    category, kind, like, featuredOnly, tagLike, aspect, subtag,
+    category, kind, like, featuredOnly, tagFilter.json, aspect, subtag,
   ))?.n ?? 0);
+  // 面板数据：一次聚合查询，条件与上面的清单完全一致（分页参数不参与，facets 永远针对整个筛选结果）。
+  const facets = facetsFromRows(await all(
+    env, PUBLIC_FACETS,
+    category, kind, like, featuredOnly, tagFilter.json, aspect, subtag,
+  ));
   const items = rows.slice(0, limit);
   const hasMore = paged ? offset + items.length < total : rows.length > limit;
 
@@ -80,6 +150,8 @@ export async function listWallpapers({ env, url, request }) {
       offset,
       sort,
       filters: { category, kind, tag: tagRaw || null, aspect: params.get('aspect') ?? null },
+      // 纯增量字段：老客户端忽略即可。三个数组都只含 count > 0 的项。
+      facets,
     },
   };
 
@@ -105,17 +177,18 @@ export async function listWallpapers({ env, url, request }) {
   });
 }
 
+/** 前台子标签筛选：按当前分类/标签给出可选子标签（tag 同样支持逗号分隔多值，OR） */
+export async function listSubtags({ env, url }) {
+  const category = url.searchParams.get('category')?.trim() || null;
+  const tagFilter = parseTagFilter(url.searchParams.get('tag') ?? '');
+  const rows = await all(env, PUBLIC_SUBTAGS, category, tagFilter.json);
+  return json({ subtags: rows.map((row) => ({ name: row.name, count: Number(row.n) })) });
+}
+
 /**
  * 标签列表。带上 ?category=<slug> 时只返回「全局标签 + 该分类专属标签」，
  * 前台筛选栏跟着当前模块走；不带就返回全部（后台选标签时用）。
  */
-/** 前台子标签筛选：按当前分类/标签给出可选子标签 */
-export async function listSubtags({ env, url }) {
-  const category = url.searchParams.get('category')?.trim() || null;
-  const tag = String(url.searchParams.get('tag') ?? '').replace(/[%_\\"]/g, '').trim().slice(0, 32);
-  const rows = await all(env, PUBLIC_SUBTAGS, category, tag ? `%"${tag}"%` : null);
-  return json({ subtags: rows.map((row) => ({ name: row.name, count: Number(row.n) })) });
-}
 export async function listTags({ env, url }) {
   const slug = String(url.searchParams.get('category') ?? '').trim().slice(0, 80);
   let tagRows;

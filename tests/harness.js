@@ -3,7 +3,7 @@
  * 好处：路由若调用了没注册的查询会立刻报错，不会静默返回空结果。
  * 同时校验 bind 数量与占位符一致 —— D1 在线上就是在这里报错的。
  */
-import { Q } from '../src/server/queries.js';
+import { Q, PUBLIC_FACETS } from '../src/server/queries.js';
 import { sha256Hex } from '../src/server/util.js';
 
 export function bindCount(sql) {
@@ -25,6 +25,12 @@ const DEFAULT_HANDLERS = {
   ]),
   // 上传成功后的记账（verified_at / codec / faststart），用例不关心具体值
   [Q.markWallpaperVerified]: () => [],
+  /**
+   * 筛选面板（facets）的聚合。假环境不跑 SQL，默认给「没有可统计的条目」；
+   * 计数语义（GROUP BY / json_each / UNION ALL）由 tests/public-facets.test.js 用真 SQLite 验证，
+   * 这样既不让每个老用例都要多注册一次查询，也不会用假数据假装算对了。
+   */
+  [PUBLIC_FACETS]: () => [],
 };
 
 export function createEnv(handlers, { bucket } = {}) {

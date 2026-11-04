@@ -145,12 +145,23 @@ X-Folia-Client: admin
 
 ## 公开接口（无需登录）
 
+这几个接口对匿名请求开放（站点门里只有它们和 `/media/*` 是白名单，见 [`private-site.md`](private-site.md)）。
+只认 `GET` / `HEAD`（外加跨域预检 `OPTIONS`），写接口一律仍要管理员会话。
+
+**匿名可读接口清单**
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| `GET` | `/api/meta` | 站点是否已初始化、可用 `kinds` / `sorts` |
 | `GET` | `/api/public/categories` | 只返回 `is_public = 1` 的分类，带已发布数量 |
 | `GET` | `/api/public/tags?category=<slug>` | 全局标签 + 该分类专属标签；不带 `category` 返回全部 |
-| `GET` | `/api/public/wallpapers` | 只返回已发布且有文件的壁纸 |
+| `GET` | `/api/public/subtags?category=<slug>&tag=<标签>` | 出现过的子标签（按当前分类/标签收窄） |
+| `GET` | `/api/public/wallpapers` | 只返回已发布且有文件的壁纸；带筛选面板数据 `facets` |
 | `GET` | `/api/public/wallpapers/:slug` | 单张详情 |
+| `GET` | `/media/*` | 媒体直链，key 含内容哈希、不可枚举 |
+
+`/api/public/*` 都带 `access-control-allow-origin: *`，插件从任意源 fetch 都能读；它们不接受 Cookie 身份，所以不存在把会话暴露给别的源的问题。
+`/api/plugin/feed` **不在**白名单里，仍然需要管理员会话（它服务站内插件面板，用的是会话身份）。
 
 **标签按分类拆分**：`tags` 表有 `category_id`，为空是全局标签（所有分类可见）。后台 `POST/PATCH /api/admin/tags` 接受 `categoryId`（`null` = 全局），作品页的标签下拉会跟着选中分类过滤。
 
@@ -160,6 +171,9 @@ X-Folia-Client: admin
 |---|---|
 | `category` | 分类 slug（不是 id） |
 | `kind` | `static` / `dynamic` |
+| `tag` | 标签名精确匹配；**支持逗号分隔多值，语义是 OR**（`tag=动漫,游戏` → 带其中任意一个标签即命中）。单个标签最长 30 字，一次最多 20 个 |
+| `subtag` | 子标签名精确匹配 |
+| `aspect` | 宽高比档位：`16:9` / `21:9` / `32:9` / `9:16` / `4:3` / `1:1`（容差 6%） |
 | `q` | 标题模糊搜索（≤60 字，`%` `_` 会被剔除） |
 | `sort` | `recent`(默认) / `oldest` / `name` / `size` / `resolution` |
 | `featured=1` | 只要置顶的 |
@@ -184,10 +198,30 @@ X-Folia-Client: admin
     }],
     "total": 42, "hasMore": true, "nextCursor": "eyJ0Ijo...",
     "page": 2, "pageSize": 24, "pageCount": 2, "offset": 24,
-    "sort": "recent"
+    "sort": "recent",
+    "facets": {
+      "categories": [{ "id": "cat_wallpaper", "slug": "wallpaper", "name": "壁纸", "count": 61 }],
+      "tags": [{ "name": "动漫", "count": 33 }, { "name": "游戏", "count": 12 }],
+      "subtags": [{ "name": "原神", "count": 9 }]
+    }
   }
 }
 ```
+
+### `data.facets`（筛选面板数据）
+
+给「分类 / 标签 / 子标签」下拉框直接喂数据和角标，**纯增量字段**：旧的 `items` / `total` / 分页字段与参数语义完全没变，老客户端忽略它即可。
+
+- **统计口径与当前筛选条件一致**：`category`、`kind`、`tag`、`subtag`、`aspect`、`q`、`featured` 有的都算进去（分页参数不参与，永远针对整个筛选结果）。所以「点开某分类后的角标」和「切回全部后的角标」都是对的，前端不需要自己算。
+- **可见性门槛与清单同源**：两处都取自 `src/server/queries.js` 的同一个 `PUBLIC_VISIBLE`（`published` + 有文件 + `verified_at` 非空 + `review_status = 'approved'`）。因此同一筛选条件下 `sum(facets.categories[].count)` **恒等于**清单的 `total`。唯一例外：`category_id` 为 `NULL` 的未分类作品会进清单与 tags/subtags，但没有分类可归，所以不计入 `categories` 分组（合计比 `total` 少这几条）。回归测试见 `tests/public-facets.test.js` 的「一致性」用例。
+- **`categories`**：`{id, slug, name, count}`。跟当前筛选走 —— 带了 `category` 时只剩该分类；某个分类下 0 条就不会出现（未分类的作品也不会出现在这里）。
+- **`tags`**：`{name, count}`，只含 `count > 0` 的标签，按 `count` 降序，最多 **50** 个。
+- **`subtags`**：`{name, count}`，同上（空子标签不计）。
+- 三个数组共用**一条**聚合 SQL（`GROUP BY` + `json_each`），不是按条目逐条查；单次清单请求固定 3 条 SQL（列表 / 计数 / facets）。
+- **旧接口的 count 口径更宽，可能与 facets 不同**：`/api/public/tags` 与 `/api/public/subtags` 是历史接口，它们的 `count` 只要求「已发布 + 有文件」，**不看** `verified_at` / `review_status`（未审核或未验证的条目也会被算进去）。所以两个数可能对不上：**筛选面板一律以 `facets` 为准**，旧接口的 count 只当参考。
+- `tag` 参数清洗后没有有效值时（例如 `tag=`、`tag=,,,`）等价于「不过滤」，清单与 facets 都回到全量 —— 与 JSON 数组为空时走 `?N IS NULL` 是同一个分支。
+
+`/api/public/subtags` 的 `tag` 参数同样支持逗号分隔多值（OR）。
 
 `page` / `pageSize` / `pageCount` / `offset` 在传 `page` 时最有用（`page` 不传时 `page` 为 `null`，`pageCount` 仍按 `total` 算）。用游标时继续看 `nextCursor` / `hasMore`，两者不要混用。
 

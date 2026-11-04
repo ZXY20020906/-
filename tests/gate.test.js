@@ -117,17 +117,29 @@ test('未登录：页面给登录页，未放行的接口给 site_locked', async
   assert.match(html, /欢迎回家/);
   assert.match(html, /name="password"/);
 
-  const api = makeContext('/api/public/categories');
+  const api = makeContext('/api/plugin/feed');
   const apiRes = await gateMiddleware(api.context);
   assert.equal(apiRes.status, 401);
   assert.equal((await apiRes.json()).error.code, 'site_locked');
 });
 
-test('插件只读白名单：GET 清单与媒体匿名放行，其它路径和方法照旧要管理员', async () => {
+test('插件只读白名单：清单/分类/标签/子标签与媒体匿名放行，其它路径和方法照旧要管理员', async () => {
   const list = makeContext('/api/public/wallpapers?category=assistant-skin&limit=100');
   const listRes = await gateMiddleware(list.context);
   assert.equal(listRes.status, 200);
   assert.equal(list.state.nextCalls, 1);
+
+  // 筛选面板的下拉数据：插件不登录也要能拿到
+  for (const path of [
+    '/api/public/categories',
+    '/api/public/tags?category=assistant-skin',
+    '/api/public/subtags?category=assistant-skin&tag=%E6%B8%B8%E6%88%8F',
+  ]) {
+    const ctx = makeContext(path);
+    const res = await gateMiddleware(ctx.context);
+    assert.equal(res.status, 200, path);
+    assert.equal(ctx.state.nextCalls, 1, path);
+  }
 
   for (const path of ['/media/wallpapers/wp_1/abc123.zip', '/media/thumbs/wp_1/abc123.webp']) {
     const ctx = makeContext(path);
@@ -137,22 +149,29 @@ test('插件只读白名单：GET 清单与媒体匿名放行，其它路径和�
   }
 
   // 带 Range 的媒体请求会先发预检，OPTIONS 也必须放行
-  for (const path of ['/api/public/wallpapers', '/media/wallpapers/wp_1/abc123.zip']) {
+  for (const path of ['/api/public/wallpapers', '/api/public/tags', '/media/wallpapers/wp_1/abc123.zip']) {
     const ctx = makeContext(path, { method: 'OPTIONS' });
     const res = await gateMiddleware(ctx.context);
     assert.equal(res.status, 200, `OPTIONS ${path}`);
     assert.equal(ctx.state.nextCalls, 1, `OPTIONS ${path}`);
   }
 
-  // 写方法不在白名单里：POST 仍然被门挡住
-  const post = makeContext('/api/public/wallpapers', { method: 'POST' });
-  const postRes = await gateMiddleware(post.context);
-  assert.equal(postRes.status, 401);
-  assert.equal((await postRes.json()).error.code, 'site_locked');
-  assert.equal(post.state.nextCalls, 0);
+  // 写方法不在白名单里：POST 仍然被门挡住（分类接口也一样）
+  for (const path of ['/api/public/wallpapers', '/api/public/categories', '/api/public/tags']) {
+    const post = makeContext(path, { method: 'POST' });
+    const postRes = await gateMiddleware(post.context);
+    assert.equal(postRes.status, 401, path);
+    assert.equal((await postRes.json()).error.code, 'site_locked', path);
+    assert.equal(post.state.nextCalls, 0, path);
+  }
 
-  // 只放了一条精确路径，别的公开接口没有顺手放开
-  for (const path of ['/api/public/categories', '/api/public/tags', '/api/plugin/feed', '/api/admin/wallpapers']) {
+  // 只放了几条精确路径，别的公开接口没有顺手放开
+  for (const path of [
+    '/api/public/wallpapers/demo',
+    '/api/plugin/feed',
+    '/api/admin/wallpapers',
+    '/api/admin/categories',
+  ]) {
     const ctx = makeContext(path);
     const res = await gateMiddleware(ctx.context);
     assert.equal(res.status, 401, path);

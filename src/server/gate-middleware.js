@@ -6,7 +6,8 @@
  * - 有会话但不是管理员 → 清掉会话，回登录页并说明原因（避免“登录了却一直弹回登录页”的死循环）；
  * - 没有会话 → 页面给登录页（401），/api/* 给 401 site_locked，/media/* 给 403；
  * - 认证接口放行，否则登录页自己没法登录、后台会话过期后也没法重新登；
- * - 插件只读白名单放行：GET/HEAD 的 /api/public/wallpapers 与 /media/*（见下）；
+ * - 插件只读白名单放行：GET/HEAD 的 /api/public/wallpapers、/api/public/categories、
+ *   /api/public/tags、/api/public/subtags 与 /media/*（见下）；
  * - /__gate 本身处理：GET 登录页、POST 登录、?logout=1 退出。
  *
  * 会话读库有成本（每个请求一次 D1 读），换来的是“停用账号/退出登录立刻生效”，
@@ -277,15 +278,22 @@ const AUTH_EXEMPT = new Set([
 /**
  * 匿名只读白名单。
  *
- * 桌面插件（以及以后别的客户端）要能在不登录的情况下拉「已发布」清单，
- * 并把清单里的封面和原文件直接当 <img src> / 下载地址用——否则整条链路都被登录门挡住。
+ * 桌面插件（以及以后别的客户端）要能在不登录的情况下拉「已发布」清单、分类/标签/子标签
+ * 筛选面板，并把清单里的封面和原文件直接当 <img src> / 下载地址用——否则整条链路都被登录门挡住。
  *
  * 放开的是「已发布」数据（草稿、下线作品本来就不在公开接口里），而且媒体 key 里带
  * wallpaper id + 内容哈希，没法枚举。写接口一个都没放。
  *
- * 只认 GET/HEAD，并且是精确路径 / 前缀，别的路径照旧要管理员会话。
+ * 只认 GET/HEAD（外加 CORS 预检的 OPTIONS，它不是写操作），并且是精确路径 / 前缀，
+ * 别的路径照旧要管理员会话。分类/标签/子标签这三个接口只是「给下拉框喂数据」，
+ * 与清单用的是同一套「已发布」过滤条件，放开它们不会多露出任何非公开内容。
  */
-const PUBLIC_READ_PATHS = new Set(['/api/public/wallpapers']);
+const PUBLIC_READ_PATHS = new Set([
+  '/api/public/wallpapers',
+  '/api/public/categories',
+  '/api/public/tags',
+  '/api/public/subtags',
+]);
 const PUBLIC_READ_PREFIXES = ['/media/'];
 
 function isPublicRead(request, url) {

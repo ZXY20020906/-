@@ -11,6 +11,20 @@
 
 没有第三种角色，也没有"只读访客"账号——访客走公开只读接口 `/api/public/*`，不需要登录。
 
+## 匿名访问（没有账号）
+
+站点门（`src/server/gate-middleware.js`）只放行以下几类，其余 `/api/*` 一律要管理员会话：
+
+| 路径 | 方法 | 说明 |
+|---|---|---|
+| `/api/public/wallpapers`、`/api/public/wallpapers/:slug` | GET/HEAD | 已发布清单与详情（响应带 `facets` 筛选面板数据） |
+| `/api/public/categories`、`/api/public/tags`、`/api/public/subtags` | GET/HEAD | 筛选面板的下拉数据 |
+| `/media/*` | GET/HEAD | 封面 / 原文件直链（key 含内容哈希，不可枚举） |
+| `/api/auth/*`、`/api/meta`、`/api/setup` | 各自 | 登录、探测、空库初始化（接口自己校验身份） |
+
+匿名只能读「已发布 + 已审核 + 有文件」的数据；`POST/PATCH/PUT/DELETE` 一个都没放。
+完整清单与理由见 [`private-site.md`](private-site.md) 的「放行清单」。
+
 ## 动作 × 角色
 
 | 动作 | 常量 | admin | editor |

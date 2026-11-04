@@ -15,29 +15,39 @@
              │
              ├─ 有会话但不是管理员 ──► 销毁会话，回登录页并提示
              │
-             ├─ /api/auth/*、/api/meta ──► 放行（它们自己校验身份）
+             ├─ /api/auth/*、/api/meta、/api/setup ──► 放行（它们自己校验身份）
              │
-             ├─ GET/HEAD /api/public/wallpapers 与 /media/* ──► 放行（插件只读白名单）
+             ├─ GET/HEAD /api/public/{wallpapers,categories,tags,subtags} 与 /media/* ──► 放行（插件只读白名单）
              │
              └─ 其它 ──► 页面(401 登录页) · /api(401 site_locked) · /media(403)
 ```
 
 ## 插件只读白名单
 
-桌面插件要在不登录的情况下拉清单、显示封面、下载皮肤包，所以门里留了一个**精确**的口子：
+桌面插件要在不登录的情况下拉清单、显示封面、下载皮肤包，**还要能渲染分类/标签筛选面板**，
+所以门里留了一个**精确**的口子：
 
 ```js
-const PUBLIC_READ_PATHS = new Set(['/api/public/wallpapers']);
+const PUBLIC_READ_PATHS = new Set([
+  '/api/public/wallpapers',
+  '/api/public/categories',
+  '/api/public/tags',
+  '/api/public/subtags',
+]);
 const PUBLIC_READ_PREFIXES = ['/media/'];
-// 只认 GET / HEAD，其余路径与方法照旧走会话校验
+// 只认 GET / HEAD（外加跨域预检 OPTIONS），其余路径与方法照旧走会话校验
 ```
 
-- 放开的只有「已发布」数据：`/api/public/wallpapers` 本来就不会返回草稿和下线作品。
+- 放开的只有「已发布」数据：`/api/public/wallpapers` 本来就不会返回草稿和下线作品；
+  `categories` / `tags` / `subtags` 是同一套过滤条件下的下拉数据（`facets` 也走同样的口径），
+  不会多露出任何非公开内容。
 - `/media/*` 的 key 形如 `wallpapers/<wp_id>/<内容哈希前16位>.<ext>`，既不可枚举，换内容还会换 key。
-- 写接口一个都没放：POST/PATCH/DELETE 仍然要管理员会话，`/api/public/categories`、`/api/plugin/feed` 这些也**没有**顺手放开。
-- 这两个路由的 CORS 是 `*`（只读、无 Cookie 身份），所以插件从任意源 fetch 都能读。
+- 写接口一个都没放：POST/PATCH/DELETE 仍然要管理员会话，`/api/plugin/feed` 这些也**没有**顺手放开。
+- 这几个路由的 CORS 是 `*`（只读、无 Cookie 身份），所以插件从任意源 fetch 都能读。
 
 如果哪天要把口子收得更紧（比如只允许某个分类），在 `isPublicRead()` 里加一层 `category` 白名单即可。
+
+## 登录与会话
 
 - 登录复用后台同一套逻辑（`attemptLogin`）：PBKDF2 校验、每账号 15 分钟 5 次限流、审计日志、旧哈希自动升级，全部一致。
 - 会话 Cookie `folia_session`（HttpOnly + SameSite=Lax + Secure）**不带 Max-Age，是浏览器会话级 Cookie**：关掉浏览器就没了，下次必须重新登录。服务端记录在 D1 的 `sessions` 表里，7 天后兜底过期；退出/停用账号立即失效。
@@ -46,18 +56,25 @@ const PUBLIC_READ_PREFIXES = ['/media/'];
 - 媒体响应改成 `cache-control: private`，只允许浏览器自己缓存，CDN 或代理不会把它转给别人。
 - 页面右上角「退出」= `/__gate?logout=1`：删库里的会话 + 清 Cookie。
 
-## 为什么放行 `/api/auth/*`
+## 放行清单（权限矩阵）
 
-登录页本身要能提交登录，后台会话过期后也要能重新登。这几个接口自己会校验身份：
+站点门前后的完整对照。**只有**下面这些路径不需要会话：
 
-| 放行的接口 | 原因 |
-|---|---|
-| `/api/auth/login` | 登录入口 |
-| `/api/auth/logout` | 退出 |
-| `/api/auth/me` | 后台启动时探测会话，未登录返回 401 |
-| `/api/meta` | 判断站点是否已初始化 |
+| 放行的接口 | 方法 | 原因 |
+|---|---|---|
+| `/api/auth/login` | POST | 登录入口 |
+| `/api/auth/logout` | POST | 退出 |
+| `/api/auth/me` | GET | 后台启动时探测会话，未登录返回 401 |
+| `/api/meta` | GET | 判断站点是否已初始化 |
+| `/api/setup` | POST | 空库初始化，靠 `BOOTSTRAP_TOKEN` + `countUsers` 自校验（仅一次） |
+| `/api/public/wallpapers` | GET/HEAD | 插件清单（只含已发布） |
+| `/api/public/categories` | GET/HEAD | 插件筛选面板：分类下拉 |
+| `/api/public/tags` | GET/HEAD | 插件筛选面板：标签下拉 |
+| `/api/public/subtags` | GET/HEAD | 插件筛选面板：子标签下拉 |
+| `/media/*` | GET/HEAD | 插件封面 / 原文件直链（key 含内容哈希，不可枚举） |
 
-除此之外的 `/api/*` 一律要求会话。
+`/api/public/*` 与 `/media/*` 还额外放行 `OPTIONS`（CORS 预检，不是写操作）。其余 `/api/*` 一律要求管理员会话；
+`/api/plugin/feed`、`/api/admin/*`、`/api/likes` 全部照旧要登录。
 
 ## 谁来都进不去，除了管理员
 
@@ -82,7 +99,8 @@ const PUBLIC_READ_PREFIXES = ['/media/'];
 - **闲置 60 分钟要重新登录**：`SESSION_IDLE_MS`，改小/改大只动这一个常量。
 - **每个请求一次 D1 读**（查会话）。私人站点访问量小，这点成本可以忽略；要省可以加 isolate 内缓存，代价是停用账号最多延迟几十秒生效。
 - **已经缓存过的媒体**：登录前看过的图仍在浏览器本地缓存里；锁只管新请求。
-- **跨域调用**：需要登录的 `/api/*` 跨域 fetch 仍然会拿到 401；只有插件白名单里的 `GET /api/public/wallpapers` 和 `/media/*` 是匿名 + `Access-Control-Allow-Origin: *`。
+- **跨域调用**：需要登录的 `/api/*` 跨域 fetch 仍然会拿到 401；只有插件白名单里的
+  `GET /api/public/{wallpapers,categories,tags,subtags}` 和 `/media/*` 是匿名 + `Access-Control-Allow-Origin: *`。
 - **白名单的代价**：媒体文件一旦被拿到直链就能匿名下载。key 里带 id 和内容哈希，不能被枚举，但**分享出去的链接谁都能打开**——这是插件能装皮肤的前提，接受不了就只能给插件单独做个带签名的下载接口。
 
 ## 回滚

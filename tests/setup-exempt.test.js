@@ -52,7 +52,7 @@ test('站点门：POST /api/setup 已放行（不再 401 site_locked）', async 
 
 test('相邻接口仍然被门挡住（没有顺手放开别的路径）', async () => {
   const { env } = emptyDbEnv();
-  for (const path of ['/api/public/categories', '/api/admin/wallpapers']) {
+  for (const path of ['/api/plugin/feed', '/api/admin/wallpapers']) {
     const request = new Request(`https://example.test${path}`);
     const res = await gateMiddleware({ request, env, params: {}, next: async () => new Response('NOPE') });
     assert.equal(res.status, 401, path);

@@ -10,20 +10,42 @@ const PUBLIC_COLUMNS = `w.id, w.slug, w.title, w.description, w.subtag, w.catego
   w.sha256, w.storage_key, w.thumb_key, w.variants,
   c.slug AS category_slug, c.name AS category_name`;
 
-const PUBLIC_FILTERS = `w.status = 'published' AND w.storage_key IS NOT NULL
+/**
+ * 「公开可见」的硬门槛：已发布 + 有文件 + 上传回读已验证 + 已审核。
+ *
+ * 清单 / 计数 / facets 三处都从这里取同一段 SQL，**不要**在别处再抄一遍：
+ * 一旦某处少了 verified_at 或 review_status，就会出现「列表 total=110，面板计数合计却更少」
+ * 的自相矛盾。tests/public-facets.test.js 还有一条断言直接守 `sum(facets.categories) == total`。
+ */
+const PUBLIC_VISIBLE = `w.status = 'published' AND w.storage_key IS NOT NULL
   AND w.verified_at IS NOT NULL
-  AND w.review_status = 'approved'
+  AND w.review_status = 'approved'`;
+
+const PUBLIC_FILTERS = `${PUBLIC_VISIBLE}
   AND (?1 IS NULL OR c.slug = ?1)
   AND (?2 IS NULL OR w.kind = ?2)
   AND (?3 IS NULL OR w.title LIKE ?3)
   AND (?4 = 0 OR w.featured = 1)`;
 
 /**
+ * 标签匹配（多值 OR）。
+ *
+ * 参数是 JSON 数组文本，比如 `["动漫","游戏"]`；命中**任意一个**即算匹配。
+ * 为什么不用 `w.tags LIKE '%"动漫"%'`：
+ * - 多值要么动态拼 SQL（占位符个数会变，测试和 D1 都更难对），要么反复 LIKE；
+ * - json_each 让多值只占**一个**占位符，SQL 文本与既有编号都不变，
+ *   旧调用方传单个值时行为完全一致（原先的 LIKE 语义本来就是「整项相等」）。
+ * 语义差别只有一处：LIKE 对 ASCII 大小写不敏感，这里是逐字节相等（更符合「标签精确匹配」）。
+ */
+const tagMatch = (placeholder) => `EXISTS (SELECT 1 FROM json_each(w.tags) j
+    WHERE j.value IN (SELECT value FROM json_each(${placeholder})))`;
+
+/**
  * 列表额外筛选（Wallpaper Engine 那套）：标签 + 分辨率。
  * 用 ?8/?9 而不是把前面的重新编号——SQL 里编号可以乱序出现，
  * 这样新增筛选不用动已有游标参数，出错面小得多。
  */
-const PUBLIC_EXTRA = `AND (?8 IS NULL OR w.tags LIKE ?8)
+const PUBLIC_EXTRA = `AND (?8 IS NULL OR ${tagMatch('?8')})
   AND (?9 IS NULL OR (w.width > 0 AND w.height > 0
     AND ABS((w.width * 1.0 / w.height) - ?9) < 0.06))
   AND (?11 IS NULL OR w.subtag = ?11)`;
@@ -34,8 +56,46 @@ export const PUBLIC_SUBTAGS = `SELECT w.subtag AS name, COUNT(*) AS n FROM wallp
   WHERE w.status = 'published' AND w.storage_key IS NOT NULL
     AND w.subtag IS NOT NULL AND w.subtag <> ''
     AND (?1 IS NULL OR c.slug = ?1)
-    AND (?2 IS NULL OR w.tags LIKE ?2)
+    AND (?2 IS NULL OR ${tagMatch('?2')})
   GROUP BY w.subtag ORDER BY n DESC, w.subtag`;
+
+/**
+ * 公开清单的筛选面板数据（facets）：一次聚合查询返回三类计数。
+ *
+ * 为什么是「一条 SQL」而不是三条：D1 每次 prepare/执行都是一次往返，
+ * 面板每次翻页都要这份数据，三次往返比一次贵得多；而按条目逐条查（N+1）更要避免。
+ * 三个分支共用同一个 CTE `base`（当前的全部筛选条件 + 与清单同源的 PUBLIC_VISIBLE 门槛），
+ * 所以三份计数天然一致，也天然对得上清单的 total：
+ * - category：跟当前 category/kind/tag/... 过滤走，某个分类下 0 条就不会出现；
+ * - tag / subtag：只对命中过滤的作品聚合（GROUP BY 只会产出 count ≥ 1 的组）。
+ * 排序与 50 条上限在路由层做（SQL 里 ORDER BY 只保证稳定输出，不承担业务上限）。
+ */
+export const PUBLIC_FACETS = `WITH base AS (
+    SELECT w.id, w.category_id, w.subtag, w.tags
+    FROM wallpapers w LEFT JOIN categories c ON c.id = w.category_id
+    WHERE ${PUBLIC_VISIBLE}
+      AND (?1 IS NULL OR c.slug = ?1)
+      AND (?2 IS NULL OR w.kind = ?2)
+      AND (?3 IS NULL OR w.title LIKE ?3)
+      AND (?4 = 0 OR w.featured = 1)
+      AND (?5 IS NULL OR ${tagMatch('?5')})
+      AND (?6 IS NULL OR (w.width > 0 AND w.height > 0
+        AND ABS((w.width * 1.0 / w.height) - ?6) < 0.06))
+      AND (?7 IS NULL OR w.subtag = ?7)
+  )
+  SELECT 'category' AS facet, b.category_id AS id, c.slug AS slug, c.name AS name,
+      NULL AS value, COUNT(*) AS n
+    FROM base b JOIN categories c ON c.id = b.category_id AND c.is_public = 1
+    GROUP BY b.category_id
+  UNION ALL
+  SELECT 'tag', NULL, NULL, NULL, j.value, COUNT(*)
+    FROM base b, json_each(b.tags) j
+    GROUP BY j.value
+  UNION ALL
+  SELECT 'subtag', NULL, NULL, NULL, b.subtag, COUNT(*)
+    FROM base b
+    WHERE b.subtag IS NOT NULL AND b.subtag <> ''
+    GROUP BY b.subtag`;
 
 export const Q = {
   // ------------------------------------------------------------------ users
@@ -216,7 +276,7 @@ export const Q = {
 
   publicCount: `SELECT COUNT(*) AS n FROM wallpapers w LEFT JOIN categories c ON c.id = w.category_id
     WHERE ${PUBLIC_FILTERS}
-      AND (?5 IS NULL OR w.tags LIKE ?5)
+      AND (?5 IS NULL OR ${tagMatch('?5')})
       AND (?6 IS NULL OR (w.width > 0 AND w.height > 0
         AND ABS((w.width * 1.0 / w.height) - ?6) < 0.06))
       AND (?7 IS NULL OR w.subtag = ?7)`,
