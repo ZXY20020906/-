@@ -163,10 +163,10 @@ function avifSize(b) {
  * 一个文件有多条轨道（视频 + 音频），音频轨的宽高是 0，所以取面积最大的那条。
  * 版本 1 的时间戳是 64 位，字段整体后移 12 字节。
  */
-function mp4Size(b) {
+function scanTkhd(b, start, end) {
   let best = null;
-  const scanEnd = Math.min(b.length, 2 * 1024 * 1024) - 8;
-  for (let i = 0; i < scanEnd; i += 1) {
+  const scanEnd = Math.min(b.length, end) - 8;
+  for (let i = Math.max(0, start); i < scanEnd; i += 1) {
     if (b[i] !== 0x74 || b[i + 1] !== 0x6b || b[i + 2] !== 0x68 || b[i + 3] !== 0x64) continue; // 'tkhd'
     const offset = b[i + 4] === 1 ? i + 92 : i + 80;
     if (offset + 8 > b.length) continue;
@@ -178,6 +178,126 @@ function mp4Size(b) {
     }
   }
   return best;
+}
+
+/**
+ * moov 写在文件尾部（没做 faststart）时，前 2MB 里根本没有 tkhd —— 以前这种情况
+ * 一律读不到宽高，库里就留了 null。这里在头部扫不到时再扫尾部同样大小的窗口。
+ */
+function mp4Size(b) {
+  const headEnd = Math.min(b.length, 2 * 1024 * 1024);
+  const fromHead = scanTkhd(b, 0, headEnd);
+  if (fromHead || b.length <= headEnd) return fromHead;
+  return scanTkhd(b, Math.max(0, b.length - 2 * 1024 * 1024), b.length);
+}
+
+/**
+ * WebM（EBML）里没有 tkhd/mvhd，宽高在 Segment → Tracks → TrackEntry → Video 的
+ * PixelWidth/PixelHeight，时长在 Segment → Info 的 Duration × TimecodeScale。
+ * 以前 webm 直接落到 switch 的 default 分支，宽高永远是 null——动态壁纸里 webm
+ * 占了一大块，入库后详情页只能显示「—」。
+ *
+ * 这里只做「按 element 头跳着走」的轻量遍历：Cluster 是叶子节点，靠 size 一次跳过，
+ * 所以几百 MB 的 webm 也只会走几十步。EBML 的 size 允许写成「未知」，这时按容器
+ * 剩余长度处理。
+ */
+const EBML_IDS = Object.freeze({
+  segment: 0x18538067,
+  info: 0x1549a966,
+  tracks: 0x1654ae6b,
+  trackEntry: 0xae,
+  video: 0xe0,
+  pixelWidth: 0xb0,
+  pixelHeight: 0xba,
+  timecodeScale: 0x2ad7b1,
+  duration: 0x4489,
+});
+
+const EBML_CONTAINERS = new Set([
+  EBML_IDS.segment, EBML_IDS.info, EBML_IDS.tracks, EBML_IDS.trackEntry, EBML_IDS.video,
+]);
+
+/** EBML 变长整数：keepMarker 时保留长度前缀位（ID 的写法就是这么定义的）。 */
+function ebmlVint(b, i, keepMarker) {
+  if (i < 0 || i >= b.length) return null;
+  const first = b[i];
+  if (first === 0) return null;               // 长度前缀最多 8 字节，首字节不可能是 0
+  let length = 1;
+  while (length <= 8 && !(first & (0x80 >> (length - 1)))) length += 1;
+  if (length > 8 || i + length > b.length) return null;
+  const mask = 0xff >> length;
+  let value = keepMarker ? first : first & mask;
+  let allOnes = (first & mask) === mask;
+  for (let k = 1; k < length; k += 1) {
+    value = value * 256 + b[i + k];
+    allOnes = allOnes && b[i + k] === 0xff;
+  }
+  return { value, length, unknown: !keepMarker && allOnes };
+}
+
+/** 收集目标 element 的 payload 区间（同名只留第一个）。 */
+function ebmlWalk(b, from, to, hits, depth = 0) {
+  let i = Math.max(0, from);
+  const end = Math.min(b.length, to);
+  for (let guard = 0; i < end && guard < 20000; guard += 1) {
+    const id = ebmlVint(b, i, true);
+    if (!id) return;
+    const size = ebmlVint(b, i + id.length, false);
+    if (!size) return;
+    const body = i + id.length + size.length;
+    if (body > end) return;
+    const bodyEnd = size.unknown ? end : Math.min(end, body + size.value);
+    if (!hits.has(id.value)) hits.set(id.value, { start: body, end: bodyEnd });
+    if (EBML_CONTAINERS.has(id.value) && depth < 6) {
+      ebmlWalk(b, body, bodyEnd, hits, depth + 1);
+    }
+    if (size.unknown) return;
+    i = bodyEnd;
+  }
+}
+
+function ebmlHits(bytes) {
+  const hits = new Map();
+  try {
+    ebmlWalk(bytes, 0, bytes.length, hits);
+  } catch { /* 半截文件/脏数据：当作读不出来 */ }
+  return hits;
+}
+
+function ebmlUint(bytes, span) {
+  if (!span) return null;
+  const n = span.end - span.start;
+  if (n < 1 || n > 8) return null;
+  let value = 0;
+  for (let k = 0; k < n; k += 1) value = value * 256 + bytes[span.start + k];
+  return Number.isFinite(value) ? value : null;
+}
+
+function ebmlFloat(bytes, span) {
+  if (!span) return null;
+  const n = span.end - span.start;
+  if (n !== 4 && n !== 8) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset + span.start, n);
+  return n === 4 ? view.getFloat32(0) : view.getFloat64(0);
+}
+
+function webmSize(bytes) {
+  const hits = ebmlHits(bytes);
+  const width = ebmlUint(bytes, hits.get(EBML_IDS.pixelWidth));
+  const height = ebmlUint(bytes, hits.get(EBML_IDS.pixelHeight));
+  if (!(width > 0 && height > 0) || width > 100_000 || height > 100_000) return null;
+  return { width, height };
+}
+
+/** Duration 的单位是 TimecodeScale（默认 1ms），换算成毫秒。 */
+function webmDurationMs(bytes) {
+  const hits = ebmlHits(bytes);
+  const raw = ebmlFloat(bytes, hits.get(EBML_IDS.duration));
+  const scale = ebmlUint(bytes, hits.get(EBML_IDS.timecodeScale)) ?? 1_000_000;
+  if (!raw || !(raw > 0) || !(scale > 0)) return null;
+  const ms = Math.round((raw * scale) / 1_000_000);
+  if (!Number.isFinite(ms) || ms <= 0 || ms > 24 * 60 * 60 * 1000) return null;
+  return ms;
 }
 
 /**
@@ -199,6 +319,7 @@ export function readMediaMeta(bytes) {
     case 'image/webp': size = webpSize(bytes); break;
     case 'image/avif': size = avifSize(bytes); break;
     case 'video/mp4': size = mp4Size(bytes); break;
+    case 'video/webm': size = webmSize(bytes); break;
     default: size = null;
   }
   return {
@@ -211,17 +332,28 @@ export function readMediaMeta(bytes) {
 /**
  * 从 MP4 的 moov/mvhd 里读时长。
  * 开机动画是按秒循环的，告诉用户「这段 6 秒一循环」比只给体积有用。
- * 分片 MP4（fMP4）的 mvhd duration 是 0，WebM 需要解析 EBML——这两类返回 null，
- * 前端会显示「—」而不是瞎猜。
+ * 分片 MP4（fMP4）的 mvhd duration 是 0，WebM 走 EBML 的 Info/Duration——
+ * 这两类读不到时返回 null，前端会显示「—」而不是瞎猜。
  *
  * mvhd 布局（type 之后）：version+flags(4) → 时间戳(4 或 8) → timescale(4) → duration(4 或 8)
  */
 export function readDurationMs(bytes, mime) {
+  if (mime === 'video/webm') {
+    if (!bytes || bytes.length < 24) return null;
+    return webmDurationMs(bytes);
+  }
   if (mime !== 'video/mp4') return null;
   if (!bytes || bytes.length < 24) return null;
-  const scanEnd = Math.min(bytes.length, 2 * 1024 * 1024) - 8;
+  const headEnd = Math.min(bytes.length, 2 * 1024 * 1024);
+  const fromHead = scanMvhd(bytes, 0, headEnd);
+  if (fromHead !== null || bytes.length <= headEnd) return fromHead;
+  // 非 faststart 的 mp4：moov/mvhd 在文件尾部
+  return scanMvhd(bytes, Math.max(0, bytes.length - 2 * 1024 * 1024), bytes.length);
+}
 
-  for (let i = 0; i < scanEnd; i += 1) {
+function scanMvhd(bytes, start, end) {
+  const scanEnd = Math.min(bytes.length, end) - 8;
+  for (let i = Math.max(0, start); i < scanEnd; i += 1) {
     if (bytes[i] !== 0x6d || bytes[i + 1] !== 0x76 || bytes[i + 2] !== 0x68 || bytes[i + 3] !== 0x64) continue;
     const version = bytes[i + 4];
     const need = version === 1 ? 36 : 24;

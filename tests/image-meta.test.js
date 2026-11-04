@@ -164,6 +164,131 @@ test('体积上限按类型区分', () => {
   assert.ok(MAX_VIDEO_BYTES > MAX_IMAGE_BYTES);
 });
 
+// ---------------------------------------------------------------- EBML / webm
+
+function concatBytes(parts) {
+  const size = parts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(size);
+  let at = 0;
+  for (const part of parts) { out.set(part, at); at += part.length; }
+  return out;
+}
+
+/** 造一个 EBML element：id 原样给（含长度前缀位），payload < 127 字节时用单字节 size。 */
+function ebml(idBytes, ...children) {
+  const payload = concatBytes(children);
+  assert.ok(payload.length < 127, 'fixture payload 过大');
+  return concatBytes([Uint8Array.from(idBytes), Uint8Array.from([0x80 | payload.length]), payload]);
+}
+
+function uintBytes(value, width) {
+  const out = new Uint8Array(width);
+  let left = value;
+  for (let i = width - 1; i >= 0; i -= 1) { out[i] = left & 0xff; left = Math.floor(left / 256); }
+  return out;
+}
+
+function float64Bytes(value) {
+  const out = new Uint8Array(8);
+  new DataView(out.buffer).setFloat64(0, value, false);
+  return out;
+}
+
+const EBML_HEADER = Uint8Array.from([0x1a, 0x45, 0xdf, 0xa3, 0x80]);
+
+/** 最小 webm：EBML 头 + Segment(Info(Duration), Tracks(TrackEntry(Video(w,h)))) */
+function fakeWebm({ width = 2560, height = 1440, duration = 12000, timecodeScale = null } = {}) {
+  const info = ebml(
+    [0x15, 0x49, 0xa9, 0x66],
+    ...(timecodeScale === null ? [] : [ebml([0x2a, 0xd7, 0xb1], uintBytes(timecodeScale, 3))]),
+    ebml([0x44, 0x89], float64Bytes(duration)),
+  );
+  const video = ebml([0xe0], ebml([0xb0], uintBytes(width, 2)), ebml([0xba], uintBytes(height, 2)));
+  const trackEntry = ebml([0xae], video);
+  const tracks = ebml([0x16, 0x54, 0xae, 0x6b], trackEntry);
+  const segment = ebml([0x18, 0x53, 0x80, 0x67], info, tracks);
+  return concatBytes([EBML_HEADER, segment]);
+}
+
+test('识别 webm 的宽高（EBML PixelWidth/PixelHeight）', () => {
+  const meta = readMediaMeta(fakeWebm());
+  assert.equal(meta.mime, 'video/webm');
+  assert.equal(meta.width, 2560);
+  assert.equal(meta.height, 1440);
+});
+
+test('webm 的宽高不是写死的：换一组数字照样读对', () => {
+  const meta = readMediaMeta(fakeWebm({ width: 3840, height: 2160 }));
+  assert.equal(meta.width, 3840);
+  assert.equal(meta.height, 2160);
+});
+
+test('从 EBML Info/Duration 读 webm 时长（默认 TimecodeScale=1ms）', () => {
+  assert.equal(readDurationMs(fakeWebm({ duration: 12000 }), 'video/webm'), 12000);
+  assert.equal(readDurationMs(fakeWebm({ duration: 30500 }), 'video/webm'), 30500);
+  // TimecodeScale 100000ns = 0.1ms 时，同样的 Duration 值对应更短的时间
+  assert.equal(readDurationMs(fakeWebm({ duration: 12000, timecodeScale: 100000 }), 'video/webm'), 1200);
+});
+
+test('webm 读不出元数据时返回 null，不瞎猜、不抛错', () => {
+  // 只有 EBML magic，后面啥都没有
+  const bare = Uint8Array.from([0x1a, 0x45, 0xdf, 0xa3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+  assert.equal(sniffMime(bare), 'video/webm');
+  const meta = readMediaMeta(bare);
+  assert.equal(meta.mime, 'video/webm');
+  assert.equal(meta.width, null);
+  assert.equal(meta.height, null);
+  assert.equal(readDurationMs(bare, 'video/webm'), null);
+
+  // Duration 为 0 / 负数当没读到
+  assert.equal(readDurationMs(fakeWebm({ duration: 0 }), 'video/webm'), null);
+  assert.equal(readDurationMs(fakeWebm({ duration: -5 }), 'video/webm'), null);
+  assert.equal(readDurationMs(null, 'video/webm'), null);
+});
+
+test('moov 在文件尾部（非 faststart）的 mp4 也能读到宽高与时长', () => {
+  // 3MB 文件：前 2MB 只有 mdat，tkhd/mvhd 被推到尾部——以前这种一律读成 null
+  const size = 3 * 1024 * 1024;
+  const buf = new Uint8Array(size);
+  asciiWrite(buf, 4, 'ftyp');
+  asciiWrite(buf, 8, 'mp42');
+  asciiWrite(buf, 32, 'mdat');
+
+  const tail = size - 1024;
+  asciiWrite(buf, tail, 'moov');
+  asciiWrite(buf, tail + 16, 'tkhd');
+  buf[tail + 16 + 4] = 0;
+  be32Write(buf, tail + 16 + 80, 3840 * 65536);
+  be32Write(buf, tail + 16 + 84, 2160 * 65536);
+  asciiWrite(buf, tail + 256, 'mvhd');
+  buf[tail + 256 + 4] = 0;
+  be32Write(buf, tail + 256 + 16, 1000);
+  be32Write(buf, tail + 256 + 20, 5350);
+
+  const meta = readMediaMeta(buf);
+  assert.equal(meta.mime, 'video/mp4');
+  assert.equal(meta.width, 3840);
+  assert.equal(meta.height, 2160);
+  assert.equal(readDurationMs(buf, 'video/mp4'), 5350);
+});
+
+test('faststart 的 mp4 仍然只读头部，行为不变', () => {
+  const size = 3 * 1024 * 1024;
+  const buf = new Uint8Array(size);
+  asciiWrite(buf, 4, 'ftyp');
+  asciiWrite(buf, 8, 'mp42');
+  asciiWrite(buf, 32, 'moov');
+  asciiWrite(buf, 48, 'tkhd');
+  buf[52] = 0;
+  be32Write(buf, 48 + 80, 1920 * 65536);
+  be32Write(buf, 48 + 84, 1080 * 65536);
+
+  const meta = readMediaMeta(buf);
+  assert.equal(meta.width, 1920);
+  assert.equal(meta.height, 1080);
+});
+
 /** 造一个只带 ftyp + mvhd 的最小 mp4 头，够解析器用 */
 function fakeMp4({ version = 0, timescale = 1000, duration = 5000 } = {}) {
   const buf = new Uint8Array(96);
