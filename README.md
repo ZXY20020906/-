@@ -157,6 +157,8 @@ node tools/dump-queries.mjs && python tools/check-sql.py   # 用真 sqlite3 编�
   否则一年 immutable 缓存会让用户长期看到旧文件。
 - 1080p 变体：4K/2K 视频上传后应生成 `variants`（1080p），写入 D1 的 `variants` 列，
   由 `/api/public/wallpapers` 输出；插件按链路情况自动选择。
+- **上传资源请先看 [`docs/UPLOAD-SOP.md`](docs/UPLOAD-SOP.md)**：键名规则、七步流程、
+  上传后四条验收命令（HEAD / Range / 全量 sha256 / API）、六条禁止项。
 
 ## 设计取舍
 
