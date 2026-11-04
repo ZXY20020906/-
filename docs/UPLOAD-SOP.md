@@ -5,6 +5,70 @@
 原理、桶结构、事故复盘在 [`docs/r2.md`](r2.md)，**这里不重复原理**，只有：可执行步骤 + 验收命令 + 禁止项。
 2026-11-04 那次「同址双版本」（145 个 URL 里 3 条皮肤包坏掉）就是跳过第 5 步、违反第 4 节造成的。
 
+## 0. 上传前必做：视频先跑本地转码
+
+**从 2026-11 起，视频上传会在服务端过「播放合规体检」，不合规直接 422 拒绝入库。**
+Cloudflare Workers / Pages Functions 里**没有 ffmpeg**，服务端只能拒、不能转——
+所以动手传之前，先在本机把文件转成合规规格：
+
+```powershell
+node tools/prepare-upload.mjs <源文件或目录> --out .\prepared
+# 可选：--fps 30（默认） --max-pixels 8294400（默认 = 3840×2160） --dry-run（只体检不转码）
+```
+
+它干这些事：
+
+1. 用 ffprobe 探测宽高 / 帧率 / 编码 / 时长，并自己按 box 头判断 faststart（ffprobe 不报这个）；
+   **机器上没有 ffprobe 时自动退回解析 `ffmpeg -i` 的 stderr**，不用额外装。
+2. 超规格 ⇒ 转码：等比缩进 3840×2160 框、`fps=30`、`libx264 -crf 20 -preset veryfast`、
+   `-pix_fmt yuv420p`、`-movflags +faststart`、`-an`（壁纸不需要音轨）。
+3. 只差 faststart ⇒ `-c copy -movflags +faststart` 无损重封装，**不重新编码、不损画质**。
+4. 生成 1080p 变体（`-crf 23`，装进 1920×1080 框；源不高于 1080p 时跳过）。
+5. 生成 1280 宽 webp 封面（优先第 1 秒，片子太短退回首帧）。
+6. 写 `prepared/prepare-upload.manifest.json`：原始规格、处理后规格、每个产物的 `sha256` 与 `bytes`。
+
+跑完最后一行是 `可以直接上传：N 个文件；不合规项已修正`，然后按下面的**第 2 步**拿清单里的
+`sha256` 算 key。判合规用的是**站点同一个函数**（`src/server/media-compliance.js`），
+所以「本地通过 = 服务端一定收」，不会出现工具放行、上传 422。
+
+### 目标规格（工具与服务端共用一份）
+
+| 项 | 原画 | 1080p 变体 |
+|---|---|---|
+| 宽 | ≤ 3840 px | ≤ 1920 px |
+| 高 | ≤ 2160 px | —（生成时按框锁定，通常 1080） |
+| 像素总量 | ≤ 8,294,400（= 3840×2160） | 同左 |
+| 帧率 | ≤ 30 fps | ≤ 30 fps |
+| 编码 | H.264（`avc1`） | H.264（`avc1`） |
+| 封装 | MP4 + faststart（moov 前置） | 同上（更严：不接受「无法确认」） |
+| 体积 | ≤ 25 MB（超了只 warn，不拒） | ≤ 8 MB（超了只 warn，不拒） |
+
+### 违规码对照表（`422 media_non_compliant` → `details.violations[].code`）
+
+| 码 | 含义 | 后果 | 怎么修 |
+|---|---|---|---|
+| `too-wide` | 宽 > 3840（变体 > 1920） | 拒绝入库 | 工具转码自动缩 |
+| `too-tall` | 高 > 2160 | 拒绝入库 | 工具转码自动缩 |
+| `too-many-pixels` | 宽×高 > 8,294,400 | 拒绝入库 | 工具转码自动缩 |
+| `fps-too-high` | 帧率 > 30（含 0.5 容差） | 拒绝入库 | 工具 `fps=30` 重编码 |
+| `codec-unsupported` | 不是 H.264（如 HEVC） | 拒绝入库 | 工具 `libx264` 重编码 |
+| `not-faststart` | moov 在文件尾 / 无法确认 | 拒绝入库 | 工具 `-movflags +faststart` |
+| `probe-failed` | 宽高或编码探测不出来 | 拒绝入库 | 源文件可能损坏，重导出 |
+
+只有警告的情况**照常入库**，但会在 `audit_log` 留一条 `action = wallpaper.asset_compliance_warn`：
+
+| 警告码 | 含义 |
+|---|---|
+| `original-too-large` | 原画 > 25 MB（不拒绝，弱网用户会等很久） |
+| `variant-too-large` | 1080p 变体 > 8 MB |
+| `container-webm` | WebM 容器：能直接播，但不在 1080p 变体管线里 |
+| `fps-unknown` | 探测不到帧率（没有 stts / DefaultDuration），可能漏放 >30fps |
+| `codec-unknown` | WebM 的 CodecID 不在文件头，无法确认编码 |
+
+> 为什么 `fps-too-high` 是**拒绝**而不是警告：60fps 浏览器能播，但它顶穿站点的
+> 解码/体积预算（1080p 变体 ≤8MB 基本不可能），而本地工具一条 `fps=30` 就能修好。
+> 硬拒才能保证「先跑工具」是唯一路径。
+
 ## 1. 三条铁律
 
 1. **键名由最终入库内容的 sha256 前 16 位生成**：`wallpapers/<wp_id>/<sha16>.<ext>`；
@@ -23,8 +87,10 @@
 
 ### 第 1 步 准备文件
 
-- **视频**：H.264 + `-movflags +faststart`（moov 在文件头才能边下边播，`readVideoInfo` 会把 codec/faststart 记进库）。
-  开机动画通常是竖屏 1080×1920、视频 ≤60MB。
+- **视频**：先跑第 0 节的 `tools/prepare-upload.mjs`——合规规格是 H.264 + `-movflags +faststart`
+  （moov 在文件头才能边下边播，`readVideoInfo` 会把 codec/faststart/帧率记进库），
+  宽 ≤3840、高 ≤2160、像素 ≤8,294,400、帧率 ≤30，开机动画通常还有竖屏 1080×1920 与 ≤60MB 的上限。
+  手工转码（不推荐，容易漏掉 faststart 或缩放）：
   ```bash
   ffmpeg -i in.mov -c:v libx264 -profile:v high -pix_fmt yuv420p -c:a aac -movflags +faststart out.mp4
   ```
@@ -184,6 +250,13 @@ $w.sha256 -eq $expectSha       # 大文件（sha256 为 NULL）跳过这条
 
 - 独立对象、独立 key、**独立 sha256 与独立 bytes**；不要复用原片的 sha256。
 - key 形如 `wallpapers/<wp_id>/<sha16>.1080p.mp4`，同样遵守三条铁律。
+- 用 `tools/prepare-upload.mjs` 生成时，变体一并产出（`<name>.1080p.mp4`），
+  缩放装进 **1920×1080 框**、`fps=30`、`-crf 23`、`+faststart`，清单里带 sha256。
+  为什么不写 `scale=-2:1080`：对 2000×1124 这类源它会产出 **1922 宽**，违反「变体 ≤1920 宽」的规格
+  （线上存量里已有 29 条这种 1922 宽对象，属于历史产物，**保留不动**）。
+- 变体同样要过服务端的变体口径：**宽 ≤1920、H.264、faststart 必须为真**。
+  服务端上传闸门只校验原画（变体由工具/脚本直写 R2 + `variants` 列），
+  但 `checkVideoCompliance(..., { role: 'variant' })` 就是这条口径，脚本自检请用它。
 - 写 D1 的 `variants` 列（JSON 数组文本）：
 
   ```json
@@ -213,9 +286,10 @@ PUT /api/admin/wallpapers/:id/asset     原始二进制 body，需登录会话
 
 它内部顺序（`src/server/routes/wallpapers.js` → `upload()`）正好是这份规程：
 
+**播放合规体检**（`media-compliance.js`，违规 422 直接返回，此步之前不写盘、不写库）→
 算 sha256 去重 → `assetKey()` 生成键 → `putAsset()`（contentType + immutable）→
 `verifyAsset()` HEAD 回读 → 通过才 `updateWallpaperAsset`（`storage_key`/`bytes`/`sha256` 同一条 UPDATE）→
-删旧 key → 写审计。
+删旧 key → 写审计（有 warning 时多写一条 `wallpaper.asset_compliance_warn`）。
 
 前端 `↑ 上传`、后台 `/admin/` 都走这条链路。手工 PUT 只在两种场合用：历史对象修复、批量迁移脚本；
 这两种场合请自己把第 5 步、第 3 节补齐。

@@ -9,6 +9,7 @@ import { Q } from '../src/server/queries.js';
 import {
   createEnv, jsonRequest, sessionCookie, sessionDeviceFields, USERS, wallpaperRow,
 } from './harness.js';
+import { makeMp4 } from './mp4-fixture.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PNG = new Uint8Array(readFileSync(resolve(here, 'fixtures', 'sample.png')));
@@ -293,8 +294,9 @@ test('上传：视频会把类型自动改成动态（不再由人手动选）',
     [Q.updateWallpaperAsset]: () => [],
     [Q.insertAudit]: () => [],
   });
-  const mp4 = new Uint8Array(32);
-  for (const [i, ch] of [...'ftypmp42'].entries()) mp4[4 + i] = ch.charCodeAt(0);
+  // 换成合规的 mp4（1080p / 30fps / H.264 / faststart）：上传现在要先过播放合规体检，
+  // 只带 ftyp 的伪 mp4 会因探测不到宽高被 422 拒掉（见 tests/media-compliance.test.js）
+  const mp4 = makeMp4({ width: 1920, height: 1080, fps: 30 });
   const res = await call(env, new Request('https://example.test/api/admin/wallpapers/wp_1/asset', {
     method: 'PUT',
     headers: { cookie: sessionCookie(), 'x-folia-client': 'admin', 'content-type': 'video/mp4' },
@@ -346,14 +348,9 @@ test('上传：zip 保持原类型（皮肤包仍是静态）', async () => {
 });
 
 test('上传：mp4 视频会把时长写进库', async () => {
-  const mp4 = new Uint8Array(96);
-  for (const [i, ch] of [...'ftypmp42'].entries()) mp4[i + 4] = ch.charCodeAt(0);
-  const mvhd = 32;
-  for (const [i, ch] of [...'mvhd'].entries()) mp4[mvhd + i] = ch.charCodeAt(0);
-  mp4[mvhd + 4] = 0; // version 0
-  mp4[mvhd + 18] = 0x03; mp4[mvhd + 19] = 0xe8; // timescale = 1000
-  mp4[mvhd + 22] = 0x17; mp4[mvhd + 23] = 0x70; // duration = 6000 → 6.0s
-
+  // 用结构完整的 mp4：时长在 mvhd（timescale=30000，180 帧 × 1000 = 6.0s）
+  const mp4 = makeMp4({ durationMs: 6000 });
+  assert.ok(mp4.length > 1000);
   const { env, calls, puts } = createEnv({
     [Q.sessionByToken]: sessionOf(USERS.editor),
     [Q.wallpaperById]: () => [wallpaperRow({ created_by: USERS.editor.id, kind: 'dynamic' })],

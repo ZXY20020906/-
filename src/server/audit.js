@@ -15,6 +15,12 @@ export const AUDIT_ACTION = Object.freeze({
   WALLPAPER_CREATE: 'wallpaper.create',
   WALLPAPER_UPDATE: 'wallpaper.update',
   WALLPAPER_ASSET: 'wallpaper.asset_upload',
+  /**
+   * 上传出现「播放合规警告」（体积超限 / WebM 容器 / 帧率探测不到）时单独记一条。
+   * 这类文件照常入库，只是想查「哪些条目不在目标规格里」时能直接按 action 过滤，
+   * 不用去 detail 里猜。规则见 src/server/media-compliance.js。
+   */
+  WALLPAPER_COMPLIANCE_WARN: 'wallpaper.asset_compliance_warn',
   WALLPAPER_DELETE: 'wallpaper.delete',
   WALLPAPER_REORDER: 'wallpaper.reorder',
   CATEGORY_CREATE: 'category.create',

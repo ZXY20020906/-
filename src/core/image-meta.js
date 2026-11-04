@@ -211,6 +211,8 @@ const EBML_IDS = Object.freeze({
   pixelHeight: 0xba,
   timecodeScale: 0x2ad7b1,
   duration: 0x4489,
+  /** 每帧纳秒数：有它就能算出帧率（很多 WebM 不写，读不到就返回 null） */
+  defaultDuration: 0x23e383,
 });
 
 const EBML_CONTAINERS = new Set([
@@ -377,32 +379,159 @@ function scanMvhd(bytes, start, end) {
 }
 
 /**
- * 视频编码 + faststart 检测（只读判断，不拒绝上传）。
+ * 读一个 MP4 box 头（只读头，不进 payload）。
+ * size 的三种写法都要认：32 位、`size=1` 之后 64 位、`size=0` 表示「到文件尾」。
+ * limit 是扫描上界，默认整份文件——嵌在父 box 里时传父 box 的 end。
+ */
+function mp4BoxAt(bytes, offset, limit = bytes.length) {
+  if (offset < 0 || offset + 8 > limit) return null;
+  const size32 = be32(bytes, offset);
+  const type = String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
+  let size = size32;
+  let header = 8;
+  if (size32 === 1) {
+    if (offset + 16 > limit) return null;
+    size = be64(bytes, offset + 8);
+    header = 16;
+  } else if (size32 === 0) {
+    size = limit - offset;
+  }
+  if (!Number.isFinite(size) || size < header) return null;
+  return { type, size, start: offset + header, end: Math.min(limit, offset + size) };
+}
+
+/** 遍历 [start, end) 里的同级 box；给 type 就只挑那一种。 */
+function childBoxes(bytes, start, end, type) {
+  const out = [];
+  let offset = start;
+  for (let guard = 0; guard < 256 && offset + 8 <= end; guard += 1) {
+    const box = mp4BoxAt(bytes, offset, end);
+    if (!box) break;
+    if (!type || box.type === type) out.push(box);
+    if (box.size < 8) break;
+    offset += box.size;
+  }
+  return out;
+}
+
+/**
+ * 顶层布局：moov / mdat 各自在哪。
+ * 以前在遇到 mdat 时直接 break，导致「moov 在尾部」的文件 moovAt 永远是 -1、
+ * faststart 永远是 null。跳过一个 box 只是 offset 加法，不读内容，没必要提前收工。
+ */
+function mp4Layout(bytes) {
+  const layout = { moov: null, moovAt: -1, mdatAt: -1 };
+  let offset = 0;
+  for (let guard = 0; guard < 64 && offset + 8 <= bytes.length; guard += 1) {
+    const box = mp4BoxAt(bytes, offset);
+    if (!box) break;
+    if (box.type === 'moov' && !layout.moov) {
+      layout.moov = box;
+      layout.moovAt = offset;
+    }
+    if (box.type === 'mdat' && layout.mdatAt < 0) layout.mdatAt = offset;
+    offset += box.size;
+  }
+  return layout;
+}
+
+/** mdhd：v0 的 timescale 在 payload+12，v1（64 位时间戳）在 payload+20。 */
+function mdhdTimescale(bytes, mdhd) {
+  const version = bytes[mdhd.start];
+  const at = mdhd.start + (version === 1 ? 20 : 12);
+  if (at + 4 > mdhd.end) return null;
+  const timescale = be32(bytes, at);
+  return timescale > 0 && timescale <= 1_000_000_000 ? timescale : null;
+}
+
+/** stts 汇总：样本总数 + 时长单位总和（帧率 = samples × timescale ÷ delta 总和）。 */
+function sttsTotals(bytes, stts) {
+  if (stts.start + 8 > stts.end) return null;
+  const entries = be32(bytes, stts.start + 4);
+  if (!(entries > 0) || entries > 100_000) return null;
+  let samples = 0;
+  let delta = 0;
+  for (let i = 0; i < entries; i += 1) {
+    const at = stts.start + 8 + i * 8;
+    if (at + 8 > stts.end) break;
+    const count = be32(bytes, at);
+    const step = be32(bytes, at + 4);
+    samples += count;
+    delta += count * step;
+  }
+  return samples > 0 && delta > 0 ? { samples, delta } : null;
+}
+
+/**
+ * 从 moov 里算帧率：找 handler_type = 'vide' 的那条 trak，用 mdhd.timescale 与 stts 算。
+ * 用 stts 而不是「总帧数 ÷ mvhd 时长」：mvhd 是整条文件（含音轨空隙）的时长，
+ * 有音频、有空镜头的片子会算偏。
+ */
+function fpsFromMoov(bytes, moov) {
+  for (const trak of childBoxes(bytes, moov.start, moov.end, 'trak')) {
+    for (const mdia of childBoxes(bytes, trak.start, trak.end, 'mdia')) {
+      const hdlr = childBoxes(bytes, mdia.start, mdia.end, 'hdlr')[0];
+      if (!hdlr || ascii(bytes, hdlr.start + 8, hdlr.start + 12) !== 'vide') continue;
+      const mdhd = childBoxes(bytes, mdia.start, mdia.end, 'mdhd')[0];
+      const minf = childBoxes(bytes, mdia.start, mdia.end, 'minf')[0];
+      if (!mdhd || !minf) continue;
+      const stbl = childBoxes(bytes, minf.start, minf.end, 'stbl')[0];
+      if (!stbl) continue;
+      const stts = childBoxes(bytes, stbl.start, stbl.end, 'stts')[0];
+      if (!stts) continue;
+      const timescale = mdhdTimescale(bytes, mdhd);
+      const totals = sttsTotals(bytes, stts);
+      if (!timescale || !totals) continue;
+      const fps = (totals.samples * timescale) / totals.delta;
+      if (!Number.isFinite(fps) || fps <= 0 || fps > 1000) continue;
+      return Math.round(fps * 100) / 100;
+    }
+  }
+  return null;
+}
+
+/** WebM：Tracks → TrackEntry → DefaultDuration（每帧纳秒），倒数就是帧率。 */
+function webmFps(bytes) {
+  const hits = ebmlHits(bytes);
+  const ns = ebmlUint(bytes, hits.get(EBML_IDS.defaultDuration));
+  if (!ns || ns < 1000 || ns > 1_000_000_000) return null;
+  const fps = 1_000_000_000 / ns;
+  if (!Number.isFinite(fps) || fps <= 0 || fps > 1000) return null;
+  return Math.round(fps * 100) / 100;
+}
+
+/**
+ * 帧率探测（只读文件头，不解码）。
+ * 读不到返回 null —— 调用方（media-compliance）会把它当「无法确认」而不是「合规」。
+ * 音轨/字幕轨的 stts 不是帧率，所以只认 handler_type 为 vide 的 trak。
+ */
+export function readVideoFps(bytes, mime) {
+  if (!bytes || bytes.length < 16) return null;
+  if (mime === 'video/webm') return webmFps(bytes);
+  if (mime !== 'video/mp4') return null;
+  const { moov } = mp4Layout(bytes);
+  return moov ? fpsFromMoov(bytes, moov) : null;
+}
+
+/**
+ * 视频编码 + faststart + 帧率检测（只读判断，不拒绝上传；拒绝在 media-compliance.js）。
  * - codec：扫 moov 里的 sample entry fourcc，hvc1/hev1 = H.265（浏览器多数解不了）
  * - faststart：moov 是否出现在 mdat 之前；否则要下完整个文件才能起播
- * 用 box 头逐个跳，不做完整解析，几 MB 的文件几十毫秒内出结果。
+ * - fps：见 readVideoFps()
+ * 用 box 头逐个跳，不做完整解析，几百 MB 的文件也只走几十步。
  */
 export function readVideoInfo(bytes, mime) {
-  if (!isVideoMime(mime) || !bytes || bytes.length < 16) return { codec: null, faststart: null };
-  if (mime === 'video/webm') return { codec: sniffWebmCodec(bytes), faststart: null };
-
-  let offset = 0;
-  let moovAt = -1;
-  let mdatAt = -1;
-  const limit = bytes.length;
-  for (let guard = 0; guard < 64 && offset + 8 <= limit; guard += 1) {
-    const size = be32(bytes, offset);
-    const type = String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
-    if (type === 'moov' && moovAt < 0) moovAt = offset;
-    if (type === 'mdat' && mdatAt < 0) mdatAt = offset;
-    if (type === 'moov' || type === 'mdat') break;
-    if (!size || size < 8) break;
-    offset += size;
+  if (!isVideoMime(mime) || !bytes || bytes.length < 16) {
+    return { codec: null, faststart: null, fps: null };
+  }
+  if (mime === 'video/webm') {
+    return { codec: sniffWebmCodec(bytes), faststart: null, fps: webmFps(bytes) };
   }
 
-  const codec = moovAt >= 0 ? sniffMp4Codec(bytes, moovAt) : null;
+  const { moov, moovAt, mdatAt } = mp4Layout(bytes);
+  const codec = moov ? sniffMp4Codec(bytes, moovAt) : null;
   const faststart = moovAt < 0 || mdatAt < 0 ? null : moovAt < mdatAt;
-  return { codec, faststart };
+  return { codec, faststart, fps: moov ? fpsFromMoov(bytes, moov) : null };
 }
 
 function sniffMp4Codec(bytes, start) {

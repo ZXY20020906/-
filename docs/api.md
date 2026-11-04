@@ -20,7 +20,7 @@
 
 - **认证**：`folia_session` Cookie，`HttpOnly` + `SameSite=Lax`，7 天有效。服务端只存令牌的 SHA-256。
 - **CSRF**：所有 `POST/PUT/PATCH/DELETE` 必须带 `X-Folia-Client: admin`；若带 `Origin`，还必须与站点同源。
-- **错误码**：400 参数问题 / 401 未登录 / 403 权限不足 / 404 不存在 / 409 冲突（重名、文件重复、分类非空）/ 413 过大 / 415 类型不支持 / 429 限流 / 500 内部错误。
+- **错误码**：400 参数问题 / 401 未登录 / 403 权限不足 / 404 不存在 / 409 冲突（重名、文件重复、分类非空）/ 413 过大 / 415 类型不支持 / **422 内容不符合播放规格** / 429 限流 / 500 内部错误。
 - **公开接口**带 CORS（`access-control-allow-origin`），只读，不需要登录。
 
 ## 认证
@@ -98,8 +98,65 @@ X-Folia-Client: admin
 - 动态壁纸收 mp4 / webm（≤60MB）或 bootanimation.zip（≤80MB）
 - 视频会顺带解析 `moov/mvhd` 写入 `duration_ms`（WebM 与分片 MP4 留空）
 - 按 SHA-256 去重，重复会 409 并带上已有壁纸的 `id` 和 `title`
+- **视频还要过播放合规体检**（见下一节），不合规 422、**一个字节都不落盘**
 
 响应里的 `url` 就是 `/media/wallpapers/...`，可直接给 `<img>`。
+
+### 422：视频不符合播放规格
+
+Cloudflare Workers 里没有 ffmpeg，服务端只做「体检 + 拒绝」，不转码——转码在本机用
+`tools/prepare-upload.mjs` 做（规格与违规码见 [`UPLOAD-SOP.md`](UPLOAD-SOP.md) §0）。
+判定函数：`src/server/media-compliance.js` 的 `checkVideoCompliance()`（与本地工具共用同一份规则）。
+
+```http
+PUT /api/admin/wallpapers/wp_xxx/asset
+Content-Type: video/mp4
+
+<原始二进制>
+```
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "media_non_compliant",
+    "message": "视频不符合播放规格：宽度 5916px 超过上限 3840px；像素总量 5916×2530=14967480 超过上限 8294400（=3840×2160）。请先用 tools/prepare-upload.mjs 处理后再上传",
+    "details": {
+      "mime": "video/mp4",
+      "width": 5916,
+      "height": 2530,
+      "fps": 30,
+      "codec": "h264",
+      "faststart": false,
+      "bytes": 15987935,
+      "violations": [
+        { "code": "too-wide", "message": "宽度 5916px 超过上限 3840px" },
+        { "code": "too-many-pixels", "message": "像素总量 5916×2530=14967480 超过上限 8294400（=3840×2160）" }
+      ],
+      "warnings": [],
+      "hint": "请先用 tools/prepare-upload.mjs 处理后再上传"
+    }
+  }
+}
+```
+
+违规码（`details.violations[].code`）：
+
+| 码 | 判定 |
+|---|---|
+| `too-wide` | 宽 > 3840 px |
+| `too-tall` | 高 > 2160 px |
+| `too-many-pixels` | 宽 × 高 > 8,294,400（= 3840×2160） |
+| `fps-too-high` | 帧率 > 30 fps（留 0.5 容差，29.97/30 不误杀） |
+| `codec-unsupported` | 编码不是 H.264（如 HEVC）；WebM 只接受 vp8/vp9/av1 |
+| `not-faststart` | moov 不在 mdat 之前，或无法确认位置 |
+| `probe-failed` | 宽高或编码探测不出来（moov 缺失/文件损坏） |
+
+- **422 是拒绝入库**：返回时还没 `putAsset`、没算 sha256、没记账，R2 与 D1 都不会被改。
+- **只有警告的情况照常 200 入库**，响应里带 `compliance.warnings`，同时写一条
+  `audit_log.action = wallpaper.asset_compliance_warn`（体积超限 / WebM 容器 / 帧率探测不到）。
+- 图片、zip（皮肤包 / 开机动画包）**不受影响**，仍走原来的类型与体积校验。
+- 开机动画的 mp4 与壁纸视频走同一套体检（同一个上传接口）。
 
 发布：`PATCH {"status":"published"}`，需要 `wallpaper:publish`，且必须已上传文件。首次发布会写 `published_at`，之后重复发布不会顶到"最近添加"第一位。
 

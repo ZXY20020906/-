@@ -35,6 +35,14 @@ export const unsupportedMedia = (message = '不支持的文件类型', details =
 export const tooManyRequests = (message = '尝试过于频繁，请稍后再试') =>
   new HttpError(429, 'too_many_requests', message);
 
+/**
+ * 422：请求本身没问题，但内容不符合播放规格（分辨率/帧率/编码/faststart）。
+ * 和 415 的区别：415 是「这种类型我不要」，422 是「类型对，但这个文件播不了」。
+ * details 里带 violations（机读码 + 中文说明），见 src/server/media-compliance.js。
+ */
+export const mediaNonCompliant = (message = '视频不符合播放规格', details = null) =>
+  new HttpError(422, 'media_non_compliant', message, details);
+
 export const storageVerifyFailed = (message = 'R2 写入校验失败（对象缺失或大小不符），请重试') =>
   new HttpError(500, 'storage-verify-failed', message);
 

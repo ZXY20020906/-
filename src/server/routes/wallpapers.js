@@ -19,11 +19,14 @@ import {
 import { KINDS, REVIEW_STATUSES, STATUSES } from '../../core/validate.js';
 import { uniqueSlug } from '../../core/slug.js';
 import {
-  ALLOWED_MIME, limitForMime, kindMatchesMime, readDurationMs, readMediaMeta, readVideoInfo,
+  ALLOWED_MIME, isVideoMime, limitForMime, kindMatchesMime, readDurationMs, readMediaMeta, readVideoInfo,
 } from '../../core/image-meta.js';
 import {
-  badRequest, conflict, HttpError, internal, notFound, payloadTooLarge, storageVerifyFailed, tooManyRequests,
-  unsupportedMedia,
+  COMPLIANCE_HINT, checkVideoCompliance, complianceMessage, describeWarnings,
+} from '../media-compliance.js';
+import {
+  badRequest, conflict, HttpError, internal, mediaNonCompliant, notFound, payloadTooLarge,
+  storageVerifyFailed, tooManyRequests, unsupportedMedia,
 } from '../../core/errors.js';
 import { created, json, readJson } from '../http.js';
 import { wallpaperDto } from '../dto.js';
@@ -316,6 +319,43 @@ export async function upload({ env, actor, request, params }) {
     throw payloadTooLarge(`${meta.mime} 最大 ${Math.round(limitForMime(meta.mime) / 1024 / 1024)} MB`);
   }
 
+  // 视频探针只解析 box 头，几 MB 的文件几毫秒；编码/帧率/faststart 全靠它。
+  const videoInfo = readVideoInfo(bytes, meta.mime);
+
+  /**
+   * 播放合规体检（上传 / 替换都走这里）。
+   *
+   * Workers 没有 ffmpeg ⇒ 服务端只能「拒」，不能「转」。所以判违规时直接 422：
+   * 此刻还没有 putAsset、没有 sha 去重、没有配额记账，更没有写 D1 —— 一个字节都不落盘。
+   * 只有 warning 的情况照常入库，warning 记进 audit_log（action = wallpaper.asset_compliance_warn）。
+   * 规则与本地工具 tools/prepare-upload.mjs 共用 src/server/media-compliance.js。
+   */
+  const compliance = isVideoMime(meta.mime)
+    ? checkVideoCompliance({
+      mime: meta.mime,
+      width: meta.width,
+      height: meta.height,
+      fps: videoInfo.fps,
+      codec: videoInfo.codec,
+      faststart: videoInfo.faststart,
+      bytes: bytes.byteLength,
+    })
+    : null;
+  if (compliance && !compliance.ok) {
+    throw mediaNonCompliant(complianceMessage(compliance), {
+      mime: meta.mime,
+      width: meta.width,
+      height: meta.height,
+      fps: videoInfo.fps,
+      codec: videoInfo.codec,
+      faststart: videoInfo.faststart,
+      bytes: bytes.byteLength,
+      violations: compliance.violations,
+      warnings: compliance.warnings,
+      hint: COMPLIANCE_HINT,
+    });
+  }
+
   // 每日字节配额：先校验再写盘，超了直接 429，别等 90MB 传完才拒
   await assertDailyQuota(env, actor, bytes.byteLength);
 
@@ -373,9 +413,9 @@ export async function upload({ env, actor, request, params }) {
   }
   if (row.storage_key && row.storage_key !== key) await deleteAsset(env, row.storage_key);
 
-  // 视频顺便读时长和编码信息：开机动画是按秒循环的，moov 位置决定能不能边下边播
+  // 视频顺便读时长：开机动画是按秒循环的，moov 位置决定能不能边下边播。
+  // 编码/faststart/帧率在上面的合规体检里已经读过，这里复用 videoInfo，不重复解析。
   const durationMs = readDurationMs(bytes, meta.mime);
-  const videoInfo = readVideoInfo(bytes, meta.mime);
   // 媒体三列（storage_key/bytes/sha256）统一走 setMediaIdentity：
   // 它先 UPDATE，再把 schema/015 触发器刚写入的审计行补上 changed_by。
   await setMediaIdentity(env, row.id, {
@@ -416,8 +456,24 @@ export async function upload({ env, actor, request, params }) {
       durationMs ? ` ${(durationMs / 1000).toFixed(1)}s` : ''}`,
   });
 
+  // 只有警告时照常入库，但要留痕：这些文件「能播」，只是不在目标规格里
+  // （体积超限、WebM 容器、帧率探测不到）。查 warning 就查这个 action。
+  if (compliance && compliance.warnings.length) {
+    await writeAudit(env, {
+      actor,
+      action: AUDIT_ACTION.WALLPAPER_COMPLIANCE_WARN,
+      targetType: 'wallpaper',
+      targetId: row.id,
+      detail: `${compliance.warnings.length} 项：${describeWarnings(compliance.warnings)}`,
+    });
+  }
+
   const fresh = await first(env, Q.wallpaperById, row.id);
-  return json({ wallpaper: wallpaperDto(fresh, { admin: true, mediaBase: mediaBaseFor(env) }), url: `/media/${key}` });
+  return json({
+    wallpaper: wallpaperDto(fresh, { admin: true, mediaBase: mediaBaseFor(env) }),
+    url: `/media/${key}`,
+    ...(compliance ? { compliance: { warnings: compliance.warnings } } : {}),
+  });
 }
 
 /**
