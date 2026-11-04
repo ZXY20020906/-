@@ -149,8 +149,11 @@
   /**
    * 缩略图：Worker 里没有图像解码能力，所以在浏览器用 canvas 生成。
    * 图片直接缩放；视频抓 0.5 秒处的一帧（列表页就不用下整段 mp4 了）。
+   *
+   * 4.23.18 起统一到 **1280 宽**：批量入口（目录扫描 / 批量导入）与服务端
+   * `ingestAsset()` 的 THUMB_WIDTH 是同一个口径，2x 屏的卡片也不会糊。
    */
-  const THUMB_WIDTH = 640;
+  const THUMB_WIDTH = 1280;
 
   function drawThumb(source, maxWidth = THUMB_WIDTH) {
     const sw = source.videoWidth || source.width;
@@ -166,7 +169,7 @@
     return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), 'image/webp', 0.82));
   }
 
-  async function videoFrame(file) {
+  async function videoFrame(file, maxWidth = THUMB_WIDTH) {
     const url = URL.createObjectURL(file);
     const video = document.createElement('video');
     video.src = url;
@@ -184,7 +187,7 @@
         video.currentTime = Math.min(0.5, (video.duration || 1) / 2);
         setTimeout(resolve, 2500);
       });
-      return await drawThumb(video);
+      return await drawThumb(video, maxWidth);
     } catch (error) {
       console.warn('[thumb] 视频抽帧失败', error.message);
       return null;
@@ -193,13 +196,13 @@
     }
   }
 
-  async function makeThumbnail(file) {
+  async function makeThumbnail(file, maxWidth = THUMB_WIDTH) {
     if (!file) return null;
-    if (file.type.startsWith('video/')) return videoFrame(file);
+    if (file.type.startsWith('video/')) return videoFrame(file, maxWidth);
     if (!file.type.startsWith('image/')) return null;
     try {
       const bitmap = await createImageBitmap(file);
-      const blob = await drawThumb(bitmap);
+      const blob = await drawThumb(bitmap, maxWidth);
       if (bitmap.close) bitmap.close();
       return blob;
     } catch {
@@ -232,6 +235,121 @@
     await putAsset(wallpaperId, file, onProgress);
     if (thumb) await putThumb(wallpaperId, thumb);
     return thumb ? thumb.size : 0;
+  }
+
+  // ------------------------------------------------------------------ 批量入库
+  /**
+   * 批量入口（「立即扫描 / 添加目录」+「批量导入本地文件」）**只走一个接口**：
+   *   POST /api/admin/wallpapers/import   （multipart：file + thumb + variant + 元数据）
+   *
+   * 服务端那一步是 `src/server/ingest.js` 的 ingestAsset()——和单条 `PUT /asset`
+   * **同一个入库管线**：合规体检（422 的那道闸门）、sha256/采样指纹、HEAD 回读、
+   * 缩略图、1080p 变体、必填字段门。所以批量入口不可能再「绕过体检」把 4K@60 塞进库。
+   *
+   * 与老写法（先 POST 建草稿、再 PUT /asset）的两个差别：
+   *   1. **失败不留空草稿**：服务端在同一次调用里建行 + 入库，失败会回滚行；
+   *   2. **返回导入报告**：每条的成功/失败原因/自动修正项，界面直接列出来。
+   */
+  const IMPORT_AUTOFIX_LABEL = {
+    faststart: '转封装（moov 前置）',
+    fps30: '降帧到 30fps',
+    variant1080p: '生成 1080p 变体',
+    thumb: '生成缩略图',
+    thumbFromOriginal: '缩略图用原图',
+    sampleFingerprint: '改用采样指纹',
+  };
+  /** 准备上传时一起给的 1080p 变体命名：`xxx.1080p.mp4` / `xxx.720p.webm` */
+  const VARIANT_NAME_RE = /\.(\d{3,4})p\.(mp4|webm)$/i;
+  const variantBase = (name) => String(name).replace(VARIANT_NAME_RE, '').replace(/\.(mp4|webm)$/i, '');
+
+  async function importEntry(entry, { categoryId, publish, reportId }) {
+    const form = new FormData();
+    form.append('title', entry.title);
+    form.append('kind', entry.kind || 'static');
+    form.append('categoryId', categoryId || '');
+    form.append('tags', JSON.stringify(entry.tags || []));
+    form.append('publish', publish ? '1' : '0');
+    form.append('reportId', reportId);
+    form.append('file', entry.file, entry.file.name);
+    // 缩略图在浏览器生成（Worker 没有解码器）：1280 宽 WebP，视频抓 0.5s 的一帧
+    const thumb = await makeThumbnail(entry.file, THUMB_WIDTH).catch(() => null);
+    if (thumb) form.append('thumb', thumb, 'thumb.webp');
+    for (const variant of entry.variants || []) {
+      if (variant && variant.name) form.append('variant', variant, variant.name);
+    }
+    const data = await api('/admin/wallpapers/import', { method: 'POST', raw: true, body: form });
+    return data.item;
+  }
+
+  function summarizeImport(reportId, items) {
+    return {
+      ok: items.every((item) => item.status !== 'failed'),
+      reportId,
+      imported: items.filter((item) => item.status === 'imported').length,
+      reused: items.filter((item) => item.status === 'reused').length,
+      failed: items.filter((item) => item.status === 'failed').length,
+      skipped: items.filter((item) => item.status === 'skipped').length,
+      items,
+    };
+  }
+
+  /** 逐条导入（服务端一次一个文件），最后拼成一份报告。 */
+  async function runImportQueue(entries, { categoryId, publish = false, skipped = [], onProgress } = {}) {
+    const reportId = `report_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const items = [...skipped];
+    let done = 0;
+    for (const entry of entries) {
+      try {
+        items.push(await importEntry(entry, { categoryId, publish, reportId }));
+      } catch (error) {
+        // 网络/权限层的失败（4xx/5xx）：也要进报告，不能只在 console 里
+        items.push({ title: entry.title, status: 'failed', reason: error.message || '导入失败', autoFixes: [] });
+      }
+      done += 1;
+      if (onProgress) onProgress(done, entries.length);
+    }
+    const report = summarizeImport(reportId, items);
+    console.info('[import] 导入报告', report.reportId, report);
+    return report;
+  }
+
+  /** 导入报告弹窗：成功 N / 复用 M / 失败 K，每条失败给原因，每条成功给自动修正项。 */
+  function showImportReport(report) {
+    const failures = report.items.filter((item) => item.status === 'failed');
+    const fixes = new Map();
+    for (const item of report.items) {
+      for (const code of item.autoFixes || []) fixes.set(code, (fixes.get(code) || 0) + 1);
+    }
+    const fixLine = [...fixes.entries()]
+      .map(([code, count]) => `${IMPORT_AUTOFIX_LABEL[code] || code} × ${count}`)
+      .join('；');
+    const skipped = report.items.filter((item) => item.status === 'skipped');
+    const row = (item) => {
+      const badge = item.status === 'skipped' ? '跳过'
+        : item.status === 'reused' ? '已存在'
+          : item.status === 'failed' ? '失败' : '成功';
+      const detail = item.status === 'failed'
+        ? esc(item.reason || '导入失败')
+        : esc((item.autoFixes || []).map((code) => IMPORT_AUTOFIX_LABEL[code] || code).join('、') || '无需修正');
+      return `<li class="wep-item${item.status === 'failed' ? ' skipped' : ''}">
+        <span class="wep-title">${esc(item.title || '(未命名)')}</span>
+        <span class="wep-meta">${badge} · ${detail}</span>
+      </li>`;
+    };
+    const body = report.items.length
+      ? `<ul class="wep-items">${report.items.map(row).join('')}</ul>`
+      : '<p class="hint">这次没有新条目。</p>';
+    openDialog(`
+      <h3>导入报告</h3>
+      <p class="hint">报告号 ${esc(report.reportId)}<br>
+        成功 ${report.imported} · 复用 ${report.reused} · 失败 ${report.failed}${skipped.length || report.skipped ? ` · 跳过 ${report.skipped || skipped.length}` : ''}</p>
+      ${fixLine ? `<p class="hint">自动修正：${esc(fixLine)}</p>` : ''}
+      ${failures.length ? `<p class="hint">失败 ${failures.length} 条 —— 原因列在下面；这些条目**没有**入库。</p>` : ''}
+      ${body}
+      <footer><button type="button" class="btn primary" data-close>知道了</button></footer>
+    `, (dialog) => {
+      $('[data-close]', dialog).addEventListener('click', closeDialog);
+    });
   }
 
   function putAsset(wallpaperId, file, onProgress) {
@@ -581,15 +699,19 @@
         const rel = pj._rel || pj.name;
         const dir = rel.slice(0, rel.lastIndexOf('/'));
         const siblings = files.filter((file) => (file._rel || '').startsWith(`${dir}/`));
-        const video = siblings.find((file) => /\.(mp4|webm)$/i.test(file.name));
-        const preview = siblings.find((file) => /^preview\.(jpe?g|png|gif)$/i.test(file.name));
+        const video = siblings.find((file) => /\.(mp4|webm)$/i.test(file.name) && !VARIANT_NAME_RE.test(file.name));
         let meta = {};
         try { meta = JSON.parse(await pj.text()); } catch { meta = {}; }
         const baseTitle = String(meta.title || dir.split('/').pop() || handle.name).slice(0, 110);
         const tags = [...new Set((meta.tags ?? []).map((tag) => WE_TAG_MAP[tag]).filter(Boolean))];
 
         if (video) {
-          entries.push({ title: baseTitle, file: video, kind: 'dynamic', tags });
+          // 同目录里预置的 1080p 变体（prepare-upload 的产物）一起带上，服务端会先体检再入库
+          const variant = siblings.find((file) => VARIANT_NAME_RE.test(file.name)
+            && variantBase(file.name) === variantBase(video.name));
+          entries.push({
+            title: baseTitle, file: video, kind: 'dynamic', tags, variants: variant ? [variant] : [],
+          });
         } else {
           // 场景包（.pkg）没有可用的原图，preview 只是缩略图，不能当作品
           entries.push({
@@ -604,30 +726,41 @@
       return entries;
     }
 
+    // 普通目录：`xxx.1080p.mp4` 不单独成条目，它属于 `xxx.mp4`（变体配对）
+    const variants = files.filter((file) => VARIANT_NAME_RE.test(file.name));
     for (const file of files) {
+      if (VARIANT_NAME_RE.test(file.name)) continue;
       if (!/\.(mp4|webm|png|jpe?g|webp|avif|gif)$/i.test(file.name)) continue;
+      const variant = variants.find((candidate) => variantBase(candidate.name) === variantBase(file.name));
       entries.push({
         title: file.name.replace(/\.[^.]+$/, '').slice(0, 110),
         file,
         kind: /\.(mp4|webm)$/i.test(file.name) ? 'dynamic' : 'static',
         tags: [],
+        variants: variant ? [variant] : [],
       });
     }
     return entries;
   }
 
-  /** 扫描所有已挂目录，把库里没有的以草稿形式入库 */
+  /**
+   * 扫描所有已挂目录，把库里没有的**走批量入库接口**存成草稿。
+   *
+   * 每条都经过服务端 ingestAsset()：合规体检（4K@60 / HEVC / 非 faststart 该拒就拒）、
+   * sha256、HEAD 回读、缩略图、1080p 变体、必填字段门。失败的条目**不会留在库里**，
+   * 全部进导入报告。
+   */
   async function scanImportDirs({ silent = true } = {}) {
     if (!state.importDirs.length) return 0;
     const categoryId = (state.categories[0] && state.categories[0].id) || null;
-    if (!categoryId) return 0;
+    if (!categoryId) {
+      if (!silent) toast('还没有分类，先去「分类」里建一个再扫描', 'error', 6000);
+      return 0;
+    }
 
     const known = new Set(state.wallpapers.items.map((item) => item.title));
-    let created = 0;
-    let skippedScene = 0;
-    let skippedLowRes = 0;
-    let skippedLarge = 0;
-    let lowResExample = '';
+    const queue = [];
+    const skipped = [];
 
     for (const dir of state.importDirs) {
       let permission = await dir.handle.queryPermission({ mode: 'read' }).catch(() => 'denied');
@@ -642,49 +775,52 @@
         entries = await scanDirectory(dir.handle);
       } catch (error) {
         console.warn('[auto-import] 扫描失败', dir.name, error.message);
+        skipped.push({ title: dir.name, status: 'skipped', reason: `扫描失败：${error.message}` });
         continue;
       }
 
       for (const entry of entries) {
-        if (!entry.file) { skippedScene += 1; continue; }
+        if (!entry.file) {
+          skipped.push({ title: entry.title, status: 'skipped', reason: entry.skipReason || '没有可用文件' });
+          continue;
+        }
         if (known.has(entry.title)) continue;
-        if (entry.file.size > MAX_IMPORT_BYTES) { skippedLarge += 1; continue; }
+        if (entry.file.size > importCapFor(entry.file)) {
+          skipped.push({
+            title: entry.title,
+            status: 'skipped',
+            reason: `${(entry.file.size / 1048576).toFixed(0)}MB 超过单文件上限`,
+          });
+          continue;
+        }
 
         // 高清闸门：图片宽度不够的不要，宁可空着也不放糊图
         if (entry.kind === 'static') {
           const width = await imageWidth(entry.file);
           if (width > 0 && width < MIN_IMAGE_WIDTH) {
-            skippedLowRes += 1;
-            if (!lowResExample) lowResExample = `${entry.title}（${width}px）`;
+            skipped.push({ title: entry.title, status: 'skipped', reason: `只有 ${width}px 宽（低于 ${MIN_IMAGE_WIDTH}px 高清线）` });
             continue;
           }
         }
 
-        try {
-          const allowed = entry.tags.filter((tag) => state.tagVocabulary.includes(tag));
-          const result = await api('/admin/wallpapers', {
-            method: 'POST',
-            body: { title: entry.title, kind: entry.kind, categoryId, tags: allowed },
-          });
-          await putAssetWithThumb(result.wallpaper.id, entry.file);
-          known.add(entry.title);
-          created += 1;
-        } catch (error) {
-          console.warn('[auto-import] 单条失败', entry.title, error.message);
-        }
+        const allowed = (entry.tags || []).filter((tag) => state.tagVocabulary.includes(tag));
+        queue.push({ title: entry.title, file: entry.file, kind: entry.kind, tags: allowed, variants: entry.variants || [] });
+        known.add(entry.title);
       }
     }
 
-    const notes = [];
-    if (created) notes.push(`导入 ${created} 件到草稿`);
-    if (skippedScene) notes.push(`跳过 ${skippedScene} 个场景包（只有低清预览，需录屏）`);
-    if (skippedLowRes) notes.push(`跳过 ${skippedLowRes} 张低清图${lowResExample ? `，如 ${lowResExample}` : ''}`);
-    if (skippedLarge) notes.push(`跳过 ${skippedLarge} 个超过 55MB 的文件`);
-    if (notes.length) {
-      toast(notes.join('；'), created ? 'ok' : 'info', 9000);
-      if (created) await loadWallpapers();
+    if (!queue.length && !skipped.length) return 0;
+
+    const report = await runImportQueue(queue, { categoryId, skipped });
+    if (report.imported || report.reused || report.failed || skipped.length) {
+      const note = `成功 ${report.imported} · 复用 ${report.reused} · 失败 ${report.failed}`
+        + `${skipped.length ? ` · 跳过 ${skipped.length}` : ''}`;
+      toast(`扫描完成：${note}`, report.failed ? 'error' : 'ok', 9000);
     }
-    return created;
+    if (report.imported || report.reused) await loadWallpapers();
+    // 自动静默扫描只在有失败时弹报告；手动「立即扫描」总是给报告
+    if (!silent || report.failed) showImportReport(report);
+    return report.imported;
   }
 
   async function addImportDir() {
@@ -1012,8 +1148,13 @@
     </div>`;
   }
 
-  /** Cloudflare 单次请求上限 100MB，Worker 又要把文件读进内存，55MB 是稳妥的天花板 */
+  /**
+   * Cloudflare 单次请求上限 100MB，Worker 又要把文件读进内存，55MB 是稳妥的天花板。
+   * zip 资源包（助手皮肤 / 开机动画）服务端上限是 64MB（`MAX_BUNDLE_BYTES`），单独一档。
+   */
   const MAX_IMPORT_BYTES = 55 * 1024 * 1024;
+  const MAX_IMPORT_BUNDLE_BYTES = 64 * 1024 * 1024;
+  const importCapFor = (file) => (/\.zip$/i.test(file.name) ? MAX_IMPORT_BUNDLE_BYTES : MAX_IMPORT_BYTES);
 
   /** 批量导入本地文件：多选，标题取文件名，导完再逐条改也可以 */
   function openLocalImport() {
@@ -1053,7 +1194,7 @@
       const input = document.createElement('input');
       input.type = 'file';
       input.multiple = true;
-      input.accept = 'image/png,image/jpeg,image/webp,image/avif,image/gif,video/mp4,video/webm';
+      input.accept = 'image/png,image/jpeg,image/webp,image/avif,image/gif,video/mp4,video/webm,application/zip,.zip';
       input.className = 'hidden';
       dialog.appendChild(input);
 
@@ -1071,31 +1212,42 @@
       };
 
       input.addEventListener('change', async () => {
-        entries = await Promise.all([...input.files].map(async (file) => {
-          const isVideo = /\.(mp4|webm)$/i.test(file.name);
-          const entry = {
-            file,
-            title: file.name.replace(/\.[^.]+$/, '').slice(0, 120),
-            kind: isVideo ? 'dynamic' : 'static',
-            kindLabel: isVideo ? '视频' : '图片',
-            skipped: false,
-          };
-          if (file.size > MAX_IMPORT_BYTES) {
-            entry.skipped = true;
-            entry.kindLabel = `${(file.size / 1048576).toFixed(0)}MB 超限`;
-            return entry;
-          }
-          if (!isVideo) {
-            const width = await imageWidth(file);
-            if (width > 0 && width < MIN_IMAGE_WIDTH) {
+        // 先把 `xxx.1080p.mp4` 挑出来：它不是独立条目，而是 `xxx.mp4` 的变体。
+        // 于是「把 prepare-upload 的输出和源文件一起多选」就能带上 1080p 档。
+        const files = [...input.files];
+        const variantFiles = files.filter((file) => VARIANT_NAME_RE.test(file.name));
+        entries = await Promise.all(files
+          .filter((file) => !VARIANT_NAME_RE.test(file.name))
+          .map(async (file) => {
+            const isVideo = /\.(mp4|webm)$/i.test(file.name);
+            // 皮肤包 / 开机动画包：zip 没有宽高，服务端按 bundle 豁免；缩略图只能另外补
+            const isBundle = /\.zip$/i.test(file.name);
+            const variant = variantFiles.find((candidate) => variantBase(candidate.name) === variantBase(file.name));
+            const entry = {
+              file,
+              title: file.name.replace(/\.[^.]+$/, '').slice(0, 120),
+              kind: isVideo ? 'dynamic' : 'static',
+              kindLabel: `${isVideo ? '视频' : isBundle ? '资源包' : '图片'}${variant ? ' +1080p' : ''}`,
+              variants: variant ? [variant] : [],
+              skipped: false,
+            };
+            if (file.size > importCapFor(file)) {
               entry.skipped = true;
-              entry.kindLabel = `${width}px 低清`;
+              entry.kindLabel = `${(file.size / 1048576).toFixed(0)}MB 超限`;
+              return entry;
             }
-          }
-          return entry;
-        }));
+            if (!isVideo && !isBundle) {
+              const width = await imageWidth(file);
+              if (width > 0 && width < MIN_IMAGE_WIDTH) {
+                entry.skipped = true;
+                entry.kindLabel = `${width}px 低清`;
+              }
+            }
+            return entry;
+          }));
         picked = new Set(entries.map((_, index) => index).filter((index) => !entries[index].skipped));
-        $('#loc-status', dialog).textContent = `共 ${entries.length} 个文件`;
+        $('#loc-status', dialog).textContent = `共 ${entries.length} 个文件`
+          + `${variantFiles.length ? `（配到 ${variantFiles.length} 个 1080p 变体）` : ''}`;
         renderList();
       });
 
@@ -1117,34 +1269,28 @@
         const moduleId = $('#loc-module', dialog).value;
         const publish = $('#loc-publish', dialog).value === '1';
         const queue = [...picked].map((index) => entries[index]);
+        const skipped = entries
+          .filter((entry, index) => entry.skipped && !picked.has(index))
+          .map((entry) => ({ title: entry.title, status: 'skipped', reason: entry.kindLabel, autoFixes: [] }));
         start.disabled = true;
-        let done = 0;
-        const failed = [];
 
-        for (const entry of queue) {
-          start.textContent = `导入中 ${done + 1}/${queue.length}`;
-          try {
-            const created = await api('/admin/wallpapers', {
-              method: 'POST',
-              body: { title: entry.title, kind: entry.kind, categoryId: moduleId, tags: [] },
-            });
-            const id = created.wallpaper.id;
-            await putAssetWithThumb(id, entry.file, (ratio) => {
-              start.textContent = `${done + 1}/${queue.length} · ${Math.round(ratio * 100)}%`;
-            });
-            if (publish) {
-              await api(`/admin/wallpapers/${encodeURIComponent(id)}`, { method: 'PATCH', body: { status: 'published' } });
-            }
-            done += 1;
-          } catch (error) {
-            failed.push(`${entry.title}：${error.message}`);
-          }
-        }
+        // 走批量入库接口：合规体检 / sha256 / HEAD 回读 / 缩略图 / 变体 / 必填门都在服务端，
+        // 失败的条目不会留在库里；每条结果进导入报告。
+        const report = await runImportQueue(queue, {
+          categoryId: moduleId,
+          publish,
+          skipped,
+          onProgress: (done, total) => { start.textContent = `导入中 ${done}/${total}`; },
+        });
 
         closeDialog();
-        toast(failed.length ? `成功 ${done}，失败 ${failed.length}` : `已导入 ${done} 个文件`, failed.length ? 'error' : 'ok', 8000);
-        if (failed.length) console.warn('[local import] 失败明细', failed);
+        toast(
+          `成功 ${report.imported} · 复用 ${report.reused} · 失败 ${report.failed}`,
+          report.failed ? 'error' : 'ok',
+          8000,
+        );
         await loadWallpapers();
+        showImportReport(report);
       });
     });
   }

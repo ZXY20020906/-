@@ -152,6 +152,11 @@ export const Q = {
   wallpaperBySlug: `SELECT * FROM wallpapers WHERE slug = ? LIMIT 1`,
   wallpaperSlugTaken: `SELECT id FROM wallpapers WHERE slug = ? LIMIT 1`,
   wallpaperShaTaken: `SELECT id, title FROM wallpapers WHERE sha256 = ? LIMIT 1`,
+  /**
+   * 批量导入的幂等兜底（>40MB 没有完整 sha256 时）：同名 + 同字节数。
+   * 只用于「拒绝重复建条目」，不参与任何对外字段。
+   */
+  wallpaperTitleBytesTaken: `SELECT id, title FROM wallpapers WHERE title = ? AND bytes = ? LIMIT 1`,
   insertWallpaper: `INSERT INTO wallpapers
       (id, slug, title, description, subtag, review_status, category_id, kind, status, storage_key, mime, bytes, width, height, sha256,
        tags, featured, sort_order, created_by, created_at, updated_at, published_at)
@@ -172,6 +177,14 @@ export const Q = {
       WHERE wallpaper_id = ? AND changed_by IS NULL AND changed_at >= ?
       ORDER BY changed_at DESC, id DESC LIMIT 1)`,
   updateWallpaperThumb: `UPDATE wallpapers SET thumb_key = ?, updated_at = ? WHERE id = ?`,
+  /**
+   * 1080p 变体清单（schema/014 的 variants 列，JSON 数组）。
+   * 每项 `{label,height,width,key,bytes,sha256}`：key 是 R2 对象，sha256 是**变体自己的**哈希
+   * （插件的 resolveMediaExpectation 靠它给变体设内容判据）。
+   */
+  updateWallpaperVariants: `UPDATE wallpapers SET variants = ?, updated_at = ? WHERE id = ?`,
+  /** 批量导入时「直接发布」：媒体已落盘并回读通过才允许走到这（见 ingest.js） */
+  publishWallpaper: `UPDATE wallpapers SET status = 'published', published_at = ?, updated_at = ? WHERE id = ?`,
   /** 上传回读成功后记账：verified_at + 编码信息 */
   /** 批量审核：把待审核的已发布作品一次性标记为已审核 */
   approvePendingPublished: `UPDATE wallpapers SET review_status = 'approved', updated_at = ?

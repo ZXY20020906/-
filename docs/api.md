@@ -58,6 +58,8 @@
 | `GET` | `/api/admin/wallpapers/:id` | `wallpaper:read` |
 | `PATCH` | `/api/admin/wallpapers/:id` | `wallpaper:update`（编辑仅限自己的） |
 | `PUT` | `/api/admin/wallpapers/:id/asset` | `asset:upload` + `wallpaper:update` |
+| `PUT` | `/api/admin/wallpapers/:id/thumb` | `asset:upload` + `wallpaper:update` |
+| `POST` | `/api/admin/wallpapers/import` | `asset:upload` + `wallpaper:create`（批量入口用，见下） |
 | `DELETE` | `/api/admin/wallpapers/:id` | `wallpaper:delete` |
 | `POST` | `/api/admin/wallpapers/reorder` | `wallpaper:reorder` |
 
@@ -99,8 +101,39 @@ X-Folia-Client: admin
 - 视频会顺带解析 `moov/mvhd` 写入 `duration_ms`（WebM 与分片 MP4 留空）
 - 按 SHA-256 去重，重复会 409 并带上已有壁纸的 `id` 和 `title`
 - **视频还要过播放合规体检**（见下一节），不合规 422、**一个字节都不落盘**
+- **能纯 JS 修的先修**：moov 在尾部时自动转封装前置（4.23.18 起，不再 422）
+- 图片没传缩略图时用原图当缩略图；`width/height` 探测不出来直接 422（`import_incomplete`）
 
 响应里的 `url` 就是 `/media/wallpapers/...`，可直接给 `<img>`。
+
+> 真正的实现只有一处：`src/server/ingest.js` 的 `ingestAsset()`。
+> `PUT /asset`、`POST /import`（批量入口）、批量的「立即扫描 / 添加目录」全走它，
+> 所以不可能出现「某条入口绕过体检」的第二种行为。
+
+### 批量入口：`POST /api/admin/wallpapers/import`
+
+后台「立即扫描 / 添加目录」与「批量导入本地文件」用的就是这条（一个文件一枪）。
+`multipart/form-data`：`file`（必填）+ 可选 `thumb`（浏览器 canvas 生成的 WebP）、
+可重复的 `variant`（1080p 变体）+ `title` / `kind` / `categoryId` / `tags`(JSON) / `publish`(0|1) / `reportId`。
+
+**HTTP 200 + 导入报告**（某一条失败是数据不是异常）：
+
+```json
+{
+  "ok": true,
+  "data": {
+    "item": { "title": "星空", "status": "imported", "wallpaperId": "wp_…",
+              "autoFixes": ["thumb", "thumbFromOriginal"], "warnings": [], "reason": null },
+    "report": { "ok": true, "reportId": "report_…", "imported": 1, "reused": 0, "failed": 0,
+                "skipped": 0, "items": [ /* 同上 */ ] }
+  }
+}
+```
+
+失败条目的 `code` 与单条上传的错误码一致（`media_non_compliant` / `import_incomplete` /
+`unsupported_media_type` / `payload_too_large`），并且**不会留在库里**（服务端会回滚刚建的草稿）。
+同一文件重复导入 ⇒ `status: "reused"`，不产生第二条。字段与报告口径见
+[`UPLOAD-SOP.md`](UPLOAD-SOP.md) §9。
 
 ### 422：视频不符合播放规格
 
@@ -149,7 +182,7 @@ Content-Type: video/mp4
 | `too-many-pixels` | 宽 × 高 > 8,294,400（= 3840×2160） |
 | `fps-too-high` | 帧率 > 30 fps（留 0.5 容差，29.97/30 不误杀） |
 | `codec-unsupported` | 编码不是 H.264（如 HEVC）；WebM 只接受 vp8/vp9/av1 |
-| `not-faststart` | moov 不在 mdat 之前，或无法确认位置 |
+| `not-faststart` | moov 不在 mdat 之前，或无法确认位置（4.23.18 起服务端会先自动转封装；转封装失败才报这条） |
 | `probe-failed` | 宽高或编码探测不出来（moov 缺失/文件损坏） |
 
 - **422 是拒绝入库**：返回时还没 `putAsset`、没算 sha256、没记账，R2 与 D1 都不会被改。

@@ -406,15 +406,53 @@ test('路由：60fps 1080p 视频 422（帧率超限）', { skip }, async () => 
   db.close();
 });
 
-test('路由：moov 在尾部的 mp4 422（not-faststart），提示用工具重封装', { skip }, async () => {
+test('路由：moov 在尾部的 mp4 自动转封装后入库（不再要求用户跑工具）', { skip }, async () => {
+  // 4.23.18 起：`not-faststart` 是唯一**不需要解码器**就能修的违规，
+  // 服务端用 src/server/mp4-remux.js 把 moov 前置（只改字节顺序，不重编码）。
+  // 所以这条不再是 422 —— 422 留给「必须真转码」的违规（分辨率/编码）。
   reset(`upload:${USER.id}`);
   const { db, env, puts } = await routeEnv([WP_ROW]);
   const res = await call(env, uploadRequest(makeMp4({ width: 1920, height: 1080, faststart: false })));
 
+  assert.equal(res.status, 200, '能自动修的不该再丢给用户');
+  assert.equal(puts.length, 1);
+  // 落盘的那份必须是 moov 前置的（ftyp → moov → mdat），不是原始字节
+  const stored = puts[0].bytes;
+  const topLevel = [];
+  for (let at = 0; at + 8 <= stored.length;) {
+    const size = new DataView(stored.buffer, stored.byteOffset, stored.byteLength).getUint32(at);
+    topLevel.push(String.fromCharCode(stored[at + 4], stored[at + 5], stored[at + 6], stored[at + 7]));
+    if (!(size >= 8)) break;
+    at += size;
+  }
+  assert.deepEqual(topLevel.slice(0, 3), ['ftyp', 'moov', 'mdat'], 'moov 必须被挪到 mdat 前面');
+
+  const row = db.prepare('SELECT faststart, verified_at, width, height FROM wallpapers WHERE id = ?').get(WP_ROW.id);
+  assert.equal(Number(row.faststart), 1, '转封装后 faststart 必须为 1');
+  assert.equal(row.width, 1920);
+  assert.equal(row.height, 1080);
+  assert.ok(row.verified_at > 0);
+  assert.deepEqual(res.body.data.ingest.autoFixes, ['faststart']);
+  db.close();
+});
+
+test('路由：真的修不了的视频仍然 422 且不落盘（负对照）', { skip }, async () => {
+  // ftyp + mdat、没有 moov：能认出是 video/mp4，但宽高/编码都探测不到 ⇒ probe-failed。
+  // 这种「文件本身不完整」的修不了，转封装也救不了 ⇒ 必须继续 422。
+  reset(`upload:${USER.id}`);
+  const { db, env, puts } = await routeEnv([WP_ROW]);
+  const fake = new Uint8Array(64);
+  const view = new DataView(fake.buffer);
+  view.setUint32(0, 24); // ftyp box
+  fake.set([0x66, 0x74, 0x79, 0x70], 4); // 'ftyp'
+  fake.set([0x6d, 0x70, 0x34, 0x32], 8); // brand 'mp42'
+  view.setUint32(24, 40); // mdat box
+  fake.set([0x6d, 0x64, 0x61, 0x74], 28); // 'mdat'
+  const res = await call(env, uploadRequest(fake));
+
   assert.equal(res.status, 422);
-  assert.deepEqual(res.body.error.details.violations.map((item) => item.code), [VIOLATION.NOT_FASTSTART]);
+  assert.ok(res.body.error.details.violations.some((item) => item.code === VIOLATION.PROBE_FAILED));
   assert.equal(puts.length, 0);
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM audit_log').get().n, 0);
   db.close();
 });
 

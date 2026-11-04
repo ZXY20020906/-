@@ -25,6 +25,13 @@ const DEFAULT_HANDLERS = {
   ]),
   // 上传成功后的记账（verified_at / codec / faststart），用例不关心具体值
   [Q.markWallpaperVerified]: () => [],
+  // 缩略图 / 1080p 变体：ingestAsset() 现在会为图片补 thumb_key、为超 1080p 的视频写 variants。
+  // 老用例只关心「上传成功」，这两条在假环境里注册成 no-op（真 SQL 由 tests/batch-ingest.test.js 验）。
+  [Q.updateWallpaperThumb]: () => [],
+  [Q.updateWallpaperVariants]: () => [],
+  [Q.wallpaperTitleBytesTaken]: () => [],
+  // 大文件指纹去重：假环境「没有重复」，与 schema/013 列存在时的行为对齐
+  [Q.wallpaperFingerprintTaken]: () => [],
   // schema/015 的审计补标注：假环境没有 media_audit 表，注册成 no-op 避免 warn 噪音；
   // 真实行为（触发器 + changed_by）由 tests/media-audit.test.js 用真 SQLite 验证。
   [Q.mediaAuditAnnotate]: () => [],

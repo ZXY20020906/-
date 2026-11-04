@@ -2,46 +2,47 @@
  * 壁纸管理接口（都需要登录）：
  *   GET    /api/admin/wallpapers       列表（可按状态/分类/类型/仅自己/关键词筛）
  *   POST   /api/admin/wallpapers       新建草稿（拿到 id 后再传文件）
+ *   POST   /api/admin/wallpapers/import  批量入口：一条文件 = 建草稿 + 入库 + 报告
  *   GET    /api/admin/wallpapers/:id
  *   PATCH  /api/admin/wallpapers/:id   改标题/分类/标签/状态/置顶
  *   PUT    /api/admin/wallpapers/:id/asset  上传原图或视频（原始二进制 body）
+ *   PUT    /api/admin/wallpapers/:id/thumb  上传缩略图（浏览器 canvas 生成）
  *   DELETE /api/admin/wallpapers/:id   删除（连 R2 对象一起删）
  *   POST   /api/admin/wallpapers/reorder    重排
+ *
+ * ⚠️ 所有写 R2 + 媒体列的动作都在 `../ingest.js` 的 `ingestAsset()` 里，
+ *    本文件只负责「鉴权 / 读请求 / 拼响应」。**不许**在这里直接 putAsset 或写媒体列：
+ *    4.23.17 的事故就是某条批量路径绕过了合规体检。
  */
 import { Q } from '../queries.js';
-import { all, batch, first, run, statement } from '../db.js';
+import { all, first, run, statement, batch, nowMs } from '../db.js';
 import { MAX_UPLOAD_BYTES } from '../../core/image-meta.js';
-import { nowMs } from '../db.js';
 import { ACTION, assertCan, can } from '../../core/permissions.js';
 import {
   cleanCategoryRef, cleanEnum, cleanId, has, parseLimit, parseWallpaperCreate, parseWallpaperPatch,
 } from '../../core/validate.js';
 import { KINDS, REVIEW_STATUSES, STATUSES } from '../../core/validate.js';
-import { uniqueSlug } from '../../core/slug.js';
+import { kindMatchesMime } from '../../core/image-meta.js';
 import {
-  ALLOWED_MIME, isVideoMime, limitForMime, kindMatchesMime, readDurationMs, readMediaMeta, readVideoInfo,
-} from '../../core/image-meta.js';
-import {
-  COMPLIANCE_HINT, checkVideoCompliance, complianceMessage, describeWarnings,
-} from '../media-compliance.js';
-import {
-  badRequest, conflict, HttpError, internal, mediaNonCompliant, notFound, payloadTooLarge,
-  storageVerifyFailed, tooManyRequests, unsupportedMedia,
+  badRequest, notFound, payloadTooLarge, storageVerifyFailed, tooManyRequests, unsupportedMedia,
 } from '../../core/errors.js';
 import { created, json, readJson } from '../http.js';
 import { wallpaperDto } from '../dto.js';
-import { assetKey, deleteAsset, mediaBaseFor, putAsset, thumbKey, verifyAsset } from '../storage.js';
-import { newId, safeJsonParse, sampleFingerprint, sha256Bytes } from '../util.js';
-import { buildReorderPlan, nextSortOrder } from '../../core/ordering.js';
+import { deleteAsset, mediaBaseFor, putAsset as putR2, thumbKey, verifyAsset } from '../storage.js';
+import { newId, sha256Bytes } from '../util.js';
+import { buildReorderPlan } from '../../core/ordering.js';
 import { AUDIT_ACTION, writeAudit } from '../audit.js';
-import { MEDIA_ACTOR, setMediaIdentity } from '../media-audit.js';
 import { allowedTagNames } from './tags.js';
 import { hit } from '../rate-limit.js';
 import { clientIp } from '../session.js';
+import { readMediaMeta } from '../../core/image-meta.js';
+import {
+  assertDailyQuota, buildImportReport, createWallpaperRow, importMedia, ingestAsset,
+  recordDailyUsage,
+} from '../ingest.js';
 
-/** 大文件跳过完整 sha256 的阈值；测试可用 env.UPLOAD_HASH_LIMIT 调小来覆盖大文件分支。 */
-export const HASH_LIMIT = 40 * 1024 * 1024;
-const DEFAULT_DAILY_BYTES = 1024 * 1024 * 1024;
+/** 大文件跳过完整 sha256 的阈值（真正的实现在 ingest.js，这里 re-export 供测试/工具引用）。 */
+export { HASH_LIMIT, THUMB_WIDTH, DEFAULT_MEDIA_TOOLS, AUTO_FIX, IMPORT_WARNING } from '../ingest.js';
 
 /**
  * 上传限流：账号级 30 次/小时 + IP 级 60 次/小时，两层都要有。
@@ -53,6 +54,14 @@ export const UPLOAD_ACTOR_MAX = 30;
 export const UPLOAD_IP_MAX = 60;
 const UPLOAD_WINDOW_MS = 60 * 60 * 1000;
 
+/**
+ * 批量导入的限流另算：一次「目录扫描」可能就是几十上百条，套单条那 30 次/小时
+ * 会把正常的批量作业直接砍死。批量入口单请求只处理**一个文件**（浏览器按文件循环），
+ * 所以阈值按「文件」给，仍然是双层的。
+ */
+export const IMPORT_ACTOR_MAX = 300;
+export const IMPORT_IP_MAX = 600;
+
 function assertUploadRate(actor, request) {
   const byActor = hit(`upload:${actor.id}`, { max: UPLOAD_ACTOR_MAX, windowMs: UPLOAD_WINDOW_MS });
   if (byActor.limited) throw tooManyRequests(`上传过于频繁，请 ${byActor.retryAfter} 秒后再试`);
@@ -60,81 +69,11 @@ function assertUploadRate(actor, request) {
   if (byIp.limited) throw tooManyRequests(`上传过于频繁，请 ${byIp.retryAfter} 秒后再试`);
 }
 
-/**
- * upload_usage 表来自 schema/013。缺表时只降级（跳过配额记账并 warn 一次），
- * 绝不让上传 500 —— 和 codec/faststart 的探测一个模式。
- */
-let uploadUsageReady = null;
-let warnedNoUsageTable = false;
-async function supportsUploadUsage(env) {
-  if (uploadUsageReady === true) return true;
-  try {
-    const rows = await all(env, Q.tableExists, 'upload_usage');
-    if (rows.length > 0) {
-      uploadUsageReady = true;
-      return true;
-    }
-    if (!warnedNoUsageTable) {
-      warnedNoUsageTable = true;
-      console.warn('[upload] 没有 upload_usage 表（schema/013 未执行），跳过每日配额记账');
-    }
-    return false;
-  } catch (error) {
-    if (!warnedNoUsageTable) {
-      warnedNoUsageTable = true;
-      console.warn('[upload] 探测 upload_usage 表失败，跳过每日配额记账', error?.message ?? error);
-    }
-    return false;
-  }
-}
-
-function usageDay(now = Date.now()) {
-  return new Date(now).toISOString().slice(0, 10);
-}
-
-/** 每日字节配额（默认 1 GiB / 账号 / 天，env.UPLOAD_DAILY_BYTES 可调）。 */
-async function assertDailyQuota(env, actor, bytes) {
-  if (!(await supportsUploadUsage(env))) return;
-  const limit = Number(env.UPLOAD_DAILY_BYTES ?? DEFAULT_DAILY_BYTES) || DEFAULT_DAILY_BYTES;
-  try {
-    const used = Number((await first(env, Q.uploadUsageGet, usageDay(), actor.id))?.bytes ?? 0);
-    if (used + bytes > limit) {
-      throw tooManyRequests('今天的上传容量已经用完，请明天再试');
-    }
-  } catch (error) {
-    // 429 必须原样抛出去；其余（查库失败）只降级，不能让容量统计把上传卡死
-    if (error instanceof HttpError) throw error;
-    console.warn('[upload] 读取上传用量失败，跳过配额校验', error?.message ?? error);
-  }
-}
-
-/** 记账失败不阻断上传：容量统计是审计用途，不能反过来把文件卡住。 */
-async function recordDailyUsage(env, actor, bytes) {
-  if (!(await supportsUploadUsage(env))) return;
-  try {
-    await run(env, Q.uploadUsageAdd, usageDay(), actor.id, bytes);
-  } catch (error) {
-    console.warn('[upload] 记录上传用量失败', error?.message ?? error);
-  }
-}
-
-/**
- * content_fingerprint 列来自 schema/013。列不在就跳过指纹去重（老库照常能传）。
- * 只缓存「有」这个结果：缺列时保持每次探测，避免测试/灰度环境切换后被永久写死。
- */
-let fingerprintColumnReady = null;
-async function supportsFingerprintColumn(env) {
-  if (fingerprintColumnReady === true) return true;
-  try {
-    const rows = await all(env, Q.wallpaperColumnExists, 'content_fingerprint');
-    if (rows.length > 0) {
-      fingerprintColumnReady = true;
-      return true;
-    }
-    return false;
-  } catch {
-    return false;
-  }
+function assertImportRate(actor, request) {
+  const byActor = hit(`import:${actor.id}`, { max: IMPORT_ACTOR_MAX, windowMs: UPLOAD_WINDOW_MS });
+  if (byActor.limited) throw tooManyRequests(`批量导入过于频繁，请 ${byActor.retryAfter} 秒后再试`);
+  const byIp = hit(`import-ip:${clientIp(request)}`, { max: IMPORT_IP_MAX, windowMs: UPLOAD_WINDOW_MS });
+  if (byIp.limited) throw tooManyRequests(`批量导入过于频繁，请 ${byIp.retryAfter} 秒后再试`);
 }
 
 function likePattern(raw) {
@@ -206,34 +145,18 @@ export async function create({ env, actor, request }) {
   // 置顶影响首页，只给有发布权限的人
   if (input.featured) assertCan(actor, ACTION.WALLPAPER_PUBLISH);
 
-  const slug = await uniqueSlug(
-    input.slug || input.title,
-    async (candidate) => Boolean(await first(env, Q.wallpaperSlugTaken, candidate)),
-    { fallback: 'wallpaper' },
-  );
-  const sortOrder = nextSortOrder([{ sort_order: Number((await first(env, Q.maxWallpaperSort))?.m ?? 0) }]);
-  const id = newId('wp');
-  const now = nowMs();
-
-  await run(
-    env,
-    Q.insertWallpaper,
-    id, slug, input.title, input.description, input.subtag, input.reviewStatus,
-    input.categoryId, input.kind, 'draft',
-    null, null, 0, null, null, null,
-    JSON.stringify(input.tags), input.featured ? 1 : 0, sortOrder, actor.id, now, now, null,
-  );
+  const row = await createWallpaperRow(env, actor, input);
 
   await writeAudit(env, {
     actor,
     action: AUDIT_ACTION.WALLPAPER_CREATE,
     targetType: 'wallpaper',
-    targetId: id,
+    targetId: row.id,
     detail: `${input.title}（${input.kind === 'dynamic' ? '动态' : '静态'}）`,
   });
 
-  const row = await first(env, Q.wallpaperById, id);
-  return created({ wallpaper: wallpaperDto(row, { admin: true, mediaBase: mediaBaseFor(env) }) });
+  const fresh = await first(env, Q.wallpaperById, row.id);
+  return created({ wallpaper: wallpaperDto(fresh, { admin: true, mediaBase: mediaBaseFor(env) }) });
 }
 
 export async function update({ env, actor, request, params }) {
@@ -269,7 +192,7 @@ export async function update({ env, actor, request, params }) {
     subtag: patch.subtag !== undefined ? patch.subtag : (row.subtag ?? ''),
     reviewStatus: patch.reviewStatus ?? row.review_status ?? 'pending',
     categoryId: patch.categoryId !== undefined ? patch.categoryId : row.category_id,
-    tags: patch.tags ?? safeJsonParse(row.tags, []),
+    tags: patch.tags ?? safeJsonParseLocal(row.tags, []),
     featured: patch.featured !== undefined ? patch.featured : row.featured === 1,
     sortOrder: patch.sortOrder ?? Number(row.sort_order ?? 0),
   };
@@ -294,6 +217,21 @@ export async function update({ env, actor, request, params }) {
   return json({ wallpaper: wallpaperDto(fresh, { admin: true, mediaBase: mediaBaseFor(env) }) });
 }
 
+function safeJsonParseLocal(value, fallback) {
+  if (value === null || value === undefined || value === '') return fallback;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * 单条上传 / 替换：读 body 后**整单交给 ingestAsset()**。
+ * 合规体检、sha256/指纹、HEAD 回读、D1 三值成对写、缩略图、变体都在那里，
+ * 这里只做鉴权、限流、审计与响应。
+ */
 export async function upload({ env, actor, request, params }) {
   const row = await loadWallpaper(env, params.id);
   assertCan(actor, ACTION.ASSET_UPLOAD);
@@ -306,174 +244,115 @@ export async function upload({ env, actor, request, params }) {
   }
 
   const buffer = await request.arrayBuffer();
-  if (!buffer.byteLength) throw badRequest('文件为空');
-  const bytes = new Uint8Array(buffer);
-  if (bytes.byteLength > MAX_UPLOAD_BYTES) {
-    throw payloadTooLarge(`文件不能超过 ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)} MB`);
-  }
-
-  const meta = readMediaMeta(bytes);
-  if (!meta.mime) throw unsupportedMedia(meta.error ?? '无法识别的文件类型');
-  if (!ALLOWED_MIME.includes(meta.mime)) throw unsupportedMedia(`不支持的类型：${meta.mime}`);
-  if (bytes.byteLength > limitForMime(meta.mime)) {
-    throw payloadTooLarge(`${meta.mime} 最大 ${Math.round(limitForMime(meta.mime) / 1024 / 1024)} MB`);
-  }
-
-  // 视频探针只解析 box 头，几 MB 的文件几毫秒；编码/帧率/faststart 全靠它。
-  const videoInfo = readVideoInfo(bytes, meta.mime);
-
-  /**
-   * 播放合规体检（上传 / 替换都走这里）。
-   *
-   * Workers 没有 ffmpeg ⇒ 服务端只能「拒」，不能「转」。所以判违规时直接 422：
-   * 此刻还没有 putAsset、没有 sha 去重、没有配额记账，更没有写 D1 —— 一个字节都不落盘。
-   * 只有 warning 的情况照常入库，warning 记进 audit_log（action = wallpaper.asset_compliance_warn）。
-   * 规则与本地工具 tools/prepare-upload.mjs 共用 src/server/media-compliance.js。
-   */
-  const compliance = isVideoMime(meta.mime)
-    ? checkVideoCompliance({
-      mime: meta.mime,
-      width: meta.width,
-      height: meta.height,
-      fps: videoInfo.fps,
-      codec: videoInfo.codec,
-      faststart: videoInfo.faststart,
-      bytes: bytes.byteLength,
-    })
-    : null;
-  if (compliance && !compliance.ok) {
-    throw mediaNonCompliant(complianceMessage(compliance), {
-      mime: meta.mime,
-      width: meta.width,
-      height: meta.height,
-      fps: videoInfo.fps,
-      codec: videoInfo.codec,
-      faststart: videoInfo.faststart,
-      bytes: bytes.byteLength,
-      violations: compliance.violations,
-      warnings: compliance.warnings,
-      hint: COMPLIANCE_HINT,
-    });
-  }
-
-  // 每日字节配额：先校验再写盘，超了直接 429，别等 90MB 传完才拒
-  await assertDailyQuota(env, actor, bytes.byteLength);
-
-  // 类型不再让人手选：传视频就是动态、传图片就是静态；
-  // zip 保留原来的类型（皮肤包是静态，开机动画包是动态）。
-  const nextKind = meta.mime.startsWith('video/')
-    ? 'dynamic'
-    : meta.mime.startsWith('image/') ? 'static' : row.kind;
-
-  // 大文件跳过完整 sha256：Worker 只有有限的 CPU 预算（免费档 10ms/请求），
-  // 40MB+ 的 digest 会把它吃穿并抛 exceededCpu。也不能拿 Date.now() 当 key ——
-  // 那样同一个文件每次上传都是新对象，R2 里只会堆垃圾。
-  const hashLimit = Number(env.UPLOAD_HASH_LIMIT ?? HASH_LIMIT) || HASH_LIMIT;
-  let sha = null;
-  if (bytes.byteLength <= hashLimit) {
-    sha = await sha256Bytes(bytes);
-    const duplicate = await first(env, Q.wallpaperShaTaken, sha);
-    if (duplicate && duplicate.id !== row.id) {
-      throw conflict('这个文件已经在库里了', { wallpaperId: duplicate.id, title: duplicate.title });
-    }
-  }
-
-  // 大文件没有完整 sha，用「首 1MB + 尾 1MB」的采样指纹做内容寻址：
-  // 同一个文件稳定得到同一个 key（能去重、URL 不会每次都变），内容变了 key 基本必变。
-  const keySeed = sha ?? await sampleFingerprint(bytes);
-
-  // 指纹去重：只在 content_fingerprint 列存在时生效（schema/013；老库跳过）
-  if (!sha && (await supportsFingerprintColumn(env))) {
-    const duplicate = await first(env, Q.wallpaperFingerprintTaken, keySeed);
-    if (duplicate && duplicate.id !== row.id) {
-      throw conflict('这个文件已经在库里了', { wallpaperId: duplicate.id, title: duplicate.title });
-    }
-  }
-
-  const key = assetKey(row.id, keySeed, meta.mime);
-
-  if (!sha) {
-    // 大文件不算完整 sha256，D1 的 sha256 列会是 NULL —— "全量下载比对 sha256" 这条验收
-    // 对这一条记录无解。留一条 warn（而不是静默留空），让后来人知道这是设计取舍不是漏写；
-    // 兜底只能靠 HEAD 长度 + Range 总量双长度检查（见 docs/UPLOAD-SOP.md 第 3 节）。
-    console.warn(
-      `[upload] sha256 skipped (>40MB), integrity verification unavailable — wallpaper=${row.id} size=${bytes.byteLength} hashLimit=${hashLimit} key=${key}`,
-    );
-  }
-
-  await putAsset(env, key, bytes, meta.mime);
-
-  // 写完立刻回读：D1 记账必须来自刚校验过的对象，否则就是「库里有、桶里没有」
-  const check = await verifyAsset(env, key, bytes.byteLength);
-  if (!check.ok) {
-    await deleteAsset(env, key);
-    throw storageVerifyFailed(check.reason === 'size'
-      ? `上传校验失败：R2 里的对象大小不一致（写入 ${bytes.byteLength}，实际 ${check.size}）`
-      : '上传校验失败：R2 里找不到刚写入的对象，请重试');
-  }
-  if (row.storage_key && row.storage_key !== key) await deleteAsset(env, row.storage_key);
-
-  // 视频顺便读时长：开机动画是按秒循环的，moov 位置决定能不能边下边播。
-  // 编码/faststart/帧率在上面的合规体检里已经读过，这里复用 videoInfo，不重复解析。
-  const durationMs = readDurationMs(bytes, meta.mime);
-  // 媒体三列（storage_key/bytes/sha256）统一走 setMediaIdentity：
-  // 它先 UPDATE，再把 schema/015 触发器刚写入的审计行补上 changed_by。
-  await setMediaIdentity(env, row.id, {
-    storageKey: key,
-    mime: meta.mime,
-    bytes: check.size,
-    width: meta.width,
-    height: meta.height,
-    durationMs,
-    sha256: sha,
-    kind: nextKind,
-    actor: row.storage_key ? MEDIA_ACTOR.REPLACE : MEDIA_ACTOR.UPLOAD,
-  });
-  await run(
-    env, Q.markWallpaperVerified,
-    nowMs(), videoInfo.codec, videoInfo.faststart, row.id,
-  );
-
-  // 大文件的内容指纹单独落进 content_fingerprint（schema/013；列不在就跳过）。
-  // 刻意不写进 sha256：那一列是对外输出的真 sha256，写个采样值会让 dto 说谎。
-  if (!sha && (await supportsFingerprintColumn(env))) {
-    try {
-      await run(env, Q.updateWallpaperFingerprint, keySeed, nowMs(), row.id);
-    } catch (error) {
-      console.warn('[upload] 写入 content_fingerprint 失败', error?.message ?? error);
-    }
-  }
-
-  // 配额记账放在落盘校验通过之后：失败的上传不该占用户当天的额度
-  await recordDailyUsage(env, actor, check.size);
+  const result = await ingestAsset(env, actor, row, { bytes: new Uint8Array(buffer) });
 
   await writeAudit(env, {
     actor,
     action: AUDIT_ACTION.WALLPAPER_ASSET,
     targetType: 'wallpaper',
     targetId: row.id,
-    detail: `${meta.mime} ${meta.width ?? '?'}x${meta.height ?? '?'} ${Math.round(bytes.byteLength / 1024)}KB${
-      durationMs ? ` ${(durationMs / 1000).toFixed(1)}s` : ''}`,
+    detail: `${result.mime} ${result.width ?? '?'}x${result.height ?? '?'} ${Math.round(result.bytes / 1024)}KB${
+      result.durationMs ? ` ${(result.durationMs / 1000).toFixed(1)}s` : ''}`,
   });
 
   // 只有警告时照常入库，但要留痕：这些文件「能播」，只是不在目标规格里
   // （体积超限、WebM 容器、帧率探测不到）。查 warning 就查这个 action。
-  if (compliance && compliance.warnings.length) {
+  const complianceWarnings = result.compliance?.warnings ?? [];
+  if (complianceWarnings.length) {
     await writeAudit(env, {
       actor,
       action: AUDIT_ACTION.WALLPAPER_COMPLIANCE_WARN,
       targetType: 'wallpaper',
       targetId: row.id,
-      detail: `${compliance.warnings.length} 项：${describeWarnings(compliance.warnings)}`,
+      detail: `${complianceWarnings.length} 项：${complianceWarnings.map((item) => `${item.code}: ${item.message}`).join(' / ')}`,
     });
   }
 
   const fresh = await first(env, Q.wallpaperById, row.id);
   return json({
     wallpaper: wallpaperDto(fresh, { admin: true, mediaBase: mediaBaseFor(env) }),
-    url: `/media/${key}`,
-    ...(compliance ? { compliance: { warnings: compliance.warnings } } : {}),
+    url: result.url,
+    ...(result.compliance ? { compliance: { warnings: complianceWarnings } } : {}),
+    // 自动修正项（转封装 / 降帧 / 缩略图 / 变体）也回给前端，让「上传成功」不再是一个黑箱
+    ingest: { autoFixes: result.autoFixes, warnings: result.warnings },
   });
+}
+
+/**
+ * 批量入口（后台「立即扫描 / 添加目录」+「批量导入本地文件」）的单条接口。
+ *
+ * Body: `multipart/form-data`
+ *   - `file`           必填，一个媒体文件
+ *   - `thumb`          可选，浏览器 canvas 生成的 WebP（1280 宽）
+ *   - `variant`        可选，可重复；1080p 变体（命名 `xxx.1080p.mp4` 时自动认高度）
+ *   - `title` / `kind` / `categoryId` / `tags`(JSON) / `publish`(0|1) / `reportId`
+ *
+ * 返回 **HTTP 200 + 报告**（不是 422）：批量导入里「某一条失败」是**数据**，不是异常，
+ * 界面要能把每条原因列出来。单个文件的失败码在 `item.code` / `item.reason` 里，
+ * 与单条 `PUT /asset` 的 422 一一对应（media_non_compliant / import_incomplete / …）。
+ */
+export async function importAsset({ env, actor, request }) {
+  assertCan(actor, ACTION.ASSET_UPLOAD);
+  assertCan(actor, ACTION.WALLPAPER_CREATE);
+  assertImportRate(actor, request);
+
+  let form = null;
+  try {
+    form = await request.formData();
+  } catch {
+    throw badRequest('批量导入必须用 multipart/form-data（字段 file）');
+  }
+  const file = form.get('file');
+  if (!file || typeof file === 'string') throw badRequest('缺少 file（一个媒体文件）');
+
+  const reportId = String(form.get('reportId') ?? '') || newId('report');
+  const title = String(form.get('title') ?? '').trim()
+    || String(file.name ?? '').replace(/\.[^.]+$/, '').slice(0, 120);
+  const publish = String(form.get('publish') ?? '') === '1';
+  // 发布是「上线动作」，权限在入口就判：不要等落盘之后再因为 403 把文件白传一遍
+  if (publish) assertCan(actor, ACTION.WALLPAPER_PUBLISH);
+  const categoryRaw = String(form.get('categoryId') ?? '');
+  let tags = [];
+  try {
+    const parsed = JSON.parse(String(form.get('tags') ?? '[]') || '[]');
+    if (Array.isArray(parsed)) tags = parsed.filter((item) => typeof item === 'string');
+  } catch {
+    tags = [];
+  }
+
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const kindRaw = String(form.get('kind') ?? '');
+  const kind = kindRaw === 'dynamic' || kindRaw === 'static' ? kindRaw : 'static';
+  const categoryId = categoryRaw ? cleanCategoryRef(categoryRaw) : null;
+  if (categoryId) await ensureCategory(env, categoryId);
+
+  const thumbFile = form.get('thumb');
+  const thumb = thumbFile && typeof thumbFile !== 'string'
+    ? new Uint8Array(await thumbFile.arrayBuffer())
+    : null;
+
+  const variants = [];
+  for (const entry of form.getAll('variant')) {
+    if (!entry || typeof entry === 'string') continue;
+    const heightHit = /\.(\d{3,4})p\./i.exec(String(entry.name ?? ''));
+    variants.push({
+      bytes: new Uint8Array(await entry.arrayBuffer()),
+      height: heightHit ? Number(heightHit[1]) : 1080,
+      label: heightHit ? `${heightHit[1]}p` : '1080p',
+    });
+  }
+
+  const item = await importMedia({
+    env,
+    actor,
+    item: {
+      title, kind, categoryId, tags, bytes, thumb, variants, publish, reportId,
+      fileName: String(file.name ?? ''),
+    },
+  });
+
+  const report = buildImportReport(reportId, [item]);
+  return json({ item, report });
 }
 
 /**
@@ -503,7 +382,7 @@ export async function uploadThumb({ env, actor, request, params }) {
 
   const sha = await sha256Bytes(bytes);
   const key = thumbKey(row.id, sha, meta.mime);
-  await putAsset(env, key, bytes, meta.mime);
+  await putR2(env, key, bytes, meta.mime);
   const thumbCheck = await verifyAsset(env, key, bytes.byteLength);
   if (!thumbCheck.ok) {
     await deleteAsset(env, key);

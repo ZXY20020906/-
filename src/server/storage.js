@@ -25,6 +25,17 @@ export function thumbKey(wallpaperId, sha256, mime) {
 }
 
 /**
+ * 1080p 变体的 key：`wallpapers/<id>/<sha16>.1080p.mp4`（docs/UPLOAD-SOP.md 第 1 条铁律）。
+ * 变体和原画是**两个对象、两份内容哈希** —— 插件用各自的 sha256 校验（见
+ * lib/variant-pick.js 的 resolveMediaExpectation），所以 key 里必须是变体自己的哈希。
+ */
+export function variantKey(wallpaperId, sha256, height = 1080, mime = 'video/mp4') {
+  const ext = EXT_BY_MIME[mime] ?? 'mp4';
+  const tag = Number(height) > 0 ? `${Math.round(Number(height))}p` : 'alt';
+  return `wallpapers/${safeId(wallpaperId)}/${sha256.slice(0, HASH_PREFIX_LEN)}.${tag}.${ext}`;
+}
+
+/**
  * routes 层统一用这个拿媒体前缀，避免各处手写 fallback。
  * 注意：PUBLIC_ORIGIN 是站点源，不是媒体根，必须补 /media；
  * MEDIA_BASE 则是 R2 自定义域名，对象直接在根。

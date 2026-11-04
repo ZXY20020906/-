@@ -46,5 +46,13 @@ export const mediaNonCompliant = (message = '视频不符合播放规格', detai
 export const storageVerifyFailed = (message = 'R2 写入校验失败（对象缺失或大小不符），请重试') =>
   new HttpError(500, 'storage-verify-failed', message);
 
+/**
+ * 422：文件能识别，但缺了插件消费的必填字段（宽高探测失败是最常见的一种）。
+ * 与 media_non_compliant 的区别：那条是「视频播不了」，这条是「记录不完整」。
+ * `details.missing` 是缺的字段名数组，批量入口据此写导入报告。
+ */
+export const importIncomplete = (message = '导入失败：缺少必填字段', details = null) =>
+  new HttpError(422, 'import_incomplete', message, details);
+
 export const internal = (message = '服务器内部错误') =>
   new HttpError(500, 'internal_error', message);

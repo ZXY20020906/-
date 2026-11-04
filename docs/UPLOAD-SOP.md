@@ -52,7 +52,7 @@ node tools/prepare-upload.mjs <源文件或目录> --out .\prepared
 | `too-many-pixels` | 宽×高 > 8,294,400 | 拒绝入库 | 工具转码自动缩 |
 | `fps-too-high` | 帧率 > 30（含 0.5 容差） | 拒绝入库 | 工具 `fps=30` 重编码 |
 | `codec-unsupported` | 不是 H.264（如 HEVC） | 拒绝入库 | 工具 `libx264` 重编码 |
-| `not-faststart` | moov 在文件尾 / 无法确认 | 拒绝入库 | 工具 `-movflags +faststart` |
+| `not-faststart` | moov 在文件尾 / 无法确认 | **自动转封装**（4.23.18 起）；转封装失败（结构不认识 / 偏移溢出）才拒绝入库 | 一般不用管；仍被拒就用工具 `-c copy -movflags +faststart` |
 | `probe-failed` | 宽高或编码探测不出来 | 拒绝入库 | 源文件可能损坏，重导出 |
 
 只有警告的情况**照常入库**，但会在 `audit_log` 留一条 `action = wallpaper.asset_compliance_warn`：
@@ -284,12 +284,15 @@ $w.sha256 -eq $expectSha       # 大文件（sha256 为 NULL）跳过这条
 PUT /api/admin/wallpapers/:id/asset     原始二进制 body，需登录会话
 ```
 
-它内部顺序（`src/server/routes/wallpapers.js` → `upload()`）正好是这份规程：
+它内部顺序（`src/server/routes/wallpapers.js` → `upload()` → `src/server/ingest.js` 的 `ingestAsset()`）
+正好是这份规程：
 
 **播放合规体检**（`media-compliance.js`，违规 422 直接返回，此步之前不写盘、不写库）→
-算 sha256 去重 → `assetKey()` 生成键 → `putAsset()`（contentType + immutable）→
-`verifyAsset()` HEAD 回读 → 通过才 `updateWallpaperAsset`（`storage_key`/`bytes`/`sha256` 同一条 UPDATE）→
-删旧 key → 写审计（有 warning 时多写一条 `wallpaper.asset_compliance_warn`）。
+**纯 JS 能修的先修**（moov 前置转封装 / 只降帧）→ 算 sha256 去重（>40MB 改采样指纹）→
+`assetKey()` 生成键 → `putAsset()`（contentType + immutable）→ `verifyAsset()` HEAD 回读 →
+通过才 `updateWallpaperAsset`（`storage_key`/`bytes`/`sha256` 同一条 UPDATE）→
+删旧 key → 缩略图（有就传自己的，没有时图片用原图）→ 1080p 变体（超规格才生成/校验后写 `variants`）→
+写审计（有 warning 时多写一条 `wallpaper.asset_compliance_warn`）。
 
 前端 `↑ 上传`、后台 `/admin/` 都走这条链路。手工 PUT 只在两种场合用：历史对象修复、批量迁移脚本；
 这两种场合请自己把第 5 步、第 3 节补齐。
@@ -309,7 +312,87 @@ PUT /api/admin/wallpapers/:id/asset     原始二进制 body，需登录会话
 - **回滚 = 用留档文件重新上传到新 key**。把 D1 的 `storage_key` 指回旧 key **不算**回滚——
   旧 key 在源站可能已经是被覆盖后的版本，指回去就是重新制造"记录与文件不一致"。
 
-## 9. 相关文档
+## 9. 批量导入 / 目录扫描（与单条上传等价）
+
+后台两个批量入口：
+
+| 入口 | 位置 | 做什么 |
+|---|---|---|
+| **A · 立即扫描 / 添加目录** | 作品页顶部 `import-strip`（`public/admin/app.js` 的 `scanImportDirs()`） | 授权一个本机目录（Wallpaper Engine 创意工坊 / 任意壁纸文件夹），按 `project.json` 认作品，扫到的新东西直接进草稿 |
+| **B · 批量导入本地文件** | 作品页右上「批量导入本地文件」（`openLocalImport()`） | 多选图片（png/jpg/webp/avif/gif）或视频（mp4/webm，单个 ≤55MB），标题取文件名，导入后存草稿 |
+
+**两条入口点的是同一个接口，与单条上传走同一个入库管线：**
+
+```
+POST /api/admin/wallpapers/import     multipart/form-data，一个文件一枪
+  file         必填，一个媒体文件
+  thumb        可选，浏览器 canvas 生成的 WebP（1280 宽）
+  variant      可选、可重复，1080p 变体（名字形如 xxx.1080p.mp4）
+  title / kind / categoryId / tags(JSON) / publish(0|1) / reportId
+```
+
+服务端处理顺序与第 7 节的 `PUT /asset` **完全相同**（两处都调 `src/server/ingest.js` 的
+`ingestAsset()`），差别只有两点，都是为了批量场景：
+
+1. **建行 + 入库在同一次调用里**：失败会**回滚刚建的草稿**，不会像老写法那样在库里留一条没文件的僵尸记录；
+2. **返回导入报告**（HTTP 200，失败是数据不是异常，见下）。
+
+### 会自动做什么（报告里的 `autoFixes`）
+
+| 码 | 含义 | 需要什么 |
+|---|---|---|
+| `faststart` | moov 在尾部 ⇒ **纯 JS 转封装前置**（只改字节顺序，不重编码、画质与体积不变） | 无（Worker 里就能做，`src/server/mp4-remux.js`） |
+| `fps30` | 只有帧率超标（如 4K@60）⇒ 同分辨率重编码到 30fps（**降帧优先，不降画质**） | 视频编码器（`env.MEDIA_TOOLS.transcodeOriginal`） |
+| `variant1080p` | 源 `width>1920` 或 `height>1080` 或 `fps>30` ⇒ 生成/收录 1080p 变体并写 `variants` 列 | 预置 `xxx.1080p.mp4` 一起导入，或 `env.MEDIA_TOOLS.transcodeVariant` |
+| `thumb` | 缩略图：浏览器 canvas 抽帧（视频 0.5s、1280 宽 WebP）或解码器抽帧 | 浏览器即可 |
+| `thumbFromOriginal` | 图片没有独立缩略图 ⇒ **用原图当缩略图**（不写就留空，卡片会没图） | 无 |
+| `sampleFingerprint` | 单文件 >40MB ⇒ 不算完整 `sha256`，改记 `content_fingerprint`（首尾 1MB 采样） | 无 |
+
+⚠️ **Workers 里没有 ffmpeg**，所以「重编码」类修正（`fps30` / `variant1080p`）需要注入
+`env.MEDIA_TOOLS`（本地 Node 运行时用 ffmpeg，测试用确定性替身）。什么都没注入时：
+能纯 JS 修的照修，其余**老实拒绝并写进报告**——绝不假装修好。
+> 所以今天的实操口径是：4K@60 / HEVC 这类先用 `tools/prepare-upload.mjs` 转好再导入
+> （`xxx.mp4` 与 `xxx.1080p.mp4` **一起多选**，前端会自动配对成变体）；快start 与缩略图
+> 不用管，服务端/浏览器会补。
+
+### 失败报告怎么看
+
+报告形状（接口 `data.report`，界面弹窗同一份数据）：
+
+```json
+{
+  "ok": false,
+  "reportId": "report_m2xk9a_1f3c",
+  "imported": 1, "reused": 0, "failed": 1, "skipped": 0,
+  "items": [
+    { "title": "星空", "status": "imported", "wallpaperId": "wp_…",
+      "autoFixes": ["thumb", "thumbFromOriginal"],
+      "fields": { "url": "/media/wallpapers/wp_…/….png", "bytes": 18342, "sha256": "…",
+                  "width": 3840, "height": 2160, "thumbUrl": "/media/…", "variants": 0 } },
+    { "title": "原神 绫华 4K60", "status": "failed",
+      "code": "media_non_compliant",
+      "reason": "视频不符合播放规格：帧率 60fps 超过上限 30fps。请先用 tools/prepare-upload.mjs 处理后再上传",
+      "details": { "violations": [{ "code": "fps-too-high", "message": "…" }] } }
+  ]
+}
+```
+
+- `status`：`imported`（新入库）/ `reused`（同一文件已在库里，直接复用，不产生第二条）/ `failed` / `skipped`（前端预检就挡掉的：超 55MB、低清图、场景包）；
+- `failed` 的 `code` 与单条 `PUT /asset` 的错误码一一对应：
+  `media_non_compliant`（422 播放规格）/ `import_incomplete`（422 缺必填字段，`details.missing` 是缺的列）/
+  `unsupported_media_type`（415）/ `payload_too_large`（413）；
+- **失败条目不入库**（行会回滚），所以「报告里有几条 failed」=「库里没多出几条脏记录」；
+- `items[].fields` 是**写进 D1 的实际值**，可直接拿去跑第 3 节的四条验收。
+
+### 必填字段门
+
+`kind / category / url / bytes / width / height` 缺任一 ⇒ 该条失败进报告，**不静默入库**。
+`width/height` 探测不出来是最常见的一种（文件头损坏、moov 不在前/后 2MB 内）——
+这类记录一旦进库，插件侧 `width/height` 为 `null`，`decodeLimitHit()` 的解码上限预判直接失效。
+
+> zip 资源包（开机动画 / 皮肤包）没有宽高，豁免这一条：它本来就不是逐帧画面。
+
+## 10. 相关文档
 
 - [`docs/r2.md`](r2.md) — R2 模式、桶结构、缓存与 Range、事故复盘与「对象一致性守则」
 - [`docs/integration.md`](integration.md) — 接入步骤、建表、部署验证清单

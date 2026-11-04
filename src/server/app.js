@@ -39,6 +39,9 @@ const DEFINITIONS = [
   { method: 'GET', path: '/api/admin/wallpapers', handler: wallpaperRoutes.list, auth: 'session' },
   { method: 'POST', path: '/api/admin/wallpapers', handler: wallpaperRoutes.create, auth: 'session' },
   { method: 'POST', path: '/api/admin/wallpapers/approve-all', handler: wallpaperRoutes.approveAll, auth: 'session' },
+  // 批量入口（立即扫描/添加目录 + 批量导入本地文件）：一个文件一枪，返回导入报告。
+  // 与单条 PUT /asset 走同一个 ingestAsset()，见 routes/wallpapers.js 的 importAsset()。
+  { method: 'POST', path: '/api/admin/wallpapers/import', handler: wallpaperRoutes.importAsset, auth: 'session' },
   { method: 'POST', path: '/api/admin/wallpapers/reorder', handler: wallpaperRoutes.reorder, auth: 'session' },
   { method: 'GET', path: '/api/admin/wallpapers/:id', handler: wallpaperRoutes.get, auth: 'session' },
   { method: 'GET', path: '/api/admin/subtags', handler: subtagRoutes.list, auth: 'session' },
