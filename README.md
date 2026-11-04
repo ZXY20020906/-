@@ -1,6 +1,6 @@
 # Folia 壁纸库 · 管理 / 分类 / 权限模块
 
-给你的 `folia-major-3t6.pages.dev` 加一层能用的后台：**谁能加壁纸、谁能改分类、谁能发布上线**。
+给你的 `folia-5ve.pages.dev` 加一层能用的后台：**谁能加壁纸、谁能改分类、谁能发布上线**。
 
 现在的线上站是纯展示（全部 / 动态 / 收藏 / 皮肤包 四个 tab，没有写入口）。这个目录现在是一个**能直接跑的整站**：前台壁纸库 + 后台管理 + R2 存储，领域逻辑与框架无关。
 
@@ -88,7 +88,7 @@ npx wrangler pages secret put BOOTSTRAP_TOKEN
 
 # 4. 合并 wrangler.toml 的 DB / BUCKET 绑定（别覆盖你现有的配置）
 
-# 5. 部署，然后打开 /admin/ 用令牌创建管理员
+# 5. push 到 main 触发 Pages 部署（见「部署纪律」），然后打开 /admin/ 用令牌创建管理员
 ```
 
 详细步骤和回滚方式见 `docs/integration.md`。
@@ -99,9 +99,7 @@ npx wrangler pages secret put BOOTSTRAP_TOKEN
 
 留了一个**插件只读白名单**：`GET/HEAD /api/public/wallpapers` 和 `/media/*` 不需要登录（桌面插件要拉清单、显示封面、下载皮肤包）。只放已发布数据、只放读，写接口和其它 `/api/*` 照旧要会话。
 
-```bash
-npx wrangler pages deploy --project-name folia
-```
+部署只走仓库：push 到 `main`，Cloudflare Pages 自动构建。**不要**在本地跑 `wrangler pages deploy` 直传，原因见下一节「部署纪律」。
 
 登录页在 `/__gate`，复用后台同一套登录逻辑（PBKDF2 + 限流 + 审计）。细节与边界见 [`docs/private-site.md`](docs/private-site.md)。
 
@@ -144,6 +142,21 @@ node tools/dump-queries.mjs && python tools/check-sql.py   # 用真 sqlite3 编�
 ```
 
 当前状态：**92 个测试全通过；55 条 SQL 全部通过 sqlite3 编译；4 个迁移脚本可按序执行。**
+
+## 部署纪律（必须遵守）
+
+- 线上站点 = `https://folia-5ve.pages.dev`，Cloudflare Pages 项目 `folia` 已接入本仓库 `main` 分支：
+  **只有 push 到 main 才会部署**（构建命令为空、输出目录 `public`）。
+- **禁止**在本地执行 `wrangler pages deploy` 直传：那会用本地工作树覆盖线上，
+  与仓库不一致、也无法回滚（历史事故：本地直传导致的版本漂移）。
+- 部署前必做：`git pull` → `git rev-parse --short HEAD` 与 `origin/main` 一致 → 再改。
+- `wrangler.toml` 里的 `PUBLIC_ORIGIN` 必须是 `https://folia-5ve.pages.dev`；
+  写成其他域名会让所有媒体直链指向不可用主机（旧配置曾指向已下线域名）。
+- 数据库迁移（`schema/*.sql`）只在线上执行一次；`ALTER TABLE` 不可重复跑。
+- 媒体对象一律用内容哈希命名（`<sha256前12>.ext`），**换内容必须换 key**，
+  否则一年 immutable 缓存会让用户长期看到旧文件。
+- 1080p 变体：4K/2K 视频上传后应生成 `variants`（1080p），写入 D1 的 `variants` 列，
+  由 `/api/public/wallpapers` 输出；插件按链路情况自动选择。
 
 ## 设计取舍
 
