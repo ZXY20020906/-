@@ -195,6 +195,9 @@ X-Folia-Client: admin
 
 `GET /media/<key>` — 从 R2 直出。`Cache-Control: public, max-age=31536000, immutable`（key 含内容哈希）。视频支持 `Range`，返回 206。
 
+> immutable 的前提是 **key 由最终入库内容的 sha256 生成、且永不覆盖同名 key**；`PUT /asset` 走 `assetKey()` 自动满足，但脚本/手工补传必须自己遵守。
+> 若在同一个 key 上覆盖上传，边缘缓存（旧字节）与源站（新字节）会长期并存，`Range` 与全量下载拼出坏包。检测与处置见 [`r2.md`](r2.md) 的「对象一致性守则」。
+
 加 `?download=<文件名>` 会以附件形式返回（`Content-Disposition: attachment`），文件名支持中文（RFC 5987 编码）。开机动画的「下载视频」按钮用的就是这个。
 
 如果配置了 `MEDIA_BASE`（R2 自定义域名），所有 `url` 会直接指向那个域名，不再经过 Worker。两种形式都是绝对可粘贴的直链。
