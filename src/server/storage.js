@@ -1,5 +1,6 @@
 /** R2 对象读写。key 里带内容哈希，所以可以放心用 immutable 缓存。 */
 import { EXT_BY_MIME } from '../core/image-meta.js';
+import { variantKeyTag } from '../core/variant-label.js';
 
 /**
  * key 里的哈希前缀长度。曾用 12 位；2026-11-04「同址双版本」事故说明 12 位太短——
@@ -25,13 +26,23 @@ export function thumbKey(wallpaperId, sha256, mime) {
 }
 
 /**
- * 1080p 变体的 key：`wallpapers/<id>/<sha16>.1080p.mp4`（docs/UPLOAD-SOP.md 第 1 条铁律）。
+ * 变体的 key：`wallpapers/<id>/<sha16>.1080p.mp4` / `.30fps.mp4`
+ * （docs/UPLOAD-SOP.md 第 1 条铁律）。
+ *
  * 变体和原画是**两个对象、两份内容哈希** —— 插件用各自的 sha256 校验（见
  * lib/variant-pick.js 的 resolveMediaExpectation），所以 key 里必须是变体自己的哈希。
+ *
+ * 后缀**只由 `variantKeyTag()` 决定**（`1080p` / `30fps` / `alt`），不在这里按高度拼：
+ * 按高度拼会把 4K@30 档写成 `.2160p.mp4`，和存量的 `.30fps.mp4` 分成两套命名。
+ *
+ * @param {string} wallpaperId
+ * @param {string} sha256 变体自身的内容哈希
+ * @param {object} spec 变体规格（见 core/variant-label.js 的 labelForVariant）
+ * @param {string} [mime]
  */
-export function variantKey(wallpaperId, sha256, height = 1080, mime = 'video/mp4') {
+export function variantKey(wallpaperId, sha256, spec = {}, mime = 'video/mp4') {
   const ext = EXT_BY_MIME[mime] ?? 'mp4';
-  const tag = Number(height) > 0 ? `${Math.round(Number(height))}p` : 'alt';
+  const tag = variantKeyTag(spec);
   return `wallpapers/${safeId(wallpaperId)}/${sha256.slice(0, HASH_PREFIX_LEN)}.${tag}.${ext}`;
 }
 
@@ -75,7 +86,8 @@ export async function verifyAsset(env, key, expectedBytes) {
   return { ok: true, size: head.size, etag: head.httpEtag };
 }
 
-export async function deleteAsset(env, key) {  if (!key) return;
+export async function deleteAsset(env, key) {
+  if (!key) return;
   try {
     await env.BUCKET.delete(key);
   } catch (error) {

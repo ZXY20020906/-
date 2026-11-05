@@ -38,6 +38,7 @@ import { promisify } from 'node:util';
 import {
   MEDIA_LIMITS, VIOLATION, VIOLATION_LABEL, checkVideoCompliance,
 } from '../src/server/media-compliance.js';
+import { VARIANT_MAX_HEIGHT } from '../src/core/media-limits.js';
 
 const execFileP = promisify(execFile);
 
@@ -375,7 +376,7 @@ async function prepareOne(file, options, tools) {
       original: action === 'transcode'
         ? `转码 → ${planned ? `${planned.width}×${planned.height}` : '装进 3840×2160 框'} @${options.fps}fps`
         : '无损重封装（-c copy -movflags +faststart）',
-      variant: sourceProbe.height && sourceProbe.height > 1080 ? '生成 1080p 变体' : '跳过（源不高于 1080p）',
+      variant: sourceProbe.height && sourceProbe.height > VARIANT_MAX_HEIGHT ? '生成 1080p 变体' : '跳过（源不高于 1080p）',
       thumb: '取第 1 秒，缩放 1280 宽',
     };
     return entry;
@@ -421,8 +422,8 @@ async function prepareOne(file, options, tools) {
 
   // ---------------------------------------------------------- 1080p 变体
   // 源本来就不高于 1080p 时不做「变体」：等比放大只会更大更糊
-  if (entry.output.height > 1080) {
-    const variantBox = boxFor(limits, { maxWidth: MEDIA_LIMITS.variantMaxWidth, maxHeight: 1080 });
+  if (entry.output.height > VARIANT_MAX_HEIGHT) {
+    const variantBox = boxFor(limits, { maxWidth: MEDIA_LIMITS.variantMaxWidth, maxHeight: VARIANT_MAX_HEIGHT });
     await runFfmpeg(tools.ffmpeg, [
       '-hide_banner', '-loglevel', 'error', '-y',
       '-i', originalPath,
@@ -450,7 +451,7 @@ async function prepareOne(file, options, tools) {
     }
     entry.variant.warnings = variantCheck.warnings;
   } else {
-    entry.variantSkipped = `源高度 ${entry.output.height}px ≤ 1080，不做等比放大的「变体」`;
+    entry.variantSkipped = `源高度 ${entry.output.height}px ≤ ${VARIANT_MAX_HEIGHT}，不做等比放大的「变体」`;
   }
 
   // ---------------------------------------------------------------- 封面

@@ -47,20 +47,24 @@ import { assetKey, deleteAsset, putAsset, thumbKey, variantKey, verifyAsset } fr
 import { newId, safeJsonParse, sampleFingerprint, sha256Bytes } from './util.js';
 import { MEDIA_ACTOR, setMediaIdentity } from './media-audit.js';
 import { repairMp4Faststart } from './mp4-remux.js';
+import {
+  HASH_LIMIT_BYTES, ORIGINAL_MAX_HEIGHT, ORIGINAL_MAX_WIDTH, TARGET_FPS, THUMB_WIDTH,
+  UPLOAD_DAILY_BYTES, VARIANT_MAX_WIDTH,
+} from '../core/media-limits.js';
+import { VARIANT_KIND, labelForVariant, needsVariant, variantKind } from '../core/variant-label.js';
 import { nextSortOrder } from '../core/ordering.js';
 import { uniqueSlug } from '../core/slug.js';
 import { AUDIT_ACTION, writeAudit } from './audit.js';
 
-/** 大文件跳过完整 sha256 的阈值；测试可用 env.UPLOAD_HASH_LIMIT 调小来覆盖大文件分支。 */
-export const HASH_LIMIT = 40 * 1024 * 1024;
+/**
+ * 大文件跳过完整 sha256 的阈值（40MB，见 core/media-limits.js）；
+ * 测试可用 env.UPLOAD_HASH_LIMIT 调小来覆盖大文件分支。
+ * 这里 re-export 是为了兼容 `routes/wallpapers.js` 的转发与 `tests/upload-limits.test.js` 的引用。
+ */
+export const HASH_LIMIT = HASH_LIMIT_BYTES;
 
 /** 缩略图目标宽度（客户端 canvas / 转码器抽帧共用）。插件卡片最多 640 宽，1280 给 2x 屏。 */
-export const THUMB_WIDTH = 1280;
-
-/** 1080p 变体规格（与 media-compliance 的 variant 口径一致）。 */
-export const VARIANT_MAX_WIDTH = 1920;
-export const VARIANT_MAX_HEIGHT = 1080;
-export const VARIANT_MAX_FPS = 30;
+export { THUMB_WIDTH };
 
 /** 必填字段：批量入口缺任一 ⇒ 该条失败（见 docs/UPLOAD-SOP.md「批量导入」）。 */
 export const REQUIRED_FIELDS = Object.freeze(['kind', 'category', 'url', 'bytes', 'width', 'height']);
@@ -149,12 +153,10 @@ function usageDay(now = Date.now()) {
   return new Date(now).toISOString().slice(0, 10);
 }
 
-const DEFAULT_DAILY_BYTES = 1024 * 1024 * 1024;
-
 /** 每日字节配额（默认 1 GiB / 账号 / 天，env.UPLOAD_DAILY_BYTES 可调）。 */
 export async function assertDailyQuota(env, actor, bytes) {
   if (!(await supportsUploadUsage(env))) return;
-  const limit = Number(env.UPLOAD_DAILY_BYTES ?? DEFAULT_DAILY_BYTES) || DEFAULT_DAILY_BYTES;
+  const limit = Number(env.UPLOAD_DAILY_BYTES ?? UPLOAD_DAILY_BYTES) || UPLOAD_DAILY_BYTES;
   try {
     const used = Number((await first(env, Q.uploadUsageGet, usageDay(), actor.id))?.bytes ?? 0);
     if (used + bytes > limit) {
@@ -191,18 +193,16 @@ export async function supportsFingerprintColumn(env) {
       return true;
     }
     return false;
-  } catch {
+  } catch (error) {
+    // 刻意不抛：schema/013 没跑（或测试假环境缺这条查询）时，指纹去重只是「锦上添花」，
+    // 不能让一次正常上传 500。但必须留痕 —— 否则线上「指纹去重静默失效」会查不出来。
+    console.warn('[ingest] 探测 content_fingerprint 列失败，本轮跳过指纹去重', error?.message ?? error);
     return false;
   }
 }
 
-/** 视频是否需要 1080p 变体（用户口径：宽>1920 或 高>1080 或 fps>30）。 */
-export function needsVariant({ width, height, fps } = {}) {
-  const w = Number(width) || 0;
-  const h = Number(height) || 0;
-  const f = Number(fps) || 0;
-  return w > VARIANT_MAX_WIDTH || h > VARIANT_MAX_HEIGHT || f > VARIANT_MAX_FPS;
-}
+/** 视频是否需要 1080p/30fps 变体（规则见 core/variant-label.js）。 */
+export { needsVariant };
 
 function hashLimitFor(env, options) {
   const raw = options?.hashLimit ?? env?.UPLOAD_HASH_LIMIT ?? HASH_LIMIT;
@@ -298,7 +298,7 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
 
   if (compliance && !compliance.ok && onlyFpsViolation(compliance) && typeof tools.transcodeOriginal === 'function') {
     const transcoded = await tools.transcodeOriginal(bytes, {
-      maxWidth: 3840, maxHeight: 2160, maxFps: VARIANT_MAX_FPS, mime: meta.mime,
+      maxWidth: ORIGINAL_MAX_WIDTH, maxHeight: ORIGINAL_MAX_HEIGHT, maxFps: TARGET_FPS, mime: meta.mime,
     });
     if (transcoded && transcoded.byteLength) {
       const nextMeta = readMediaMeta(transcoded);
@@ -313,7 +313,7 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
         compliance = nextCheck;
         fixes.push({
           code: AUTO_FIX.FPS_DECIMATE,
-          message: `帧率降到 ${VARIANT_MAX_FPS}fps（同分辨率重编码，画质不变）`,
+          message: `帧率降到 ${TARGET_FPS}fps（同分辨率重编码，画质不变）`,
         });
       }
     }
@@ -483,7 +483,7 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
     }
   }
 
-  // ⑩ 1080p 变体
+  // ⑩ 变体（1080p 降分辨率档 / 同分辨率 30fps 档）
   const variants = [];
   if (isVideoMime(mime) && needsVariant({ width, height, fps: videoInfo.fps })) {
     const supplied = Array.isArray(asset.variants) ? asset.variants : [];
@@ -491,13 +491,18 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
     if (!candidates.length && typeof tools.transcodeVariant === 'function') {
       try {
         const generated = await tools.transcodeVariant(bytes, {
-          maxWidth: VARIANT_MAX_WIDTH, maxFps: VARIANT_MAX_FPS, mime,
+          maxWidth: VARIANT_MAX_WIDTH, maxFps: TARGET_FPS, mime,
         });
-        if (generated && generated.byteLength) candidates.push({ bytes: generated, height: 1080, label: '1080p' });
+        if (generated && generated.byteLength) {
+          candidates.push({ bytes: generated, kind: VARIANT_KIND.DOWNSCALE });
+        }
       } catch (error) {
         console.warn('[ingest] 生成 1080p 变体失败', error?.message ?? error);
       }
     }
+    // label 与 key 后缀只用 core/variant-label.js 这一处口径（原片尺寸/帧率一并传进去，
+    // 它才能分清「降分辨率」和「同分辨率降帧」——两者高度可能一样）。
+    const original = { width, height, fps: videoInfo.fps };
     for (const candidate of candidates) {
       if (!candidate || !candidate.bytes || !candidate.bytes.byteLength) continue;
       const vMeta = readMediaMeta(candidate.bytes);
@@ -509,9 +514,23 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
         continue;
       }
       const vInfo = readVideoInfo(candidate.bytes, vMeta.mime);
+      // 先定档位（降分辨率 / 同分辨率降帧），label、key 后缀、合规口径三处都从这一个 spec 走。
+      const spec = {
+        kind: candidate.kind,
+        width: vMeta.width ?? null,
+        height: vMeta.height ?? null,
+        fps: vInfo.fps ?? null,
+        original,
+      };
+      const kind = variantKind(spec);
+      // 变体的宽度上限随档位走：1080p 档 ≤1920；同分辨率降帧档的上限就是**原画宽度**
+      // （否则 4K@30 会被 1080p 那条 1920 上限误杀 —— 存量 4K30 档就是这么来的）。
+      const variantLimits = kind === VARIANT_KIND.FPS && Number(width) > 0
+        ? { variantMaxWidth: width }
+        : {};
       const verdict = checkVideoCompliance(
         complianceInput(vMeta.mime, vMeta, candidate.bytes, vInfo),
-        { role: 'variant' },
+        { role: 'variant', limits: variantLimits },
       );
       if (!verdict.ok) {
         warnings.push({
@@ -521,7 +540,7 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
         continue;
       }
       const vSha = await sha256Bytes(candidate.bytes);
-      const vKey = variantKey(row.id, vSha, vMeta.height ?? candidate.height ?? 1080, vMeta.mime);
+      const vKey = variantKey(row.id, vSha, spec, vMeta.mime);
       await putAsset(env, vKey, candidate.bytes, vMeta.mime);
       const vCheck = await verifyAsset(env, vKey, candidate.bytes.byteLength);
       if (!vCheck.ok) {
@@ -530,7 +549,8 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
         continue;
       }
       variants.push({
-        label: vMeta.height ? `${vMeta.height}p` : '1080p',
+        label: labelForVariant(spec),
+        kind,
         height: vMeta.height ?? null,
         width: vMeta.width ?? null,
         key: vKey,

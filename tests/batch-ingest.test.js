@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url';
 
 import { importAsset } from '../src/server/routes/wallpapers.js';
 import { AUTO_FIX, IMPORT_WARNING, ingestAsset } from '../src/server/ingest.js';
+import { wallpaperDto } from '../src/server/dto.js';
 import { readMediaMeta } from '../src/core/image-meta.js';
 import { assetKey } from '../src/server/storage.js';
 import { sha256Bytes } from '../src/server/util.js';
@@ -471,5 +472,62 @@ test('ingestAsset 本身：缺 category 时批量入口报 missing-field（单�
   const ok = await ingestAsset(env, ACTOR, row, { bytes: PNG });
   assert.equal(ok.mime, 'image/png');
   assert.equal(ok.width, 4);
+  db.close();
+});
+
+// ------------------------------------------------------ 变体 label（R4 口径统一）
+test('R4 入库：2:1 源（3840×1920）+ 1920×960 变体 ⇒ label 是 1080p，key 后缀仍是 .1080p', { skip }, async () => {
+  // 这条就是线上那个 bug 的形状：4320×2160 的源装进 1920 框只剩 1920×960，
+  // 老实现按高度拼 label 就写成了 960p。文件名甚至不写 `.1080p.`（走尺寸推断）。
+  const { db, env, bucket } = makeEnv();
+  env.MEDIA_TOOLS = MEDIA_TOOLS;
+  reset(`import:${ACTOR.id}`);
+
+  // 合规的 2:1 原画（宽顶满 3840、高 1920 ≤ 2160）
+  const fourK2by1 = makeMp4({ width: 3840, height: 1920, fps: 30, faststart: true });
+  const data = await runImport(env, {
+    fileName: '超宽原画.mp4',
+    file: fourK2by1,
+    kind: 'dynamic',
+    variants: [{ bytes: makeMp4({ width: 1920, height: 960, fps: 30, faststart: true }), name: 'v.mp4' }],
+  });
+
+  assert.equal(data.item.status, 'imported', data.item.reason ?? '应当入库');
+  const row = rowOf(db, data.item.wallpaperId);
+  const variants = JSON.parse(row.variants);
+  assert.equal(variants.length, 1);
+  assert.equal(variants[0].height, 960);
+  assert.equal(variants[0].label, '1080p', '1920×960 是 1080p 档，不是 960p 档');
+  assert.match(variants[0].key, /\.1080p\.mp4$/);
+  assert.ok(bucket.objects.has(variants[0].key));
+
+  // 公开 DTO 拿到的 label 与库里一致（同一个函数，不可能再各说一套）
+  assert.equal(wallpaperDto(row).variants[0].label, variants[0].label);
+  db.close();
+});
+
+test('R4 入库：4K@60 源 + 同分辨率 3840×2160@30 变体 ⇒ label 是 4K30，key 后缀是 .30fps', { skip }, async () => {
+  const { db, env, bucket } = makeEnv();
+  env.MEDIA_TOOLS = MEDIA_TOOLS;
+  reset(`import:${ACTOR.id}`);
+
+  const data = await runImport(env, {
+    fileName: '4K60.mp4',
+    file: makeMp4({ width: 3840, height: 2160, fps: 60 }),
+    kind: 'dynamic',
+    // 同分辨率降帧档：宽 3840 与原画一致 ⇒ 不该被 1080p 的 1920 上限误杀
+    variants: [{ bytes: makeMp4({ width: 3840, height: 2160, fps: 30, faststart: true }), name: 'v.30fps.mp4' }],
+  });
+
+  assert.equal(data.item.status, 'imported', data.item.reason ?? '应当入库');
+  const row = rowOf(db, data.item.wallpaperId);
+  const variants = JSON.parse(row.variants);
+  assert.equal(variants.length, 1);
+  assert.equal(variants[0].height, 2160);
+  assert.equal(variants[0].label, '4K30', '同分辨率降帧档不许被说成 2160p');
+  assert.equal(variants[0].kind, '30fps');
+  assert.match(variants[0].key, /\.30fps\.mp4$/);
+  assert.ok(bucket.objects.has(variants[0].key));
+  assert.equal(wallpaperDto(row).variants[0].label, '4K30');
   db.close();
 });

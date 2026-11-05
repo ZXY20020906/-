@@ -17,7 +17,9 @@
 import { Q } from '../queries.js';
 import { all, first, run, statement, batch, nowMs } from '../db.js';
 import { MAX_UPLOAD_BYTES } from '../../core/image-meta.js';
-import { ACTION, assertCan, can } from '../../core/permissions.js';
+import { THUMB_MAX_BYTES } from '../../core/media-limits.js';
+import { specFromFileName } from '../../core/variant-label.js';
+import { ACTION, assertCan } from '../../core/permissions.js';
 import {
   cleanCategoryRef, cleanEnum, cleanId, has, parseLimit, parseWallpaperCreate, parseWallpaperPatch,
 } from '../../core/validate.js';
@@ -29,7 +31,7 @@ import {
 import { created, json, readJson } from '../http.js';
 import { wallpaperDto } from '../dto.js';
 import { deleteAsset, mediaBaseFor, putAsset as putR2, thumbKey, verifyAsset } from '../storage.js';
-import { newId, sha256Bytes } from '../util.js';
+import { newId, safeJsonArray, sha256Bytes } from '../util.js';
 import { buildReorderPlan } from '../../core/ordering.js';
 import { AUDIT_ACTION, writeAudit } from '../audit.js';
 import { allowedTagNames } from './tags.js';
@@ -192,7 +194,7 @@ export async function update({ env, actor, request, params }) {
     subtag: patch.subtag !== undefined ? patch.subtag : (row.subtag ?? ''),
     reviewStatus: patch.reviewStatus ?? row.review_status ?? 'pending',
     categoryId: patch.categoryId !== undefined ? patch.categoryId : row.category_id,
-    tags: patch.tags ?? safeJsonParseLocal(row.tags, []),
+    tags: patch.tags ?? safeJsonArray(row.tags, []),
     featured: patch.featured !== undefined ? patch.featured : row.featured === 1,
     sortOrder: patch.sortOrder ?? Number(row.sort_order ?? 0),
   };
@@ -215,16 +217,6 @@ export async function update({ env, actor, request, params }) {
 
   const fresh = await first(env, Q.wallpaperById, row.id);
   return json({ wallpaper: wallpaperDto(fresh, { admin: true, mediaBase: mediaBaseFor(env) }) });
-}
-
-function safeJsonParseLocal(value, fallback) {
-  if (value === null || value === undefined || value === '') return fallback;
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : fallback;
-  } catch {
-    return fallback;
-  }
 }
 
 /**
@@ -312,13 +304,10 @@ export async function importAsset({ env, actor, request }) {
   // 发布是「上线动作」，权限在入口就判：不要等落盘之后再因为 403 把文件白传一遍
   if (publish) assertCan(actor, ACTION.WALLPAPER_PUBLISH);
   const categoryRaw = String(form.get('categoryId') ?? '');
-  let tags = [];
-  try {
-    const parsed = JSON.parse(String(form.get('tags') ?? '[]') || '[]');
-    if (Array.isArray(parsed)) tags = parsed.filter((item) => typeof item === 'string');
-  } catch {
-    tags = [];
-  }
+  // 表单里的 tags 是 JSON 文本；坏 JSON 不是错误（前端偶发传空串），回落成 [] 即可，
+  // 与 `safeJsonParseLocal` 原来是同一套行为，现在统一走 util.safeJsonArray。
+  const tags = safeJsonArray(String(form.get('tags') ?? '[]') || '[]')
+    .filter((item) => typeof item === 'string');
 
   const bytes = new Uint8Array(await file.arrayBuffer());
   const kindRaw = String(form.get('kind') ?? '');
@@ -334,11 +323,13 @@ export async function importAsset({ env, actor, request }) {
   const variants = [];
   for (const entry of form.getAll('variant')) {
     if (!entry || typeof entry === 'string') continue;
-    const heightHit = /\.(\d{3,4})p\./i.exec(String(entry.name ?? ''));
+    // 文件名只用来「标预期种类」（`xxx.1080p.mp4` / `xxx.30fps.mp4`）；
+    // 真实尺寸与 fps 由 ingest 探测文件头后重新算，文件名撒谎不会让 label 撒谎。
+    const spec = specFromFileName(entry.name);
     variants.push({
       bytes: new Uint8Array(await entry.arrayBuffer()),
-      height: heightHit ? Number(heightHit[1]) : 1080,
-      label: heightHit ? `${heightHit[1]}p` : '1080p',
+      kind: spec.kind,
+      height: spec.height,
     });
   }
 
@@ -366,7 +357,7 @@ export async function uploadThumb({ env, actor, request, params }) {
   // 缩略图也计入同一套限流与配额：否则可以靠反复传小图把 R2 写爆
   assertUploadRate(actor, request);
 
-  const MAX = 2 * 1024 * 1024;
+  const MAX = THUMB_MAX_BYTES;
   const declared = Number(request.headers.get('content-length') ?? 0);
   if (declared > MAX) throw payloadTooLarge('缩略图不能超过 2MB');
 
@@ -454,11 +445,3 @@ export async function reorder({ env, actor, request }) {
   return json({ reordered: plan.length });
 }
 
-/** 前端用来判断按钮是否可点：把「能不能改某一条」的判定留在服务端。 */
-export function describePermissions(actor, row) {
-  return {
-    canUpdate: can(actor, ACTION.WALLPAPER_UPDATE, row),
-    canDelete: can(actor, ACTION.WALLPAPER_DELETE),
-    canPublish: can(actor, ACTION.WALLPAPER_PUBLISH),
-  };
-}

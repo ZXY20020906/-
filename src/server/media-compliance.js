@@ -30,18 +30,23 @@
  * 3. 宽高探测不出来 = `probe-failed` **违规**。这类文件在库里只会留下 null 宽高，
  *    列表的宽高比筛选、变体生成、详情页全部失真，宁可拒。
  */
+import {
+  FPS_PROBE_CEILING, FPS_TOLERANCE, ORIGINAL_MAX_HEIGHT, ORIGINAL_MAX_PIXELS,
+  ORIGINAL_MAX_WIDTH, ORIGINAL_SUGGESTED_BYTES, TARGET_FPS, VARIANT_MAX_WIDTH,
+  VARIANT_SUGGESTED_BYTES, positiveNumber,
+} from '../core/media-limits.js';
 
 /** 目标规格上限。工具可用 options.limits 覆盖（比如 --max-pixels 传更小的值）。 */
 export const MEDIA_LIMITS = Object.freeze({
-  maxWidth: 3840,
-  maxHeight: 2160,
-  maxPixels: 3840 * 2160, // 8_294_400
-  maxFps: 30,
+  maxWidth: ORIGINAL_MAX_WIDTH,
+  maxHeight: ORIGINAL_MAX_HEIGHT,
+  maxPixels: ORIGINAL_MAX_PIXELS,
+  maxFps: TARGET_FPS,
   /** 1080p 变体的宽度上限 */
-  variantMaxWidth: 1920,
+  variantMaxWidth: VARIANT_MAX_WIDTH,
   /** 原画 / 变体的体积上限：超了只 warn，不拒绝 */
-  originalMaxBytes: 25 * 1024 * 1024,
-  variantMaxBytes: 8 * 1024 * 1024,
+  originalMaxBytes: ORIGINAL_SUGGESTED_BYTES,
+  variantMaxBytes: VARIANT_SUGGESTED_BYTES,
 });
 
 /** 违规码（拒绝入库）。改名字要同步 docs/UPLOAD-SOP.md 的对照表与 tests。 */
@@ -94,11 +99,6 @@ function normalizeCodec(codec) {
   return raw;
 }
 
-function positiveNumber(value) {
-  const n = Number(value);
-  return Number.isFinite(n) && n > 0 ? n : null;
-}
-
 /**
  * 视频合规体检。
  *
@@ -132,7 +132,7 @@ export function checkVideoCompliance(input = {}, options = {}) {
   const height = positiveNumber(input.height);
   const bytes = positiveNumber(input.bytes);
   const rawFps = positiveNumber(input.fps);
-  const fps = rawFps && rawFps <= 1000 ? rawFps : null;
+  const fps = rawFps && rawFps <= FPS_PROBE_CEILING ? rawFps : null;
   const codec = normalizeCodec(input.codec);
 
   // ---------------------------------------------------------------- 容器/编码
@@ -170,7 +170,7 @@ export function checkVideoCompliance(input = {}, options = {}) {
     if (pixels > limits.maxPixels) {
       fail(
         VIOLATION.TOO_MANY_PIXELS,
-        `像素总量 ${width}×${height}=${pixels} 超过上限 ${limits.maxPixels}（=3840×2160）`,
+        `像素总量 ${width}×${height}=${pixels} 超过上限 ${limits.maxPixels}（=${ORIGINAL_MAX_WIDTH}×${ORIGINAL_MAX_HEIGHT}）`,
       );
     }
   }
@@ -178,8 +178,8 @@ export function checkVideoCompliance(input = {}, options = {}) {
   // ---------------------------------------------------------------- 帧率
   if (fps === null) {
     warn(WARNING.FPS_UNKNOWN, '探测不到帧率（没有 stts / DefaultDuration），超过 30fps 的情况可能漏放');
-  } else if (fps > limits.maxFps + 0.5) {
-    // +0.5 容差：29.97 / 30.000 这类实测抖动不该被误判
+  } else if (fps > limits.maxFps + FPS_TOLERANCE) {
+    // +FPS_TOLERANCE 容差：29.97 / 30.000 这类实测抖动不该被误判
     fail(VIOLATION.FPS_TOO_HIGH, `帧率 ${Number(fps.toFixed(2))}fps 超过上限 ${limits.maxFps}fps`);
   }
 

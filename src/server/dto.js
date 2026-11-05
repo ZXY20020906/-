@@ -5,6 +5,7 @@
 import { safeJsonParse } from './util.js';
 import { publicUrl } from './storage.js';
 import { capabilitiesFor, ROLE_LABELS } from '../core/permissions.js';
+import { labelForVariant } from '../core/variant-label.js';
 
 export function categoryDto(row) {
   return {
@@ -22,16 +23,17 @@ export function categoryDto(row) {
 }
 
 /**
- * 变体 label 的唯一口径：**以 `variants` 列里存的 label 为准**，height 只当兜底。
+ * 变体 label：**存的 label 优先，缺失时交给唯一口径 `labelForVariant()`**。
  *
  * 为什么不能再用 `height` 反算：从 2026-11 起变体不再只有「降分辨率」一档，还有
  * **同分辨率降帧**（4K@60 → 4K@30）。两者的 height 都是 2160，用 `height + 'p'` 反算
  * 会把 `4K30` 说成 `2160p` —— 客户端拿到两个 2160 高的档（一个 60fps 原画、一个 30fps
  * 变体）就分不清哪一档是「本机一定能播」的那份，选档只能退回本地转码。
  * 老库里的记录没有 label 字段（`batch.py` 只写了 height/key/bytes/sha256），
- * 这时仍按 `${height}p` 兜底，行为与升级前逐字节一致。
+ * 这时由 `labelForVariant()` 按同一张规则表兜底（缺 fps ⇒ `${height}p`），
+ * 与 ingest 写 label 时**调的是同一个函数**，所以两边不可能再各说一套。
  *
- * @param {any} item variants 列里的一项
+ * @param {any} item variants 列里的一项（可能带 label / kind / width / fps）
  * @param {number|null} height 已归一的高度
  * @returns {string}
  */
@@ -41,7 +43,12 @@ function variantLabel(item, height) {
     const label = raw.trim();
     if (label) return label;
   }
-  return height ? `${height}p` : 'alt';
+  return labelForVariant({
+    kind: item?.kind,
+    height,
+    width: item?.width,
+    fps: item?.fps,
+  });
 }
 
 /**
