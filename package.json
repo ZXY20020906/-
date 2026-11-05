@@ -7,6 +7,8 @@
   "scripts": {
     "test": "node tools/run-tests.mjs",
     "check": "node tools/check-syntax.mjs && node tools/check-ui.mjs",
+    "smoke": "node tools/smoke-public-api.mjs",
+    "snapshot": "node tools/build-public-snapshot.mjs",
     "prepare-upload": "node tools/prepare-upload.mjs",
     "check:sql": "node tools/dump-queries.mjs && python tools/check-sql.py",
     "import": "node tools/import-wallpapers.mjs",

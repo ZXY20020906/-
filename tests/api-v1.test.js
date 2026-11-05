@@ -146,8 +146,8 @@ test('ETag：v1 清单带 ETag，If-None-Match 命中返回 304 且无 body', as
   assert.equal(weak.status, 304);
 });
 
-test('边缘缓存：普通请求命中缓存（HIT），带 If-None-Match 时绕过缓存并回 304', async (t) => {
-  const { env } = makeSite();
+test('边缘缓存：条件请求也走缓存，304 不再回源 D1', async (t) => {
+  const { env, calls } = makeSite();
   const store = new Map();
   const saved = globalThis.caches;
   globalThis.caches = {
@@ -172,14 +172,23 @@ test('边缘缓存：普通请求命中缓存（HIT），带 If-None-Match 时�
   assert.equal(first.status, 200);
   const etag = first.headers.get('etag');
   await first.text();
+  const queriesAfterFirst = calls.length;
 
   const warm = await handle(new Request(url), env);
   assert.equal(warm.headers.get('x-folia-edge'), 'HIT', '普通请求应命中缓存');
   await warm.text();
 
   const conditional = await handle(new Request(url, { headers: { 'if-none-match': etag } }), env);
-  assert.equal(conditional.status, 304, '缓存不能把条件请求的 304 盖成 200');
+  assert.equal(conditional.status, 304, '缓存里的 ETag 命中应直接回 304');
+  assert.equal(conditional.headers.get('x-folia-edge'), 'HIT', '304 也必须由边缘缓存返回');
   assert.equal(await conditional.text(), '');
+  assert.equal(calls.length, queriesAfterFirst, '条件请求不得再查 D1（2026-11-05 额度事故的回归点）');
+
+  // 冷缓存 + 条件请求：也要先拿到完整 200 写缓存，再回 304；不能把 304 写进缓存。
+  store.clear();
+  const cold = await handle(new Request(url, { headers: { 'if-none-match': etag } }), env);
+  assert.equal(cold.status, 304, '冷缓存条件请求仍应回 304');
+  assert.equal(store.size, 1, '冷缓存条件请求必须把 200 实体写进缓存');
 });
 
 test('manifest：形状完整（apiVersion/generatedAt/etag/total/items），且与清单同口径', async () => {

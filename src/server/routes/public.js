@@ -16,6 +16,7 @@ import { all, first } from '../db.js';
 import { json } from '../http.js';
 import { mediaBaseFor, publicUrl } from '../storage.js';
 import { sha256Hex } from '../util.js';
+import { etagMatches } from '../../core/etag.js';
 import { KINDS, STATUSES } from '../../core/validate.js';
 import * as v1 from './public-v1.js';
 
@@ -63,11 +64,10 @@ export async function pluginFeed({ env, request, url }) {
 
   const stamp = await sha256Hex(items.map((item) => `${item.id}:${item.updatedAt}`).join('|') || 'empty');
   const etag = `"${stamp.slice(0, 24)}"`;
-  const headers = { etag, 'cache-control': 'public, max-age=30' };
+  const headers = { etag, 'cache-control': 'public, max-age=300, stale-while-revalidate=3600' };
 
   // Cloudflare 会在边缘给 ETag 加 W/ 前缀，比较前必须归一化，否则永远 200
-  const normalizeTag = (value) => String(value ?? '').replace(/^W\//, '').replace(/^"|"$/g, '').trim();
-  if (normalizeTag(request.headers.get('if-none-match')) === normalizeTag(etag)) {
+  if (etagMatches(request.headers.get('if-none-match'), etag)) {
     return new Response(null, { status: 304, headers });
   }
 

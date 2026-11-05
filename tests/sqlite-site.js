@@ -132,7 +132,8 @@ export function openSite(rows = []) {
     insert.run(...INSERT_COLUMNS.map((column) => full[column]));
   }
   const bucket = makeBucket();
-  const env = { DB: makeD1(db), BUCKET: bucket, PUBLIC_ORIGIN: 'https://example.test' };
+  // 单测默认关快照回落，避免 D1 报错被生产快照掩盖；快照用例单独打开。
+  const env = { DB: makeD1(db), BUCKET: bucket, PUBLIC_ORIGIN: 'https://example.test', PUBLIC_SNAPSHOT_FALLBACK: '0' };
   return {
     db,
     bucket,

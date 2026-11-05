@@ -135,13 +135,14 @@ const page = await (await fetch('/api/public/wallpapers?category=dynamic&sort=re
 ## 本地校验
 
 ```bash
-node tools/run-tests.mjs     # 92 个测试：权限 / 上传校验 / 时长解析 / 轮换收藏 / 分页 / HTTP 层
+node tools/run-tests.mjs     # 全部测试：权限 / 上传校验 / 时长解析 / 分页 / HTTP 层 / 快照回落
 node tools/check-ui.mjs      # 前台 + 后台的 id、按钮动作、接口路径是否都对得上
 node tools/check-syntax.mjs  # 模块加载与语法检查
-node tools/dump-queries.mjs && python tools/check-sql.py   # 用真 sqlite3 编译全部 55 条 SQL
+node tools/dump-queries.mjs && python tools/check-sql.py   # 用真 sqlite3 编译全部 SQL
+node tools/smoke-public-api.mjs   # 线上公开 API 冒烟（部署后必跑，见下）
 ```
 
-当前状态：**92 个测试全通过；55 条 SQL 全部通过 sqlite3 编译；4 个迁移脚本可按序执行。**
+当前状态：**全部测试通过；全部 SQL 通过 sqlite3 编译。**
 
 ## 部署纪律（必须遵守）
 
@@ -159,6 +160,42 @@ node tools/dump-queries.mjs && python tools/check-sql.py   # 用真 sqlite3 编�
   由 `/api/public/wallpapers` 输出；插件按链路情况自动选择。
 - **上传资源请先看 [`docs/UPLOAD-SOP.md`](docs/UPLOAD-SOP.md)**：键名规则、七步流程、
   上传后四条验收命令（HEAD / Range / 全量 sha256 / API）、六条禁止项。
+
+### 部署后冒烟（必做）
+
+push 到 `main` 后 Pages 自动部署（约 2–3 分钟）。**每次部署后跑一次**：
+
+```bash
+npm run smoke
+# 等价于 node tools/smoke-public-api.mjs
+```
+
+它只打线上，检查 6 个公开端点：`/api/public/wallpapers`、`/api/v1/public/wallpapers`、
+`/api/v1/public/manifest.json`、`/api/public/categories`、`/api/public/tags`、
+`/api/v1/public/wallpapers/:slug`。断言：HTTP 200、`total=110`、wallpaper 分类 46、
+`facets.categories` 合计 == `total`、旧路径与 v1 响应逐字节相同、manifest ETag/304。
+
+**D1 不可用时会返回 `degraded: true` 的快照**（见下节），默认算失败；如果确认是
+D1 免费额度耗尽、且快照数据正确，可加 `--allow-degraded` 放行并人工确认。
+
+### 公开接口快照（D1 故障兜底）
+
+`src/server/public-snapshot.js` 是**从生产 D1 导出文件生成**的只读快照，不是手写数据。
+D1 额度耗尽 / 缺表 / 缺列 / 绑定失效时，`public-api.js` 自动回落并带
+`degraded: true` + `snapshotGeneratedAt`；正常请求仍然只走 D1。
+
+D1 数据有变更（发布/删除素材）后，按下面步骤刷新快照并随下次部署上线：
+
+```bash
+# 1) 从 Cloudflare 导出 D1（control plane，不消耗 D1 行读取额度）
+#    POST /accounts/<acct>/d1/database/<db>/export  body: {"output_format":"file"}
+# 2) 把导出的 .sql 执行成 .sqlite（sqlite3 或 Python 均可）
+# 3) 生成快照
+node tools/build-public-snapshot.mjs --sqlite build/d1-export.sqlite --commit $(git rev-parse --short HEAD)
+```
+
+工具会断言 `items.length == total`、`facets.categories 合计 == total`、
+`manifest.total == total`，对不上就拒绝生成，避免把自相矛盾的快照发上线。
 
 ## 设计取舍
 

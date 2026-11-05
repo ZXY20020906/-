@@ -10,20 +10,23 @@
  */
 import { json } from '../http.js';
 import { sha256Hex } from '../util.js';
+import { etagMatches, normalizeEtag } from '../../core/etag.js';
 import {
   categoriesPayload, subtagsPayload, tagsPayload, wallpapersPayload, wallpaperPayload, manifestPayload,
 } from '../public-api.js';
 
-/** 公开接口缓存 30 秒：发布/删除最多延迟这么久，比每次重新查 D1 划算。 */
-const CACHE_CONTROL = 'public, max-age=30, stale-while-revalidate=60';
-
 /**
- * ETag 归一化：Cloudflare 会在边缘给 ETag 加 `W/` 前缀，
- * 直接字符串比较会永远 200，所以两侧都去掉弱校验前缀与引号再比。
+ * 公开接口边缘缓存 5 分钟。
+ *
+ * 原先是 30 秒：插件面板 15–20 秒轮询一次，30 秒缓存意味着**每个轮询周期都可能回源**，
+ * 而一次清单要跑「清单 + count + facets」三条 SQL。2026-11-05 线上 D1 免费额度被耗尽，
+ * 公开接口全部 500，根子是读取量而不是数据坏了。5 分钟缓存把回源次数压到原来的 1/10，
+ * 配合 app.js 的「条件请求也走缓存」，插件轮询基本不再产生 D1 读。
  */
-export function normalizeEtag(value) {
-  return String(value ?? '').replace(/^W\//, '').replace(/^"|"$/g, '').trim();
-}
+const CACHE_CONTROL = 'public, max-age=300, stale-while-revalidate=3600';
+
+// 兼容旧引用：ETag 规则已经收敛到 src/core/etag.js，这里只做转发。
+export { normalizeEtag };
 
 /**
  * 给 JSON 载荷加 ETag：客户端带 If-None-Match 且命中时回 304（无 body）。
@@ -43,7 +46,7 @@ export async function etagJson(payload, request, { status = 200 } = {}) {
     etag,
     'cache-control': CACHE_CONTROL,
   };
-  if (normalizeEtag(request?.headers?.get('if-none-match')) === normalizeEtag(etag)) {
+  if (etagMatches(request?.headers?.get('if-none-match'), etag)) {
     return new Response(null, { status: 304, headers });
   }
   return new Response(body, { status, headers });
@@ -91,7 +94,7 @@ export async function manifest(ctx) {
     etag,
     'cache-control': CACHE_CONTROL,
   };
-  if (normalizeEtag(ctx.request?.headers?.get('if-none-match')) === normalizeEtag(etag)) {
+  if (etagMatches(ctx.request?.headers?.get('if-none-match'), etag)) {
     return new Response(null, { status: 304, headers });
   }
   return new Response(JSON.stringify({ ...core, etag: stamp }), { status: 200, headers });

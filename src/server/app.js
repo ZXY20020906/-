@@ -3,6 +3,7 @@
  * 权限只在 routes/* 里用 assertCan 判定，路由表不重复声明，避免两处规则打架。
  */
 import { assertSafeRequest, corsHeaders, failure, methodNotAllowed, preflight } from './http.js';
+import { etagMatches } from '../core/etag.js';
 import { readSession, clientIp } from './session.js';
 import { hit } from './rate-limit.js';
 import { findApiKey, readApiKey, touchApiKey } from './api-keys.js';
@@ -255,16 +256,17 @@ export async function handle(request, env) {
       actor = session.user;
     }
 
-    // 公开只读接口在边缘缓存 30 秒：插件反复打开列表时不用每次都查 D1。
+    // 公开只读接口在边缘缓存 5 分钟：插件反复打开列表时不用每次都查 D1。
     // 只缓存公开路由（GET/HEAD），带身份的管理接口一律不缓存。
     // cacheKey 只吃白名单参数（cacheKeyUrl），未知 query 不会把缓存击穿。
     //
-    // 带 If-None-Match 的请求**绕过边缘缓存**：缓存命中时直接回缓存的 200 会丢掉 304，
-    // 客户端每次条件请求都要重下整包（2xx 与 304 语义就废了）。绕过后由 handler
-    // 重新算 ETag 并正确回 304；条件请求本来就不多，这点回源成本值得。
+    // **条件请求也必须走缓存**（2026-11-05 D1 额度事故的修复点之一）：
+    // 原先带 If-None-Match 就绕过缓存、由 handler 重新查库算 ETag，于是插件每轮
+    // 条件轮询都会回源（一次清单 = 清单 + count + facets 三条 SQL）。现在缓存里
+    // 已经存了完整 200 + ETag，直接和它比较：命中回 304，没命中回缓存的 200，
+    // 两种情况都不碰 D1。
     const edgeCacheable = route.cors
       && (request.method === 'GET' || request.method === 'HEAD')
-      && !request.headers.get('if-none-match')
       && typeof caches !== 'undefined'
       && caches.default;
     const cacheKey = edgeCacheable ? new Request(cacheKeyUrl(url), { method: 'GET' }) : null;
@@ -275,20 +277,46 @@ export async function handle(request, env) {
         const headers = new Headers(cached.headers);
         for (const [key, value] of Object.entries(corsHeaders(env))) headers.set(key, value);
         headers.set('x-folia-edge', 'HIT');
-        return new Response(cached.body, { status: cached.status, headers });
+        if (etagMatches(request.headers.get('if-none-match'), headers.get('etag'))) {
+          headers.delete('content-length');
+          headers.delete('content-type');
+          return new Response(null, { status: 304, headers });
+        }
+        return new Response(request.method === 'HEAD' ? null : cached.body, { status: cached.status, headers });
       }
     }
 
-    const response = await route.handler({ request, env, url, params, actor });
+    // 冷缓存 + 条件请求：先不带 If-None-Match 调 handler，拿到完整 200 才能写缓存；
+    // 304 等缓存写入后再由本层判，避免「第一次条件请求把 304 写进缓存」。
+    let handlerRequest = request;
+    if (edgeCacheable && request.headers.get('if-none-match')) {
+      const headers = new Headers(request.headers);
+      headers.delete('if-none-match');
+      handlerRequest = new Request(request.url, { method: request.method, headers });
+    }
+
+    const response = await route.handler({ request: handlerRequest, env, url, params, actor });
     const final = route.cors ? withCors(response, env) : response;
 
-    if (edgeCacheable && final.status === 200) {
+    // 只缓存 GET 的完整实体：HEAD 没有 body，若把 HEAD 的响应写进 GET 的 key，
+    // 后续 GET 会拿到空 body。HEAD 仍然可以**读**上面的缓存。
+    if (edgeCacheable && final.status === 200 && request.method === 'GET') {
       const headers = new Headers(final.headers);
-      headers.set('cache-control', 'public, max-age=30, stale-while-revalidate=60');
+      headers.set('cache-control', 'public, max-age=300, stale-while-revalidate=3600');
       headers.set('x-folia-edge', 'MISS');
-      await caches.default.put(cacheKey, new Response(final.clone().body, { status: 200, headers: new Headers(headers) }));
-      // 回源响应也带 x-folia-edge: MISS，线上探针才能区分「回源」和「命中」
-      return new Response(final.body, { status: final.status, headers });
+      try {
+        await caches.default.put(cacheKey, new Response(final.clone().body, { status: 200, headers: new Headers(headers) }));
+      } catch (error) {
+        // 缓存写失败不是业务失败：照常把刚查到的 200 返回给客户端。
+        console.warn('[api] 边缘缓存写入失败', url.pathname, error?.message ?? error);
+      }
+      // 回源响应也带 x-folia-edge: MISS，线上探针才能区分「回源」和「命中」。
+      if (etagMatches(request.headers.get('if-none-match'), headers.get('etag'))) {
+        headers.delete('content-length');
+        headers.delete('content-type');
+        return new Response(null, { status: 304, headers });
+      }
+      return new Response(request.method === 'HEAD' ? null : final.body, { status: final.status, headers });
     }
 
     return final;

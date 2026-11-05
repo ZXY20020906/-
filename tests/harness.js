@@ -131,6 +131,9 @@ export function createEnv(handlers, { bucket } = {}) {
       BUCKET: fakeBucket,
       PUBLIC_ORIGIN: 'https://example.test',
       BOOTSTRAP_TOKEN: 'boot-token',
+      // 单测默认关掉快照回落：未注册的查询 / 真实 SQL 错误必须当场炸出来，
+      // 不能被生产快照「兜」成 200。快照行为由 public-snapshot.test.js 显式打开。
+      PUBLIC_SNAPSHOT_FALLBACK: '0',
     },
     calls,
     puts,
