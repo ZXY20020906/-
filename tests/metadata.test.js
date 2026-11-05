@@ -18,6 +18,8 @@ import { ingestAsset } from '../src/server/ingest.js';
 import { wallpaperDto, variantsDto } from '../src/server/dto.js';
 import { readVideoAudio } from '../src/core/image-meta.js';
 import { makeMp4 } from './mp4-fixture.js';
+import { createEnv, jsonRequest, sessionCookie, sessionDeviceFields, USERS, wallpaperRow } from './harness.js';
+import { Q } from '../src/server/queries.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SCHEMA_DIR = resolve(here, '..', 'schema');
@@ -289,8 +291,7 @@ test('ingest：没有海报素材时 poster_key 保持 NULL，入库照常成功
   assert.equal(fresh.verified_at > 0, true, '媒体本身照常入库');
 });
 
-test('公开列表：?license= 生效，且 items 带新字段、variants 带 width/fps', { skip }, async () => {
-  const { db, env } = makeSite();
+test('公开列表：?license= 生效，且 items 带新字段、variants 带 width/fps', { skip }, async () => {  const { db, env } = makeSite();
   insertRow(db, {
     id: 'wp_cc0', slug: 'cc0', license: 'cc0',
     variants: JSON.stringify([
@@ -319,4 +320,29 @@ test('公开列表：?license= 生效，且 items 带新字段、variants 带 wi
   assert.equal(item.variants[0].width, 1920);
   assert.equal(item.variants[0].fps, 30);
   assert.equal(item.variants[0].label, '1080p');
+});
+
+test('PATCH：license/source/author 落库（license 归一为小写、文本去空白）', async () => {
+  const actor = USERS.admin;
+  const { env, calls } = createEnv({
+    [Q.sessionByToken]: () => [{
+      token_hash: 'hashed', expires_at: Date.now() + 60_000,
+      ...actor, ...sessionDeviceFields(),
+    }],
+    [Q.wallpaperById]: () => [wallpaperRow({ created_by: actor.id })],
+    [Q.updateWallpaper]: () => [],
+    [Q.insertAudit]: () => [],
+  });
+  const res = await handle(jsonRequest('/api/admin/wallpapers/wp_1', {
+    method: 'PATCH',
+    body: { license: 'CC0', author: '  画师甲  ', source: 'https://example.test/source' },
+    cookie: sessionCookie(),
+  }), env);
+  assert.equal(res.status, 200);
+  const update = calls.find((entry) => entry.sql === Q.updateWallpaper);
+  assert.ok(update, '必须执行 updateWallpaper');
+  // 顺序：… updated_at(11), published_at(12), license(13), source(14), author(15), id(16)
+  assert.equal(update.args[13], 'cc0', 'license 统一小写');
+  assert.equal(update.args[14], 'https://example.test/source');
+  assert.equal(update.args[15], '画师甲');
 });

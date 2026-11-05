@@ -59,6 +59,8 @@ test('筛选：尺寸 / 时长 / 体积 / 帧率（NULL 不匹配，未知不伪
       ['?minBytes=10000000', ['wp_4k', 'wp_4k30']],
       ['?maxBytes=6000000', ['wp_portrait', 'wp_unknown']],
       ['?fpsMax=30', ['wp_4k30', 'wp_hd', 'wp_portrait']],
+      ['?license=CC0', ['wp_4k', 'wp_hd']],
+      ['?license=cc0', ['wp_4k', 'wp_hd']],
       ['?minWidth=1000&maxWidth=2000&minBytes=1000000', ['wp_hd', 'wp_portrait']],
     ];
     for (const [query, expected] of cases) {
