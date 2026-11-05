@@ -29,6 +29,20 @@ const DEFAULT_HANDLERS = {
   // 老用例只关心「上传成功」，这两条在假环境里注册成 no-op（真 SQL 由 tests/batch-ingest.test.js 验）。
   [Q.updateWallpaperThumb]: () => [],
   [Q.updateWallpaperVariants]: () => [],
+  /**
+   * schema/016 的元数据列：假环境一律「列都在」，这样上传用例走的是**新版路径**
+   * （写 fps/pix_fmt/has_audio/poster_key），而不是悄悄回落到旧行为。
+   * 真 SQL 与列默认值由 tests/metadata.test.js 用 node:sqlite 验。
+   */
+  [Q.wallpaperTechColumns]: () => ([
+    { name: 'fps' }, { name: 'pix_fmt' }, { name: 'has_audio' }, { name: 'poster_key' },
+  ]),
+  [Q.updateWallpaperTech]: () => [],
+  [Q.updateWallpaperPoster]: () => [],
+  // 通用列探测：默认「存在」，避免 fingerprint / poster 分支在假环境里被当成「没迁移」
+  [Q.wallpaperColumnExists]: ([name]) => [{ name }],
+  // v1 manifest：假环境没有快照，默认空清单（形状由 tests/api-v1.test.js 验）
+  [Q.publicManifest]: () => [],
   [Q.wallpaperTitleBytesTaken]: () => [],
   // 大文件指纹去重：假环境「没有重复」，与 schema/013 列存在时的行为对齐
   [Q.wallpaperFingerprintTaken]: () => [],

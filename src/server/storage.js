@@ -26,6 +26,18 @@ export function thumbKey(wallpaperId, sha256, mime) {
 }
 
 /**
+ * 首帧海报（v1 `posterUrl`）：`posters/<id>/<sha16>.webp`。
+ *
+ * 和 thumbs/ 分开的理由：缩略图是「卡片封面」（浏览器 canvas 抓的一帧，可能带播放器 UI），
+ * 海报是「首帧原样 1280 宽」（分享卡片 / 详情页大图 / 客户端列表预加载）。
+ * 两者内容不同，key 必须各不相同，否则先占位的那个会长期覆盖另一个。
+ */
+export function posterKey(wallpaperId, sha256, mime = 'image/webp') {
+  const ext = EXT_BY_MIME[mime] ?? 'webp';
+  return `posters/${safeId(wallpaperId)}/${sha256.slice(0, HASH_PREFIX_LEN)}.${ext}`;
+}
+
+/**
  * 变体的 key：`wallpapers/<id>/<sha16>.1080p.mp4` / `.30fps.mp4`
  * （docs/UPLOAD-SOP.md 第 1 条铁律）。
  *

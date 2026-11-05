@@ -531,8 +531,37 @@ export function readVideoInfo(bytes, mime) {
   return { codec, faststart, fps: moov ? fpsFromMoov(bytes, moov) : null };
 }
 
-function sniffMp4Codec(bytes, start) {
-  const known = ['avc1', 'hvc1', 'hev1', 'av01', 'vp09', 'mp4v'];
+/**
+ * 音轨探测（只读 moov / EBML 头，不解码）。
+ *
+ * 返回三态：`true` 有音轨、`false` 确认没有、`null` 读不出来（未知）。
+ * **为什么不能把「读不出来」当 false**：v1 的 `hasAudio` 要用来回答
+ * 「这个素材静音吗」，猜错会让静音类筛选漏掉真·无声文件；未知就老实给 null。
+ *
+ * - MP4：找 moov 里 handler_type = 'soun' 的 trak（和 fpsFromMoov 同一套盒遍历）；
+ * - WebM：TrackEntry 的 CodecID 在头部明文里（A_OPUS / A_VORBIS …），扫到就算有；
+ *   扫不到返回 null —— WebM 的 Tracks 段可能不在前 4KB，不能据此断言「没有」。
+ */
+export function readVideoAudio(bytes, mime) {
+  if (!isVideoMime(mime) || !bytes || bytes.length < 16) return null;
+  if (mime === 'video/webm') {
+    const text = String.fromCharCode(...bytes.subarray(0, Math.min(bytes.length, 8192)));
+    return /A_OPUS|A_VORBIS|A_AAC|A_MPEG\/L3|A_FLAC|A_PCM/.test(text) ? true : null;
+  }
+  const { moov } = mp4Layout(bytes);
+  if (!moov) return null;
+  let sawTrack = false;
+  for (const trak of childBoxes(bytes, moov.start, moov.end, 'trak')) {
+    for (const mdia of childBoxes(bytes, trak.start, trak.end, 'mdia')) {
+      sawTrack = true;
+      const hdlr = childBoxes(bytes, mdia.start, mdia.end, 'hdlr')[0];
+      if (hdlr && ascii(bytes, hdlr.start + 8, hdlr.start + 12) === 'soun') return true;
+    }
+  }
+  return sawTrack ? false : null;
+}
+
+function sniffMp4Codec(bytes, start) {  const known = ['avc1', 'hvc1', 'hev1', 'av01', 'vp09', 'mp4v'];
   const end = Math.min(bytes.length - 4, start + 4 * 1024 * 1024);
   for (let i = start; i < end; i += 1) {
     for (const code of known) {

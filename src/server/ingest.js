@@ -33,7 +33,7 @@ import { all, first, nowMs, run } from './db.js';
 import { Q } from './queries.js';
 import {
   ALLOWED_MIME, MAX_UPLOAD_BYTES, isBundleMime, isVideoMime, limitForMime,
-  readDurationMs, readMediaMeta, readVideoInfo,
+  readDurationMs, readMediaMeta, readVideoAudio, readVideoInfo,
 } from '../core/image-meta.js';
 import {
   COMPLIANCE_HINT, checkVideoCompliance, complianceMessage, describeWarnings,
@@ -43,12 +43,12 @@ import {
   storageVerifyFailed, tooManyRequests, unsupportedMedia,
 } from '../core/errors.js';
 import { ACTION, assertCan } from '../core/permissions.js';
-import { assetKey, deleteAsset, putAsset, thumbKey, variantKey, verifyAsset } from './storage.js';
+import { assetKey, deleteAsset, posterKey, putAsset, thumbKey, variantKey, verifyAsset } from './storage.js';
 import { newId, safeJsonParse, sampleFingerprint, sha256Bytes } from './util.js';
 import { MEDIA_ACTOR, setMediaIdentity } from './media-audit.js';
 import { repairMp4Faststart } from './mp4-remux.js';
 import {
-  HASH_LIMIT_BYTES, ORIGINAL_MAX_HEIGHT, ORIGINAL_MAX_WIDTH, TARGET_FPS, THUMB_WIDTH,
+  HASH_LIMIT_BYTES, ORIGINAL_MAX_HEIGHT, ORIGINAL_MAX_WIDTH, POSTER_WIDTH, TARGET_FPS, THUMB_WIDTH,
   UPLOAD_DAILY_BYTES, VARIANT_MAX_WIDTH,
 } from '../core/media-limits.js';
 import { VARIANT_KIND, labelForVariant, needsVariant, variantKind } from '../core/variant-label.js';
@@ -77,6 +77,7 @@ export const AUTO_FIX = Object.freeze({
   THUMB: 'thumb',
   THUMB_FROM_ORIGINAL: 'thumbFromOriginal',
   SAMPLE_FINGERPRINT: 'sampleFingerprint',
+  POSTER: 'poster',
 });
 
 /** 报告里的告警码（不算失败，但人要看见）。 */
@@ -113,6 +114,17 @@ export const DEFAULT_MEDIA_TOOLS = Object.freeze({
   transcodeVariant: null,
   /** 抽帧生成 WebP 缩略图；无解码器时为 null（浏览器用 canvas 注入） */
   extractThumb: null,
+  /**
+   * 抽首帧生成 1280 宽 WebP 海报；Worker 里没有解码器（null）。
+   * 浏览器/本地 ffmpeg 可以注入；不注入时由调用方直接传 `asset.poster`。
+   * 两者都没有 → poster_key 保持 NULL，公开 DTO 的 posterUrl 也是 null（不假装有图）。
+   */
+  extractPoster: null,
+  /**
+   * 可选：更完整的技术探测（ffprobe 类工具可返回 `{ fps, codec, pixFmt, hasAudio }`）。
+   * Worker 默认没有，ingest 只用纯 JS 能读到的 fps/codec/hasAudio；pix_fmt 留给回填/工具。
+   */
+  probeTech: null,
 });
 
 /** 工具集解析：默认值 ← env.MEDIA_TOOLS ← 调用方 options.mediaTools。 */
@@ -203,6 +215,31 @@ export async function supportsFingerprintColumn(env) {
 
 /** 视频是否需要 1080p/30fps 变体（规则见 core/variant-label.js）。 */
 export { needsVariant };
+
+/**
+ * schema/016 的元数据列是否已迁移（fps / pix_fmt / has_audio / poster_key）。
+ * 只缓存「探测成功」的结果：老库（或测试假环境）缺列时每次都会重新探测，
+ * 这样迁移一执行就自动生效，不用改代码或重启。
+ */
+let techColumnsCache = null;
+export async function supportsTechColumns(env) {
+  if (techColumnsCache) return techColumnsCache;
+  try {
+    const rows = await all(env, Q.wallpaperTechColumns);
+    const names = new Set(rows.map((row) => row.name));
+    techColumnsCache = {
+      fps: names.has('fps'),
+      pixFmt: names.has('pix_fmt'),
+      hasAudio: names.has('has_audio'),
+      poster: names.has('poster_key'),
+    };
+    return techColumnsCache;
+  } catch (error) {
+    // 探测失败不抛：元数据是「锦上添花」，不能反过来把上传卡死。
+    console.warn('[ingest] 探测 schema/016 元数据列失败，本轮跳过技术元数据写入', error?.message ?? error);
+    return null;
+  }
+}
 
 function hashLimitFor(env, options) {
   const raw = options?.hashLimit ?? env?.UPLOAD_HASH_LIMIT ?? HASH_LIMIT;
@@ -425,6 +462,36 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
   });
   await run(env, Q.markWallpaperVerified, now, videoInfo.codec, videoInfo.faststart, row.id);
 
+  // ⑧b schema/016 技术元数据（fps / pix_fmt / has_audio）。
+  //     纯 JS 探测：fps/codec 由 readVideoInfo 给，hasAudio 由 readVideoAudio 给；
+  //     pix_fmt 浏览器端读不出来（要解 SPS），只有注入的 probeTech（ffprobe 类）能给。
+  //     拿不到就写 NULL —— 绝不因为「没有元数据」让入库失败。
+  let pixFmt = null;
+  let hasAudio = null;
+  if (isVideoMime(mime)) {
+    if (typeof tools.probeTech === 'function') {
+      try {
+        const probed = await tools.probeTech(bytes, { mime });
+        if (probed && typeof probed === 'object') {
+          pixFmt = typeof probed.pixFmt === 'string' && probed.pixFmt ? probed.pixFmt : null;
+        }
+      } catch (error) {
+        warnings.push({ code: 'tech-probe-failed', message: `技术探测失败（元数据留空）：${error?.message ?? error}` });
+      }
+    }
+    const detected = readVideoAudio(bytes, mime);
+    hasAudio = detected === null ? null : (detected ? 1 : 0);
+    const tech = await supportsTechColumns(env);
+    if (tech) {
+      try {
+        await run(env, Q.updateWallpaperTech, videoInfo.fps ?? null, pixFmt, hasAudio, row.id);
+      } catch (error) {
+        // 列在、但 UPDATE 失败（极少见）：只告警，媒体本身已落盘成功
+        console.warn('[ingest] 写入技术元数据失败', error?.message ?? error);
+      }
+    }
+  }
+
   if (!sha && fingerprint && (await supportsFingerprintColumn(env))) {
     try {
       await run(env, Q.updateWallpaperFingerprint, fingerprint, now, row.id);
@@ -480,6 +547,45 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
         code: IMPORT_WARNING.THUMB_MISSING,
         message: '没有生成缩略图（本运行时没有解码器），插件卡片会没有封面',
       });
+    }
+  }
+
+  // ⑨b 首帧海报（v1 `posterUrl`）：调用方给 `asset.poster`，或注入 extractPoster 生成。
+  //      Worker 里没有解码器，两者都没有就留 NULL —— 公开 DTO 的 posterUrl 也是 null，
+  //      客户端回落到 thumbUrl；不拿缩略图冒充首帧（缩略图可能是 0.5s 处的封面帧）。
+  let posterStored = null;
+  const posterColumns = await supportsTechColumns(env);
+  if (posterColumns?.poster) {
+    let posterBytes = asset.poster && asset.poster.byteLength ? asset.poster : null;
+    if (!posterBytes && typeof tools.extractPoster === 'function') {
+      try {
+        posterBytes = await tools.extractPoster(bytes, { width: POSTER_WIDTH, mime, videoInfo });
+      } catch (error) {
+        console.warn('[ingest] 抽首帧失败', error?.message ?? error);
+        warnings.push({ code: 'poster-failed', message: `首帧海报生成失败：${error?.message ?? error}` });
+      }
+    }
+    if (posterBytes) {
+      const posterMeta = readMediaMeta(posterBytes);
+      if (!posterMeta.mime || !posterMeta.mime.startsWith('image/')) {
+        warnings.push({ code: 'poster-invalid', message: '首帧海报不是图片，已忽略' });
+      } else {
+        const posterSha = await sha256Bytes(posterBytes);
+        const key = posterKey(row.id, posterSha, posterMeta.mime);
+        await putAsset(env, key, posterBytes, posterMeta.mime);
+        const posterCheck = await verifyAsset(env, key, posterBytes.byteLength);
+        if (!posterCheck.ok) {
+          await deleteAsset(env, key);
+          warnings.push({ code: 'poster-verify-failed', message: '首帧海报回读校验失败，已丢弃' });
+        } else {
+          await run(env, Q.updateWallpaperPoster, key, row.id);
+          posterStored = key;
+          fixes.push({
+            code: AUTO_FIX.POSTER,
+            message: `首帧海报 ${posterMeta.width || '?'}×${posterMeta.height || '?'} ${posterMeta.mime}`,
+          });
+        }
+      }
     }
   }
 
@@ -596,6 +702,12 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
     height: bundle ? null : height,
     durationMs,
     thumbUrl: finalThumbKey ? `/media/${finalThumbKey}` : null,
+    // 首帧海报：没有就是 null（客户端回落到 thumbUrl）
+    posterUrl: posterStored ? `/media/${posterStored}` : null,
+    fps: videoInfo.fps ?? null,
+    codec: videoInfo.codec ?? null,
+    pixFmt,
+    hasAudio: hasAudio === null ? null : hasAudio === 1,
     variants: variants.length,
     tags: safeJsonParse(row.tags, []),
     review_status: row.review_status ?? 'pending',
@@ -652,6 +764,7 @@ export async function createWallpaperRow(env, actor, input, { now = nowMs() } = 
     input.reviewStatus ?? 'pending', input.categoryId ?? null, input.kind, 'draft',
     null, null, 0, null, null, null,
     JSON.stringify(input.tags ?? []), input.featured ? 1 : 0, sortOrder, actor.id, now, now, null,
+    input.license ?? null, input.source ?? null, input.author ?? null,
   );
   return { id, slug, sortOrder };
 }
@@ -712,6 +825,9 @@ export async function importMedia({ env, actor, item, options = {} }) {
       tags: item.tags ?? [],
       slug: item.slug ?? '',
       featured: false,
+      license: item.license ?? null,
+      source: item.source ?? null,
+      author: item.author ?? null,
     }, { now });
 
     await writeAudit(env, {
@@ -728,6 +844,7 @@ export async function importMedia({ env, actor, item, options = {} }) {
     const result = await ingestAsset(env, actor, row, {
       bytes: item.bytes,
       thumb: item.thumb,
+      poster: item.poster,
       variants: item.variants,
     }, { ...options, now, requireCategory: true });
 
@@ -755,8 +872,9 @@ export async function importMedia({ env, actor, item, options = {} }) {
       warnings: result.warnings,
       fields: {
         url: result.url, bytes: result.bytes, sha256: result.sha256, width: result.width,
-        height: result.height, thumbUrl: result.thumbUrl, variants: result.variants,
-        durationMs: result.durationMs, kind: result.kind, mime: result.mime,
+        height: result.height, thumbUrl: result.thumbUrl, posterUrl: result.posterUrl,
+        variants: result.variants, durationMs: result.durationMs, kind: result.kind, mime: result.mime,
+        fps: result.fps, pixFmt: result.pixFmt, hasAudio: result.hasAudio,
       },
     };
   } catch (error) {

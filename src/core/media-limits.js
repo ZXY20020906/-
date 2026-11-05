@@ -49,11 +49,13 @@ export const ORIGINAL_SUGGESTED_BYTES = 25 * MB;
 /** 1080p 变体体积建议上限：超了只 warn（弱网起播会变慢）。 */
 export const VARIANT_SUGGESTED_BYTES = 8 * MB;
 
-// ------------------------------------------------------------------ 缩略图
+// ------------------------------------------------------------------ 缩略图 / 首帧海报
 /** 缩略图目标宽度：插件卡片最多 640 宽，1280 给 2x 屏。 */
 export const THUMB_WIDTH = 1280;
 /** 手动上传缩略图的体积上限。 */
 export const THUMB_MAX_BYTES = 2 * MB;
+/** 首帧海报宽度（v1 `posterUrl`）：1280 宽 WebP，详情页/分享卡片用。 */
+export const POSTER_WIDTH = 1280;
 
 // ------------------------------------------------------------------ 配额
 /** 每日上传配额默认值（1 GiB / 账号 / 天），env.UPLOAD_DAILY_BYTES 可覆盖。 */

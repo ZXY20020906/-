@@ -15,6 +15,7 @@ import { ASPECT_TOLERANCE } from '../core/aspects.js';
 const PUBLIC_COLUMNS = `w.id, w.slug, w.title, w.description, w.subtag, w.category_id, w.kind, w.mime, w.bytes, w.width, w.height,
   w.duration_ms, w.tags, w.featured, w.sort_order, w.published_at, w.created_at, w.updated_at,
   w.sha256, w.storage_key, w.thumb_key, w.variants,
+  w.fps, w.codec, w.pix_fmt, w.has_audio, w.poster_key, w.license, w.source, w.author,
   c.slug AS category_slug, c.name AS category_name`;
 
 /**
@@ -55,20 +56,28 @@ const aspectMatch = (placeholder) => `(w.width > 0 AND w.height > 0
     AND ABS((w.width * 1.0 / w.height) - ${placeholder}) < ${ASPECT_TOLERANCE})`;
 
 /**
- * 列表额外筛选（Wallpaper Engine 那套）：标签 + 分辨率 + 子标签。
+ * 列表额外筛选（素材网那套）：标签 + 宽高比 + 子标签 + 许可证。
  *
- * 参数是**占位符编号**而不是值：PUBLIC_EXTRA 用 ?8/?9/?11（前面还有游标 ?5/?6/?7），
- * 而 publicCount 用 ?5/?6/?7。同一段规则、不同编号，所以只能传编号进来。
- * 用 ?N 而不是把前面的重新编号——SQL 里编号可以乱序出现，这样新增筛选不用动已有
- * 游标参数，出错面小得多。
+ * 参数是**占位符编号**而不是值：清单用 ?8/?9/?11/?12，计数与 facets 用 ?5/?6/?7/?8。
+ * 同一段规则、不同编号，所以只能传编号进来。用 ?N 而不是把前面的重新编号——
+ * SQL 里编号可以乱序出现，这样新增筛选不用动已有游标参数，出错面小得多。
+ *
+ * 后续（第二期）的数值/可播/音轨参数也走这里：**只增不改**，已有编号永不挪位。
  */
-function extraFilters({ tag, aspect, subtag }) {
-  return `AND (${tag} IS NULL OR ${tagMatch(tag)})
-  AND (${aspect} IS NULL OR ${aspectMatch(aspect)})
-  AND (${subtag} IS NULL OR w.subtag = ${subtag})`;
+function extraFilters({ tag, aspect, subtag, license }) {
+  const clauses = [
+    `AND (${tag} IS NULL OR ${tagMatch(tag)})`,
+    `AND (${aspect} IS NULL OR ${aspectMatch(aspect)})`,
+    `AND (${subtag} IS NULL OR w.subtag = ${subtag})`,
+  ];
+  // 许可证：空值就是「没声明」，不会被 license= 命中；大小写不敏感（对外统一小写标识）。
+  if (license) {
+    clauses.push(`AND (${license} IS NULL OR LOWER(COALESCE(w.license, '')) = ${license})`);
+  }
+  return clauses.join('\n  ');
 }
 
-const PUBLIC_EXTRA = extraFilters({ tag: '?8', aspect: '?9', subtag: '?11' });
+const PUBLIC_EXTRA = extraFilters({ tag: '?8', aspect: '?9', subtag: '?11', license: '?12' });
 
 /** 公开子标签列表：只统计已发布、有文件的 */
 export const PUBLIC_SUBTAGS = `SELECT w.subtag AS name, COUNT(*) AS n FROM wallpapers w
@@ -94,7 +103,7 @@ export const PUBLIC_FACETS = `WITH base AS (
     SELECT w.id, w.category_id, w.subtag, w.tags
     FROM wallpapers w LEFT JOIN categories c ON c.id = w.category_id
     WHERE ${PUBLIC_FILTERS}
-      ${extraFilters({ tag: '?5', aspect: '?6', subtag: '?7' })}
+      ${extraFilters({ tag: '?5', aspect: '?6', subtag: '?7', license: '?8' })}
   )
   SELECT 'category' AS facet, b.category_id AS id, c.slug AS slug, c.name AS name,
       NULL AS value, COUNT(*) AS n
@@ -205,10 +214,11 @@ export const Q = {
   wallpaperTitleBytesTaken: `SELECT id, title FROM wallpapers WHERE title = ? AND bytes = ? LIMIT 1`,
   insertWallpaper: `INSERT INTO wallpapers
       (id, slug, title, description, subtag, review_status, category_id, kind, status, storage_key, mime, bytes, width, height, sha256,
-       tags, featured, sort_order, created_by, created_at, updated_at, published_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       tags, featured, sort_order, created_by, created_at, updated_at, published_at, license, source, author)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   updateWallpaper: `UPDATE wallpapers SET slug = ?, title = ?, description = ?, subtag = ?, category_id = ?, kind = ?, status = ?,
-      review_status = ?, tags = ?, featured = ?, sort_order = ?, updated_at = ?, published_at = ? WHERE id = ?`,
+      review_status = ?, tags = ?, featured = ?, sort_order = ?, updated_at = ?, published_at = ?,
+      license = ?, source = ?, author = ? WHERE id = ?`,
   updateWallpaperAsset: `UPDATE wallpapers SET storage_key = ?, mime = ?, bytes = ?, width = ?, height = ?,
       duration_ms = ?, sha256 = ?, kind = ?, updated_at = ? WHERE id = ?`,
   /** 只改媒体三列（工具重算 sha256/bytes 用）；不碰 mime/width/height/kind。 */
@@ -236,6 +246,15 @@ export const Q = {
   approvePendingPublished: `UPDATE wallpapers SET review_status = 'approved', updated_at = ?
     WHERE review_status <> 'approved' AND status = 'published'`,
   markWallpaperVerified: `UPDATE wallpapers SET verified_at = ?, codec = ?, faststart = ? WHERE id = ?`,
+  /**
+   * schema/016 的技术元数据三列。**单独一条**而不是塞进 markWallpaperVerified：
+   * 迁移是分阶段上线的，老库没这三列时上一条 UPDATE 仍然能跑（codec/faststart 是 012 的列）。
+   * 调用方先用 wallpaperTechColumns 探测，探测不到就跳过（拿不到就 NULL，不阻塞入库）。
+   */
+  updateWallpaperTech: `UPDATE wallpapers SET fps = ?, pix_fmt = ?, has_audio = ? WHERE id = ?`,
+  wallpaperTechColumns: `SELECT name FROM pragma_table_info('wallpapers') WHERE name IN ('fps', 'pix_fmt', 'has_audio', 'poster_key')`,
+  /** schema/016 的首帧海报（1280 宽 WebP，内容哈希 key）。 */
+  updateWallpaperPoster: `UPDATE wallpapers SET poster_key = ? WHERE id = ?`,
   /** 对账发现问题时标记（公开接口据此过滤） */
   markWallpaperBroken: `UPDATE wallpapers SET verified_at = NULL, missing_reason = ? WHERE id = ?`,
   /** 探测 codec/faststart 列是否已迁移：返回 2 行表示都在。 */
@@ -322,7 +341,7 @@ export const Q = {
 
   publicCount: `SELECT COUNT(*) AS n FROM wallpapers w LEFT JOIN categories c ON c.id = w.category_id
     WHERE ${PUBLIC_FILTERS}
-      ${extraFilters({ tag: '?5', aspect: '?6', subtag: '?7' })}`,
+      ${extraFilters({ tag: '?5', aspect: '?6', subtag: '?7', license: '?8' })}`,
 
   /** 标签云：Wallpaper Engine 左侧那一列标签，按出现次数排序 */
   publicTags: tagCounts(
@@ -357,6 +376,16 @@ export const Q = {
 
   publicBySlug: `SELECT ${PUBLIC_COLUMNS} FROM wallpapers w LEFT JOIN categories c ON c.id = w.category_id
     WHERE w.slug = ?1 AND w.status = 'published' AND w.storage_key IS NOT NULL LIMIT 1`,
+
+  /**
+   * v1 manifest 快照：与公开清单同一套可见性门槛，但**不分页、不筛选**，
+   * 一次给出全部可下载条目（素材网客户端据此做全量同步/校验）。
+   * 上限 1000：当前站点 232 条量级，留足余量；真到 1000 条再改成游标分片。
+   */
+  publicManifest: `SELECT ${PUBLIC_COLUMNS} FROM wallpapers w LEFT JOIN categories c ON c.id = w.category_id
+    WHERE ${PUBLIC_VISIBLE}
+    ORDER BY COALESCE(w.published_at, w.created_at) DESC, w.id DESC
+    LIMIT 1000`,
 
   // ------------------------------------------------------------------ audit
   insertAudit: `INSERT INTO audit_log (at, actor_id, actor_email, actor_role, action, target_type, target_id, detail)

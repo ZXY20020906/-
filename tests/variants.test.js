@@ -17,8 +17,9 @@ test('variants：正常 JSON → 同域 url + 由高度推出的 label', () => {
   const out = variantsDto({
     variants: JSON.stringify([{ height: 1080, key: KEY, bytes: 7861004, sha256: 'ab1a' }]),
   }, 'https://cdn.test');
+  // v1 起 variants[] 多了 width / fps（老库没有就是 null），label 规则不变
   assert.deepEqual(out, [{
-    label: '1080p', height: 1080, bytes: 7861004, sha256: 'ab1a',
+    label: '1080p', width: null, height: 1080, fps: null, bytes: 7861004, sha256: 'ab1a',
     url: `https://cdn.test/${KEY}`,
   }]);
 });

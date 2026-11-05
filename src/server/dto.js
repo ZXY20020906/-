@@ -70,7 +70,10 @@ export function variantsDto(row, mediaBase = '') {
       const bytes = Number(item.bytes);
       return {
         label: variantLabel(item, height),
+        // 宽度/帧率是 v1 新增：客户端按「档位」选片时不用自己从 label 里猜
+        width: Number(item.width) || null,
         height,
+        fps: Number(item.fps) || null,
         bytes,
         sha256: item.sha256 ?? null,
         url: publicUrl(item.key, mediaBase),
@@ -79,12 +82,27 @@ export function variantsDto(row, mediaBase = '') {
     .sort((a, b) => a.bytes - b.bytes);
 }
 
+/** `nullableNumber`：D1 的 REAL 列可能给 null / undefined / 空串，统一收敛成 number|null。 */
+function nullableNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** `has_audio` 三态：1 → true、0 → false、NULL/缺列 → null（未知，不假装成 false）。 */
+function nullableBool(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (value === true || value === 1 || value === '1') return true;
+  return false;
+}
+
 export function wallpaperDto(row, { admin = false, mediaBase = '' } = {}) {
   const fullUrl = publicUrl(row.storage_key, mediaBase);
   // 没有缩略图时，只有原文件本身是图片才拿它顶替；
   // 视频 / zip 绝不能当缩略图返回，否则客户端会把 40MB 的 mp4 当图片去下。
   const assetIsImage = typeof row.mime === 'string' && row.mime.startsWith('image/');
   const thumbUrl = publicUrl(row.thumb_key, mediaBase) ?? (assetIsImage ? fullUrl : null);
+  const posterUrl = publicUrl(row.poster_key, mediaBase);
   const base = {
     id: row.id,
     slug: row.slug,
@@ -97,6 +115,11 @@ export function wallpaperDto(row, { admin = false, mediaBase = '' } = {}) {
     width: row.width ?? null,
     height: row.height ?? null,
     durationMs: row.duration_ms ?? null,
+    // v1 技术元数据（schema/016）：拿不到一律 null，不猜、不补默认值
+    fps: nullableNumber(row.fps),
+    codec: row.codec ?? null,
+    pixFmt: row.pix_fmt ?? null,
+    hasAudio: nullableBool(row.has_audio),
     tags: safeJsonParse(row.tags, []),
     featured: row.featured === 1 || row.featured === true,
     category: row.category_id
@@ -104,6 +127,12 @@ export function wallpaperDto(row, { admin = false, mediaBase = '' } = {}) {
       : null,
     url: fullUrl,
     thumbUrl,
+    // 首帧海报（视频才可能有）：1280 宽 WebP；没有时保持 null，客户端回落到 thumbUrl
+    posterUrl,
+    // 授权信息：列表就能筛选/展示，客户端不用再调详情
+    license: row.license ?? null,
+    source: row.source ?? null,
+    author: row.author ?? null,
     // 降档变体：没有就是空数组，老客户端读不到也不会崩
     variants: variantsDto(row, mediaBase),
     // 给插件做增量同步用：内容哈希 + 更新时间，没变就不用重新下载

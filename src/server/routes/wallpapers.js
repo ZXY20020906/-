@@ -21,7 +21,8 @@ import { THUMB_MAX_BYTES } from '../../core/media-limits.js';
 import { specFromFileName } from '../../core/variant-label.js';
 import { ACTION, assertCan } from '../../core/permissions.js';
 import {
-  cleanCategoryRef, cleanEnum, cleanId, has, parseLimit, parseWallpaperCreate, parseWallpaperPatch,
+  cleanCategoryRef, cleanEnum, cleanId, cleanLicense, cleanNullableText, has, parseLimit,
+  parseWallpaperCreate, parseWallpaperPatch, AUTHOR_MAX, SOURCE_MAX,
 } from '../../core/validate.js';
 import { KINDS, REVIEW_STATUSES, STATUSES } from '../../core/validate.js';
 import { kindMatchesMime } from '../../core/image-meta.js';
@@ -197,6 +198,10 @@ export async function update({ env, actor, request, params }) {
     tags: patch.tags ?? safeJsonArray(row.tags, []),
     featured: patch.featured !== undefined ? patch.featured : row.featured === 1,
     sortOrder: patch.sortOrder ?? Number(row.sort_order ?? 0),
+    // 授权信息（schema/016）：没传就沿用库里的值，不会被 PATCH 顺手清空
+    license: patch.license !== undefined ? patch.license : (row.license ?? null),
+    source: patch.source !== undefined ? patch.source : (row.source ?? null),
+    author: patch.author !== undefined ? patch.author : (row.author ?? null),
   };
 
   const now = nowMs();
@@ -204,7 +209,8 @@ export async function update({ env, actor, request, params }) {
     env,
     Q.updateWallpaper,
     row.slug, next.title, next.description, next.subtag, next.categoryId, nextKind, nextStatus,
-    next.reviewStatus, JSON.stringify(next.tags), next.featured ? 1 : 0, next.sortOrder, now, publishedAt, row.id,
+    next.reviewStatus, JSON.stringify(next.tags), next.featured ? 1 : 0, next.sortOrder, now, publishedAt,
+    next.license, next.source, next.author, row.id,
   );
 
   await writeAudit(env, {
@@ -320,6 +326,18 @@ export async function importAsset({ env, actor, request }) {
     ? new Uint8Array(await thumbFile.arrayBuffer())
     : null;
 
+  // 首帧海报（1280 宽 WebP）：浏览器把视频 seek 到 0 后用 canvas 抓一帧；
+  // 没传也不影响入库（posterUrl 为 null，客户端回落 thumbUrl）。
+  const posterFile = form.get('poster');
+  const poster = posterFile && typeof posterFile !== 'string'
+    ? new Uint8Array(await posterFile.arrayBuffer())
+    : null;
+
+  // 授权信息（schema/016）：表单里可选，留空就是「未声明」
+  const license = cleanLicense(String(form.get('license') ?? ''));
+  const source = cleanNullableText(String(form.get('source') ?? '') || null, 'source', SOURCE_MAX);
+  const author = cleanNullableText(String(form.get('author') ?? '') || null, 'author', AUTHOR_MAX);
+
   const variants = [];
   for (const entry of form.getAll('variant')) {
     if (!entry || typeof entry === 'string') continue;
@@ -337,7 +355,8 @@ export async function importAsset({ env, actor, request }) {
     env,
     actor,
     item: {
-      title, kind, categoryId, tags, bytes, thumb, variants, publish, reportId,
+      title, kind, categoryId, tags, bytes, thumb, poster, variants, publish, reportId,
+      license, source, author,
       fileName: String(file.name ?? ''),
     },
   });

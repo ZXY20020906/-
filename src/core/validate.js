@@ -152,6 +152,39 @@ export function cleanFreeTags(value, field = 'tags') {
 
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
+/** 授权信息长度上限（schema/016 的 license/source/author）。 */
+export const LICENSE_MAX = 40;
+export const SOURCE_MAX = 200;
+export const AUTHOR_MAX = 120;
+
+/**
+ * 许可证标识：null/空串 = 未声明；否则统一小写、只允许 `[a-z0-9._-]`。
+ *
+ * 为什么收敛成小写：筛选参数 `license=` 也是小写，两处大小写不一致会让
+ * 「填了 CC0、筛 cc0 却查不到」。想展示成 `CC0` 是前端的事，库里只有一种写法。
+ */
+export function cleanLicense(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value !== 'string') fail('license', 'license 必须是字符串');
+  const out = value.trim().toLowerCase();
+  if (!out) return null;
+  if (out.length > LICENSE_MAX) fail('license', `license 最多 ${LICENSE_MAX} 个字符`);
+  if (!/^[a-z0-9][a-z0-9._-]*$/.test(out)) {
+    fail('license', 'license 只能包含小写字母、数字、点、下划线、短横线');
+  }
+  return out;
+}
+
+/** 来源 / 作者：可空文本；空串统一存 null（DTO 输出 null 而不是 ""）。 */
+export function cleanNullableText(value, field, max) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') fail(field, `${field} 必须是字符串`);
+  const out = value.trim().replace(/\s+/g, ' ');
+  if (!out) return null;
+  if (out.length > max) fail(field, `${field} 最多 ${max} 个字符`);
+  return out;
+}
+
 export function cleanId(value, field) {
   if (typeof value !== 'string' || !ID_RE.test(value)) fail(field, `${field} 格式不合法`);
   return value;
@@ -181,6 +214,10 @@ export function parseWallpaperCreate(body, { allowedTags = TAGS } = {}) {
     tags: cleanFreeTags(b.tags),
     slug: b.slug ? cleanSlugInput(b.slug) : '',
     featured: b.featured === undefined ? false : cleanBool(b.featured, 'featured'),
+    // 授权信息（schema/016）：新建时就可以带上，列表/详情/筛选都能用
+    license: cleanLicense(b.license),
+    source: cleanNullableText(b.source, 'source', SOURCE_MAX),
+    author: cleanNullableText(b.author, 'author', AUTHOR_MAX),
   };
 }
 
@@ -197,6 +234,9 @@ export function parseWallpaperPatch(body, { allowedTags = TAGS } = {}) {
   if (has(b, 'featured')) patch.featured = cleanBool(b.featured, 'featured');
   if (has(b, 'status')) patch.status = cleanEnum(b.status, 'status', STATUSES);
   if (has(b, 'sortOrder')) patch.sortOrder = cleanInt(b.sortOrder, 'sortOrder', { min: 0, max: 1e6 });
+  if (has(b, 'license')) patch.license = cleanLicense(b.license);
+  if (has(b, 'source')) patch.source = cleanNullableText(b.source, 'source', SOURCE_MAX);
+  if (has(b, 'author')) patch.author = cleanNullableText(b.author, 'author', AUTHOR_MAX);
   if (Object.keys(patch).length === 0) fail('body', '没有可更新的字段');
   return patch;
 }
