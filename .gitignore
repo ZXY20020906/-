@@ -22,3 +22,7 @@ current-ids.json
 restore-deleted.sql
 hide-broken.sql
 probe.*
+
+# Python 字节码
+__pycache__/
+*.pyc

@@ -97,8 +97,9 @@ export function corsHeaders() {
   return {
     'access-control-allow-origin': '*',
     'access-control-allow-methods': 'GET, HEAD, OPTIONS',
-    'access-control-allow-headers': 'content-type, range',
-    'access-control-expose-headers': 'etag, content-length, content-range',
+    'access-control-allow-headers': 'content-type, range, authorization',
+    // 客户端要能读到限流/缓存相关的头（含 429 的 Retry-After）
+    'access-control-expose-headers': 'etag, content-length, content-range, retry-after, x-ratelimit-limit, x-ratelimit-remaining, x-ratelimit-window',
     'access-control-max-age': '86400',
   };
 }

@@ -275,6 +275,11 @@ Content-Type: video/mp4
 
 > 版本化入口 `/api/v1/public/*` 见下文「API v1（素材网地基）」；旧路径是它的兼容壳。
 
+**限流**：公开读接口按 IP 120 次/分钟；v1 额外支持 API key（`Authorization: Bearer <key>`
+或 `?key=`），带 key 时按该 key 的 `rpm`（默认 600 次/分钟）。超限 `429` + `Retry-After`
+与 `x-ratelimit-*` 头。创建 key：`node tools/create-api-key.mjs --label=... --rpm=600`。
+细节见 [`API-V1.md`](API-V1.md#7-限流)。
+
 `/api/public/*` 都带 `access-control-allow-origin: *`，插件从任意源 fetch 都能读；它们不接受 Cookie 身份，所以不存在把会话暴露给别的源的问题。
 `/api/plugin/feed` **不在**白名单里，仍然需要管理员会话（它服务站内插件面板，用的是会话身份）。
 
@@ -353,8 +358,11 @@ Content-Type: video/mp4
 第一期起，公开只读接口有了版本化入口 **`/api/v1/public/*`**。旧路径 `/api/public/*`
 **继续工作**，而且内部只是一个兼容壳（`src/server/routes/public.js` 直接转发到
 `src/server/routes/public-v1.js`），所以同一请求两边响应体**逐字节相同**。
-完整的机器可读契约见 [`openapi.yaml`](openapi.yaml)（OpenAPI 3.1，覆盖全部 v1 端点、
-参数、响应与错误码）。
+
+- 完整 v1 文档（字段表 / 限流 / SDK / curl 示例）：[`API-V1.md`](API-V1.md)
+- 机器可读契约（OpenAPI 3.1，覆盖全部 v1 端点、参数、响应与错误码）：
+  [`openapi.yaml`](openapi.yaml)
+- 客户端 SDK：JS（ESM）与 Python，见 [`../sdk/README.md`](../sdk/README.md)
 
 | 方法 | v1 路径 | 说明 |
 |---|---|---|

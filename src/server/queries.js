@@ -407,6 +407,13 @@ export const Q = {
   /** 后台用：不限状态地统计每个标签用了多少次 */
   adminTagStats: tagCounts(''),
 
+  // -------------------------------------------------------------- api keys
+  /** 公开 API key 查询：只按哈希查（明文永不入库）。schema/018 */
+  apiKeyByHash: `SELECT id, label, rpm, active, created_at, last_used_at FROM api_keys
+    WHERE key_hash = ? LIMIT 1`,
+  /** 使用时间回写（agent 侧做了 60s 节流，见 src/server/api-keys.js） */
+  touchApiKey: `UPDATE api_keys SET last_used_at = ? WHERE id = ?`,
+
   // ------------------------------------------------------------------ tags
   listTags: `SELECT * FROM tags ORDER BY sort_order, name`,
   /** 某个分类下能用的标签：全局标签（category_id 为空） + 该分类专属标签 */

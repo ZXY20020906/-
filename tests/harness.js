@@ -45,6 +45,12 @@ const DEFAULT_HANDLERS = {
   [Q.publicManifest]: () => [],
   // manifest 的 generatedAt 取「公开集合最新 updated_at」；假环境给 0 → 回落到 items 最大值
   [Q.publicMaxUpdatedAt]: () => [{ n: 0 }],
+  /**
+   * API key（schema/018）：假环境默认「没有这把 key」。
+   * 带 key 的用例在 tests/api-keys.test.js 里显式注册；不带 key 的请求**不会**查库。
+   */
+  [Q.apiKeyByHash]: () => [],
+  [Q.touchApiKey]: () => [],
   [Q.wallpaperTitleBytesTaken]: () => [],
   // 大文件指纹去重：假环境「没有重复」，与 schema/013 列存在时的行为对齐
   [Q.wallpaperFingerprintTaken]: () => [],

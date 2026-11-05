@@ -5,6 +5,7 @@
 import { assertSafeRequest, corsHeaders, failure, methodNotAllowed, preflight } from './http.js';
 import { readSession, clientIp } from './session.js';
 import { hit } from './rate-limit.js';
+import { findApiKey, readApiKey, touchApiKey } from './api-keys.js';
 import { HttpError, notFound, tooManyRequests, unauthorized } from '../core/errors.js';
 import * as authRoutes from './routes/auth.js';
 import * as publicRoutes from './routes/public.js';
@@ -208,16 +209,43 @@ export async function handle(request, env) {
     }
 
     // 公开读接口限速（只对带 CORS 的公开 GET/HEAD 生效）。
-    // 这是 isolate 内存计数的兜底；真正抗打要在 Cloudflare 控制台给 /api/public/* 配 Rate Limiting 规则。
+    //
+    // 两档配额（第三期）：
+    //   · 带 API key（仅 v1）：按 key 的 rpm 计，默认 600/min；
+    //   · 不带 key：按 IP 120/min（PUBLIC_RATE，见 rate-limit.js 的 isolate 内存局限）。
+    // key 无效/停用必须 401，不能静默降级成匿名 —— 否则「配额」只是摆设。
+    // 这一层在边缘缓存之前：命中缓存的请求同样计数，防止用缓存当免费通道刷配额。
     if (route.cors && (request.method === 'GET' || request.method === 'HEAD')) {
-      const rl = hit(`pub:${clientIp(request)}`, PUBLIC_RATE);
+      let apiKey = null;
+      if (url.pathname.startsWith('/api/v1/public/')) {
+        const raw = readApiKey(request, url);
+        if (raw) {
+          const lookup = await findApiKey(env, raw);
+          if (lookup.unavailable) {
+            // 表还没迁移：回落匿名限流（公开读取优先可用），但字段已带 key 也不放行数据以外的特权
+            apiKey = null;
+          } else if (!lookup.key) {
+            return withCors(failure(new HttpError(401, 'api_key_invalid', 'API key 无效或已停用')), env);
+          } else {
+            apiKey = lookup.key;
+          }
+        }
+      }
+      const plan = apiKey ? { max: apiKey.rpm, windowMs: 60 * 1000 } : PUBLIC_RATE;
+      const bucket = apiKey ? `key:${apiKey.id}` : `pub:${clientIp(request)}`;
+      const rl = hit(bucket, plan);
       if (rl.limited) {
         const limited = failure(tooManyRequests(`请求过于频繁，请 ${rl.retryAfter} 秒后再试`));
         const headers = new Headers(limited.headers);
         headers.set('retry-after', String(Math.max(1, rl.retryAfter)));
+        headers.set('x-ratelimit-limit', String(plan.max));
+        headers.set('x-ratelimit-remaining', '0');
+        headers.set('x-ratelimit-window', String(Math.round(plan.windowMs / 1000)));
         for (const [key, value] of Object.entries(corsHeaders(env))) headers.set(key, value);
         return new Response(limited.body, { status: limited.status, headers });
       }
+      // 使用时间回写（60s 节流），失败不影响读取
+      if (apiKey) await touchApiKey(env, apiKey);
     }
 
     let actor = null;
@@ -260,23 +288,26 @@ export async function handle(request, env) {
 
     return final;
   } catch (error) {
+    // 公开路径的错误也带 CORS：浏览器里的素材网客户端要能读到 4xx 的 JSON，
+    // 否则 fetch 只会抛一个没有信息的 TypeError（跨域被拦）。
+    const respond = (response) => (isPublicReadPath(url.pathname) ? withCors(response, env) : response);
     if (error instanceof HttpError) {
       if (error.status >= 500) console.error('[api]', error.status, error.code, error.message);
-      return failure(error);
+      return respond(failure(error));
     }
     console.error('[api] unhandled', url.pathname, error?.stack ?? error?.message ?? error);
     // 排查用：DEBUG_API=1 时把真实异常带出来，默认关闭
     if (env && env.DEBUG_API === '1') {
-      return new Response(JSON.stringify({
+      return respond(new Response(JSON.stringify({
         ok: false,
         error: {
           code: 'internal_error',
           message: String(error?.message ?? error),
           stack: String(error?.stack ?? '').split('\n').slice(0, 6),
         },
-      }), { status: 500, headers: { 'content-type': 'application/json; charset=utf-8' } });
+      }), { status: 500, headers: { 'content-type': 'application/json; charset=utf-8' } }));
     }
-    return failure(error);
+    return respond(failure(error));
   }
 }
 
