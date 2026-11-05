@@ -1,5 +1,6 @@
 /** HTTP 层：统一 JSON 形状、安全头、CSRF 防护、请求体大小限制。 */
 import { HttpError, badRequest, forbidden, payloadTooLarge } from '../core/errors.js';
+import { hintForCode, statusForCode } from '../core/error-codes.js';
 
 const JSON_HEADERS = {
   'content-type': 'application/json; charset=utf-8',
@@ -22,12 +23,28 @@ export function created(data, headers = {}) {
   return json(data, { status: 201, headers });
 }
 
+/**
+ * 统一错误体：`{ ok:false, error:{ code, message, hint?, details? } }`。
+ *
+ * `hint` 的来源优先级：`details.hint`（业务自己知道得更具体，比如 422 体检）
+ * → 错误码表的默认提示（`core/error-codes.js`）。两处都没有就不出现这个字段。
+ * `details` 保持原样不动：老客户端读 `details.field` / `details.violations` 的地方一个都不受影响。
+ */
 export function failure(error) {
-  const status = error instanceof HttpError ? error.status : 500;
+  const status = error instanceof HttpError ? error.status : statusForCode('internal_error');
   const code = error instanceof HttpError ? error.code : 'internal_error';
   const message = error instanceof HttpError ? error.message : '服务器内部错误';
   const details = error instanceof HttpError ? error.details : null;
-  const body = { ok: false, error: { code, message, ...(details ? { details } : {}) } };
+  const hint = (details && typeof details === 'object' ? details.hint : null) ?? hintForCode(code);
+  const body = {
+    ok: false,
+    error: {
+      code,
+      message,
+      ...(hint ? { hint } : {}),
+      ...(details ? { details } : {}),
+    },
+  };
   return new Response(JSON.stringify(body), {
     status,
     headers: { ...BASE_HEADERS, ...JSON_HEADERS },
@@ -91,11 +108,9 @@ export function preflight(env) {
 }
 
 export function methodNotAllowed(allowed) {
-  return new Response(JSON.stringify({
-    ok: false,
-    error: { code: 'method_not_allowed', message: `只支持 ${allowed.join(', ')}` },
-  }), {
-    status: 405,
-    headers: { ...BASE_HEADERS, ...JSON_HEADERS, allow: allowed.join(', ') },
-  });
+  // 与 failure() 同一形状：错误码表里的 hint 也要出现，否则 405 是唯一没有提示的错。
+  const base = failure(new HttpError(405, 'method_not_allowed', `只支持 ${allowed.join(', ')}`));
+  const headers = new Headers(base.headers);
+  headers.set('allow', allowed.join(', '));
+  return new Response(base.body, { status: 405, headers });
 }

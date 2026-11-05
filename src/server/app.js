@@ -8,6 +8,7 @@ import { hit } from './rate-limit.js';
 import { HttpError, notFound, tooManyRequests, unauthorized } from '../core/errors.js';
 import * as authRoutes from './routes/auth.js';
 import * as publicRoutes from './routes/public.js';
+import * as publicV1Routes from './routes/public-v1.js';
 import * as wallpaperRoutes from './routes/wallpapers.js';
 import * as categoryRoutes from './routes/categories.js';
 import * as tagRoutes from './routes/tags.js';
@@ -18,13 +19,21 @@ import * as auditRoutes from './routes/audit.js';
 
 /** @type {{method:string, path:string, handler:Function, auth:'none'|'session', cors?:boolean}[]} */
 const DEFINITIONS = [
-  // 公开只读
+  // 公开只读（旧路径，v1 的兼容壳；字段与 v1 完全一致）
   { method: 'GET', path: '/api/meta', handler: publicRoutes.meta, auth: 'none', cors: true },
   { method: 'GET', path: '/api/public/categories', handler: publicRoutes.listCategories, auth: 'none', cors: true },
   { method: 'GET', path: '/api/public/tags', handler: publicRoutes.listTags, auth: 'none', cors: true },
   { method: 'GET', path: '/api/public/subtags', handler: publicRoutes.listSubtags, auth: 'none', cors: true },
   { method: 'GET', path: '/api/public/wallpapers', handler: publicRoutes.listWallpapers, auth: 'none', cors: true },
   { method: 'GET', path: '/api/public/wallpapers/:slug', handler: publicRoutes.getWallpaper, auth: 'none', cors: true },
+
+  // 公开只读 v1（素材网 API 地基；详情也在匿名白名单里）
+  { method: 'GET', path: '/api/v1/public/categories', handler: publicV1Routes.listCategories, auth: 'none', cors: true },
+  { method: 'GET', path: '/api/v1/public/tags', handler: publicV1Routes.listTags, auth: 'none', cors: true },
+  { method: 'GET', path: '/api/v1/public/subtags', handler: publicV1Routes.listSubtags, auth: 'none', cors: true },
+  { method: 'GET', path: '/api/v1/public/manifest.json', handler: publicV1Routes.manifest, auth: 'none', cors: true },
+  { method: 'GET', path: '/api/v1/public/wallpapers', handler: publicV1Routes.listWallpapers, auth: 'none', cors: true },
+  { method: 'GET', path: '/api/v1/public/wallpapers/:slug', handler: publicV1Routes.getWallpaper, auth: 'none', cors: true },
 
   // 认证
   { method: 'POST', path: '/api/setup', handler: authRoutes.setup, auth: 'none' },
@@ -122,6 +131,8 @@ const ROUTES = DEFINITIONS.map(compile);
  */
 export const CACHE_PARAMS = [
   'category', 'kind', 'q', 'sort', 'featured', 'page', 'cursor', 'limit', 'tag', 'aspect', 'subtag', 'type',
+  // 第一期新增：许可证筛选（第二期的数值/可播筛选依次追加在后面，顺序固定）
+  'license',
 ];
 
 export function cacheKeyUrl(url) {
@@ -134,6 +145,14 @@ export function cacheKeyUrl(url) {
 
 /** 公开读接口的频率上限：每 IP 每分钟 120 次（isolate 内存计数，见 rate-limit.js 的局限说明）。 */
 export const PUBLIC_RATE = { max: 120, windowMs: 60 * 1000 };
+
+/**
+ * 公开只读路径前缀（旧路径 + v1）。OPTIONS 预检只对这些路径回 CORS 头：
+ * 插件 / 素材网客户端从任意源 fetch 都要能过预检，写接口一个都不放。
+ */
+export function isPublicReadPath(pathname) {
+  return pathname.startsWith('/api/public/') || pathname.startsWith('/api/v1/public/');
+}
 
 function match(method, pathname) {
   // HEAD 与 GET 同义：HTTP 语义要求二者行为一致（只是不要 body）。
@@ -172,7 +191,7 @@ export async function handle(request, env) {
     if (!url.pathname.startsWith('/api/')) throw notFound('接口不存在');
 
     if (request.method === 'OPTIONS') {
-      if (url.pathname.startsWith('/api/public/')) return preflight(env);
+      if (isPublicReadPath(url.pathname)) return preflight(env);
       return new Response(null, { status: 204 });
     }
 

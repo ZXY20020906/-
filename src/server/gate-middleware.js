@@ -294,7 +294,15 @@ const PUBLIC_READ_PATHS = new Set([
   '/api/public/tags',
   '/api/public/subtags',
 ]);
-const PUBLIC_READ_PREFIXES = ['/media/'];
+/**
+ * v1 整棵 `/api/v1/public/` 子树都放行的理由（2026-11 起）：
+ *   - 它下面**只有**只读接口（列表 / 详情 / 分类 / 标签 / 子标签 / manifest）；
+ *   - 素材网客户端必须能匿名拿详情，否则只有列表没有单条元数据，等于不可用；
+ *   - 放行的是前缀而不是逐个路径：新增 v1 只读端点（如 manifest.json）不该每次改门禁，
+ *     而 `/api/v1/` 下不存在任何写接口（写接口全在 `/api/admin/*`，需要会话）。
+ * 媒体文件（/media/）继续单独放行。
+ */
+const PUBLIC_READ_PREFIXES = ['/media/', '/api/v1/public/'];
 
 function isPublicRead(request, url) {
   // OPTIONS 也要放：带 Range 的媒体请求会触发预检，不放就只有 401，插件下不动文件
