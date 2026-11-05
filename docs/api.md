@@ -11,10 +11,33 @@
 **失败**
 
 ```json
-{ "ok": false, "error": { "code": "forbidden", "message": "缺少权限：wallpaper:publish", "details": { "required": "wallpaper:publish", "role": "editor" } } }
+{ "ok": false, "error": { "code": "forbidden", "message": "缺少权限：wallpaper:publish", "hint": "当前账号角色不含该动作；details.required 是缺少的权限名。", "details": { "required": "wallpaper:publish", "role": "editor" } } }
 ```
 
 `details` 只在有帮助时出现（字段名、冲突的壁纸 id、分类下壁纸数等）。
+`hint` 是「下一步该做什么」：优先取业务给的（如 422 体检的修复建议），否则用错误码表的默认值；
+两处都没有就不出现这个字段。完整错误码表见下面的「错误码」一节，机读版本在
+[`openapi.yaml`](openapi.yaml) 的 `components.schemas.Error.x-error-codes`。
+
+## 错误码
+
+| code | HTTP | 含义 | hint（默认） |
+|---|---|---|---|
+| `bad_request` | 400 | 参数不合法 | 检查查询参数/请求体字段名与类型；`details.field` 指出具体字段 |
+| `unauthorized` | 401 | 未登录 | 管理接口需要会话；公开接口不需要 |
+| `site_locked` | 401 | 该路径不在匿名只读白名单内 | 用 `/api/v1/public/*` 或先登录 |
+| `api_key_invalid` | 401 | API key 无效/停用（第三期） | 检查 `Authorization: Bearer <key>` 或 `?key=` |
+| `forbidden` | 403 | 权限不足 | 当前角色不含该动作 |
+| `not_found` | 404 | 资源不存在 / 未发布 | 检查 slug/id 或发布状态 |
+| `method_not_allowed` | 405 | 方法不支持 | 公开接口只读：GET/HEAD/OPTIONS |
+| `conflict` | 409 | 重名或文件重复 | `details` 里带已有条目的 id |
+| `payload_too_large` | 413 | 体积超限 | 图片≤20MB、视频≤60MB、资源包≤64MB |
+| `unsupported_media_type` | 415 | 类型不支持 | 只收 png/jpeg/webp/avif/gif、mp4/webm、zip |
+| `media_non_compliant` | 422 | 视频播不了 | 先用 `tools/prepare-upload.mjs` 转码 |
+| `import_incomplete` | 422 | 缺必填字段 | `details.missing` 列出缺的字段 |
+| `too_many_requests` | 429 | 限流 | 按 `Retry-After`（秒）等待 |
+| `storage-verify-failed` | 500 | R2 回读校验失败 | 重试；连续失败查 R2 绑定 |
+| `internal_error` | 500 | 未预期异常 | `DEBUG_API=1` 可把真实异常带进响应 |
 
 ## 约定
 
@@ -250,6 +273,8 @@ Content-Type: video/mp4
 | `GET` | `/api/public/wallpapers/:slug` | 单张详情 |
 | `GET` | `/media/*` | 媒体直链，key 含内容哈希、不可枚举 |
 
+> 版本化入口 `/api/v1/public/*` 见下文「API v1（素材网地基）」；旧路径是它的兼容壳。
+
 `/api/public/*` 都带 `access-control-allow-origin: *`，插件从任意源 fetch 都能读；它们不接受 Cookie 身份，所以不存在把会话暴露给别的源的问题。
 `/api/plugin/feed` **不在**白名单里，仍然需要管理员会话（它服务站内插件面板，用的是会话身份）。
 
@@ -264,6 +289,7 @@ Content-Type: video/mp4
 | `tag` | 标签名精确匹配；**支持逗号分隔多值，语义是 OR**（`tag=动漫,游戏` → 带其中任意一个标签即命中）。单个标签最长 30 字，一次最多 20 个 |
 | `subtag` | 子标签名精确匹配 |
 | `aspect` | 宽高比档位：`16:9` / `21:9` / `32:9` / `9:16` / `4:3` / `1:1`（容差 6%） |
+| `license` | 许可证标识（小写，如 `cc0` / `cc-by` / `personal`）；大小写不敏感，空值不命中 |
 | `q` | 标题模糊搜索（≤60 字，`%` `_` 会被剔除） |
 | `sort` | `recent`(默认) / `oldest` / `name` / `size` / `resolution` |
 | `featured=1` | 只要置顶的 |
@@ -314,6 +340,55 @@ Content-Type: video/mp4
 `/api/public/subtags` 的 `tag` 参数同样支持逗号分隔多值（OR）。
 
 `page` / `pageSize` / `pageCount` / `offset` 在传 `page` 时最有用（`page` 不传时 `page` 为 `null`，`pageCount` 仍按 `total` 算）。用游标时继续看 `nextCursor` / `hasMore`，两者不要混用。
+
+## API v1（素材网地基）
+
+第一期起，公开只读接口有了版本化入口 **`/api/v1/public/*`**。旧路径 `/api/public/*`
+**继续工作**，而且内部只是一个兼容壳（`src/server/routes/public.js` 直接转发到
+`src/server/routes/public-v1.js`），所以同一请求两边响应体**逐字节相同**。
+完整的机器可读契约见 [`openapi.yaml`](openapi.yaml)（OpenAPI 3.1，覆盖全部 v1 端点、
+参数、响应与错误码）。
+
+| 方法 | v1 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/v1/public/wallpapers` | 列表 + facets（分页 / 筛选同旧路径） |
+| `GET` | `/api/v1/public/wallpapers/:slug` | 详情（**公开可读**，已加入 gate 白名单） |
+| `GET` | `/api/v1/public/categories` | 公开分类 |
+| `GET` | `/api/v1/public/tags` | 标签（可按 `category` 收窄） |
+| `GET` | `/api/v1/public/subtags` | 子标签（可按 `category` / `tag` 收窄） |
+| `GET` | `/api/v1/public/manifest.json` | 全量快照（素材网客户端同步用，带 ETag） |
+
+v1 响应形状与旧路径一致（`{ ok:true, data:{...} }`；manifest 例外，是文档本身）。
+错误体统一为：
+
+```json
+{ "ok": false, "error": { "code": "not_found", "message": "壁纸不存在或尚未发布", "hint": "检查 id/slug 是否正确；公开接口只返回「已发布 + 已审核 + 有文件」的条目。" } }
+```
+
+### 新增元数据字段（schema/016）
+
+DTO / manifest 新增以下字段（拿不到就是 `null`，**不补默认值**）：
+
+| 字段 | 类型 | 说明 | 谁写入 |
+|---|---|---|---|
+| `fps` | number\|null | 视频帧率 | ingest 的纯 JS 探测（moov/stts）；回填时用 ffprobe |
+| `codec` | string\|null | `h264` / `hevc` / `vp9` / `av1`… | ingest（schema/012 起已有该列） |
+| `pixFmt` | string\|null | 像素格式（`yuv420p`…） | Worker 读不出 SPS，默认 `null`；回填由 ffprobe 写入 |
+| `hasAudio` | boolean\|null | 三态：true 有音轨 / false 无 / **null 未知**（别当 false） | ingest 的 `readVideoAudio()`；回填 ffprobe |
+| `posterUrl` | string\|null | 首帧海报（1280 宽 WebP） | ingest 的 `asset.poster` / 注入的 `extractPoster`；存量由回填脚本生成 |
+| `license` | string\|null | 许可证标识（小写，如 `cc0` / `cc-by` / `personal`） | 后台 `POST/PATCH /api/admin/wallpapers`、批量导入表单 |
+| `source` | string\|null | 来源 / 作者主页（≤200 字） | 同上 |
+| `author` | string\|null | 作者名（≤120 字） | 同上 |
+
+`variants[]` 也多两列：`width`（之前只有 `height`）与 `fps`；`label` 自 4.23.18 起就有。
+所以客户端选档不再需要从 label 或高度反推。
+
+列表新增筛选参数 `license=`（大小写不敏感的小写标识；空值不会被命中）。它同时参与
+facets 聚合，与其它筛选同源（`tests/metadata.test.js` 有用例）。
+
+**回填**：存量条目由 `tools/backfill-metadata.mjs` 处理 —— 对视频用 ffprobe 只读文件头
+（HTTP Range，不整档下载）补 `fps/codec/pix_fmt/has_audio`，用 ffmpeg 抽首帧生成 1280 宽
+WebP 写上 `poster_key`，再由 API 输出 `posterUrl`。脚本可重复执行（只补空缺/变化的值）。
 
 ## 媒体
 

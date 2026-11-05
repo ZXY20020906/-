@@ -1,0 +1,541 @@
+openapi: 3.1.0
+info:
+  title: Folia 素材网 API (v1)
+  version: 1.0.0
+  description: |
+    Folia 素材网公开只读 API。所有端点都可以匿名访问（不需要 Cookie / 登录），
+    返回「已发布 + 已审核 + 有文件」的条目。
+
+    - 旧路径 `/api/public/*` 是 v1 的**兼容壳**：同一请求的响应体与 v1 逐字节相同。
+      新接入方请直接使用 `/api/v1/public/*`。
+    - 数据是「素材网」语义：图片、视频、资源包（zip）都有 `kind` / `mime` / `bytes`；
+      视频额外带 `fps` / `codec` / `pixFmt` / `hasAudio` / `durationMs` / `posterUrl` /
+      `variants[]`（降档变体）。
+    - 错误体统一为 `{ ok:false, error:{ code, message, hint? , details? } }`，
+      错误码表见 `components.schemas.Error` 的 `x-error-codes`。
+    - 清单与 manifest 带 `ETag`；带 `If-None-Match` 命中时返回 `304`（无 body）。
+    - 限流：默认每 IP 120 次/分钟；超额 `429` + `Retry-After`（秒）。
+  license:
+    name: CC0-1.0
+    url: https://creativecommons.org/publicdomain/zero/1.0/
+servers:
+  - url: https://folia-5ve.pages.dev/api/v1
+    description: 线上站点（以实际部署域名为准；路径前缀固定 /api/v1）
+  - url: https://example.test/api/v1
+    description: 本地 / 测试环境
+tags:
+  - name: public
+    description: 匿名只读接口
+paths:
+  /public/wallpapers:
+    get:
+      tags: [public]
+      summary: 素材列表（分页 + 筛选 + facets）
+      description: |
+        只返回公开可见的条目。返回 `data.items` / `data.total` / `data.facets`。
+        支持页码（page）与游标（cursor）两种翻页；两者同时传时以 page 为准。
+      operationId: listWallpapers
+      parameters:
+        - $ref: '#/components/parameters/category'
+        - $ref: '#/components/parameters/kind'
+        - $ref: '#/components/parameters/q'
+        - $ref: '#/components/parameters/tag'
+        - $ref: '#/components/parameters/subtag'
+        - $ref: '#/components/parameters/aspect'
+        - $ref: '#/components/parameters/license'
+        - $ref: '#/components/parameters/featured'
+        - $ref: '#/components/parameters/sort'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/cursor'
+      responses:
+        '200':
+          description: 清单
+          headers:
+            etag:
+              description: 响应体哈希；带 If-None-Match 可拿 304
+              schema: { type: string }
+            cache-control:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WallpaperListEnvelope' }
+        '304':
+          description: 未变化（If-None-Match 命中），无 body
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /public/wallpapers/{slug}:
+    get:
+      tags: [public]
+      summary: 素材详情（公开可读）
+      operationId: getWallpaper
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          description: 素材 slug（与列表里的 slug 一致）
+          schema: { type: string, maxLength: 120 }
+      responses:
+        '200':
+          description: 详情
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WallpaperEnvelope' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /public/categories:
+    get:
+      tags: [public]
+      summary: 公开分类（带已发布计数）
+      operationId: listCategories
+      responses:
+        '200':
+          description: 分类列表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CategoryListEnvelope' }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /public/tags:
+    get:
+      tags: [public]
+      summary: 标签列表（可按分类收窄）
+      operationId: listTags
+      parameters:
+        - name: category
+          in: query
+          description: 分类 slug；带它时只返回「全局标签 + 该分类专属标签」
+          schema: { type: string, maxLength: 80 }
+      responses:
+        '200':
+          description: 标签列表 + 宽高比/类型词表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TagListEnvelope' }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /public/subtags:
+    get:
+      tags: [public]
+      summary: 子标签列表（按分类/标签收窄）
+      operationId: listSubtags
+      parameters:
+        - $ref: '#/components/parameters/category'
+        - $ref: '#/components/parameters/tag'
+      responses:
+        '200':
+          description: 子标签及计数
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SubtagListEnvelope' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /public/manifest.json:
+    get:
+      tags: [public]
+      summary: 全量清单快照（素材网客户端同步用）
+      description: |
+        不分页、不筛选，一次给出全部公开条目的同步字段。
+        `generatedAt` 是数据里最新的 `updated_at`（不是请求时间）；
+        `etag` 同时出现在 body 与响应头里，带 `If-None-Match` 命中时 304。
+      operationId: getManifest
+      responses:
+        '200':
+          description: manifest 文档
+          headers:
+            etag:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Manifest' }
+        '304':
+          description: 未变化，无 body
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+components:
+  parameters:
+    category:
+      name: category
+      in: query
+      description: 分类 slug（不是 id）
+      schema: { type: string, maxLength: 80 }
+    kind:
+      name: kind
+      in: query
+      description: 素材类型
+      schema: { type: string, enum: [static, dynamic] }
+    q:
+      name: q
+      in: query
+      description: 标题模糊搜索（≤60 字；`%` `_` 会被剔除）
+      schema: { type: string, maxLength: 60 }
+    tag:
+      name: tag
+      in: query
+      description: |
+        标签名精确匹配；支持逗号分隔多值，语义是 **OR**。
+        单个标签最长 30 字，一次最多 20 个。
+      schema: { type: string }
+      example: 动漫,游戏
+    subtag:
+      name: subtag
+      in: query
+      schema: { type: string, maxLength: 40 }
+    aspect:
+      name: aspect
+      in: query
+      description: 宽高比档位（容差 6%）
+      schema: { type: string, enum: ['16:9', '21:9', '32:9', '9:16', '4:3', '1:1'] }
+    license:
+      name: license
+      in: query
+      description: 许可证标识（小写，如 cc0 / cc-by / personal）；空值不被命中
+      schema: { type: string, pattern: '^[a-z0-9][a-z0-9._-]*$', maxLength: 40 }
+    featured:
+      name: featured
+      in: query
+      description: `1` / `true` 只返回置顶
+      schema: { type: string, enum: ['0', '1', 'true', 'false'] }
+    sort:
+      name: sort
+      in: query
+      schema: { type: string, enum: [recent, oldest, name, size, resolution], default: recent }
+    limit:
+      name: limit
+      in: query
+      description: 每页条数（1–100，默认 24）
+      schema: { type: integer, minimum: 1, maximum: 100, default: 24 }
+    page:
+      name: page
+      in: query
+      description: 页码（从 1 开始）；传了 page 就不再用 cursor
+      schema: { type: integer, minimum: 1, maximum: 10000 }
+    cursor:
+      name: cursor
+      in: query
+      description: 上一页返回的 nextCursor（无限滚动）
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: 参数不合法
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            ok: false
+            error:
+              code: bad_request
+              message: license 参数不合法（小写字母、数字、点、下划线、短横线，≤40 字）
+              hint: 检查查询参数或请求体字段名/类型；details.field 会指出具体字段。
+    NotFound:
+      description: 资源不存在（或未发布/未审核）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            ok: false
+            error:
+              code: not_found
+              message: 壁纸不存在或尚未发布
+              hint: 检查 id/slug 是否正确；公开接口只返回「已发布 + 已审核 + 有文件」的条目。
+    RateLimited:
+      description: 超过限流配额
+      headers:
+        retry-after:
+          description: 建议等待秒数
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            ok: false
+            error:
+              code: too_many_requests
+              message: 请求过于频繁，请 42 秒后再试
+              hint: 按响应头 Retry-After（秒）等待；带 API key 的配额更高，见 docs/API-V1.md。
+    InternalError:
+      description: 服务器内部错误
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [ok, error]
+      properties:
+        ok: { type: boolean, const: false }
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: 机读错误码（见 x-error-codes）
+            message:
+              type: string
+              description: 人类可读的中文说明
+            hint:
+              type: string
+              description: 下一步该做什么（错误码表的默认提示或业务自定义）
+            details:
+              type: object
+              description: 结构化补充（字段名、违规码、缺失字段等），只在有帮助时出现
+      x-error-codes:
+        bad_request: { status: 400, hint: 检查参数名/类型/范围 }
+        unauthorized: { status: 401, hint: 管理接口需要会话；公开接口不需要 }
+        site_locked: { status: 401, hint: 该路径不在匿名白名单内 }
+        forbidden: { status: 403, hint: 当前角色没有该动作 }
+        not_found: { status: 404, hint: 检查 slug/id 或发布状态 }
+        method_not_allowed: { status: 405, hint: 公开接口只读：GET/HEAD/OPTIONS }
+        conflict: { status: 409, hint: slug 重名或文件已存在 }
+        payload_too_large: { status: 413, hint: 见各类型体积上限 }
+        unsupported_media_type: { status: 415, hint: 只收 png/jpeg/webp/avif/gif、mp4/webm、zip }
+        media_non_compliant: { status: 422, hint: 先用 tools/prepare-upload.mjs 转码 }
+        import_incomplete: { status: 422, hint: details.missing 列出缺的字段 }
+        too_many_requests: { status: 429, hint: 按 Retry-After 等待 }
+        storage-verify-failed: { status: 500, hint: 重试；连续失败查 R2 绑定 }
+        internal_error: { status: 500, hint: 打开 DEBUG_API=1 看真实异常 }
+
+    Variant:
+      type: object
+      description: 降档变体（1080p 降分辨率 / 同分辨率 30fps）；按 bytes 升序
+      required: [label, url, bytes]
+      properties:
+        label:
+          type: string
+          description: 档位标签（`1080p` / `30fps` / `4K30` / `<height>p` / `alt`）
+          examples: ['1080p']
+        width: { type: [integer, 'null'], description: 变体宽（老数据可能为 null） }
+        height: { type: [integer, 'null'] }
+        fps: { type: [number, 'null'], description: 变体帧率（老数据可能为 null） }
+        bytes: { type: integer }
+        sha256: { type: [string, 'null'], description: 变体自身内容哈希 }
+        url: { type: string, description: 绝对直链（/media/... 或 CDN） }
+
+    Wallpaper:
+      type: object
+      required: [id, slug, title, kind, url, bytes]
+      properties:
+        id: { type: string }
+        slug: { type: string }
+        title: { type: string }
+        description: { type: string }
+        subtag: { type: string }
+        kind: { type: string, enum: [static, dynamic] }
+        mime: { type: [string, 'null'] }
+        bytes: { type: integer }
+        width: { type: [integer, 'null'] }
+        height: { type: [integer, 'null'] }
+        durationMs: { type: [integer, 'null'] }
+        fps: { type: [number, 'null'], description: 视频帧率（拿不到为 null） }
+        codec: { type: [string, 'null'], description: h264 / hevc / vp9 / av1 … }
+        pixFmt: { type: [string, 'null'], description: 像素格式（如 yuv420p；Worker 内可能为 null） }
+        hasAudio:
+          type: [boolean, 'null']
+          description: 1=有音轨、0=无音轨、null=未知（不要当 false 用）
+        tags:
+          type: array
+          items: { type: string }
+        featured: { type: boolean }
+        category:
+          type: [object, 'null']
+          properties:
+            id: { type: string }
+            slug: { type: [string, 'null'] }
+            name: { type: [string, 'null'] }
+        url: { type: string, description: 原文件直链 }
+        thumbUrl: { type: [string, 'null'], description: 卡片缩略图 }
+        posterUrl: { type: [string, 'null'], description: 首帧海报（1280 宽 WebP）；没有时用 thumbUrl 兜底 }
+        license: { type: [string, 'null'], description: 许可证标识（小写） }
+        source: { type: [string, 'null'], description: 来源 / 作者主页 }
+        author: { type: [string, 'null'] }
+        variants:
+          type: array
+          items: { $ref: '#/components/schemas/Variant' }
+        sha256: { type: [string, 'null'] }
+        updatedAt: { type: integer }
+        publishedAt: { type: [integer, 'null'] }
+        createdAt: { type: integer }
+
+    Facets:
+      type: object
+      properties:
+        categories:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              slug: { type: [string, 'null'] }
+              name: { type: [string, 'null'] }
+              count: { type: integer }
+        tags:
+          type: array
+          description: 与清单同源，按 count 降序，最多 50
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              count: { type: integer }
+        subtags:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              count: { type: integer }
+
+    WallpaperListData:
+      type: object
+      required: [items, total, hasMore, pageSize, facets]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Wallpaper' }
+        total: { type: integer }
+        hasMore: { type: boolean }
+        nextCursor: { type: [string, 'null'] }
+        page: { type: [integer, 'null'] }
+        pageSize: { type: integer }
+        pageCount: { type: integer }
+        offset: { type: integer }
+        sort: { type: string }
+        filters:
+          type: object
+          description: 仅回显历史四个筛选键（新参数不回显，保持老客户端 deepEqual 稳定）
+          properties:
+            category: { type: [string, 'null'] }
+            kind: { type: [string, 'null'] }
+            tag: { type: [string, 'null'] }
+            aspect: { type: [string, 'null'] }
+        facets: { $ref: '#/components/schemas/Facets' }
+
+    WallpaperListEnvelope:
+      type: object
+      required: [ok, data]
+      properties:
+        ok: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/WallpaperListData' }
+
+    WallpaperEnvelope:
+      type: object
+      required: [ok, data]
+      properties:
+        ok: { type: boolean, const: true }
+        data:
+          type: object
+          properties:
+            wallpaper: { $ref: '#/components/schemas/Wallpaper' }
+
+    CategoryListEnvelope:
+      type: object
+      properties:
+        ok: { type: boolean, const: true }
+        data:
+          type: object
+          properties:
+            categories:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: { type: string }
+                  slug: { type: string }
+                  name: { type: string }
+                  description: { type: string }
+                  sortOrder: { type: integer }
+                  isPublic: { type: boolean }
+                  wallpaperCount: { type: integer }
+                  publishedCount: { type: integer }
+                  createdAt: { type: integer }
+                  updatedAt: { type: integer }
+
+    TagListEnvelope:
+      type: object
+      properties:
+        ok: { type: boolean, const: true }
+        data:
+          type: object
+          properties:
+            tags:
+              type: array
+              items:
+                type: object
+                properties:
+                  tag: { type: string }
+                  count: { type: integer }
+                  categoryId: { type: [string, 'null'] }
+            aspects:
+              type: array
+              items: { type: string }
+            kinds:
+              type: array
+              items: { type: string }
+
+    SubtagListEnvelope:
+      type: object
+      properties:
+        ok: { type: boolean, const: true }
+        data:
+          type: object
+          properties:
+            subtags:
+              type: array
+              items:
+                type: object
+                properties:
+                  name: { type: string }
+                  count: { type: integer }
+
+    Manifest:
+      type: object
+      required: [apiVersion, generatedAt, etag, total, items]
+      properties:
+        apiVersion: { type: string, const: v1 }
+        generatedAt:
+          type: integer
+          description: 数据里最新的 updated_at（毫秒时间戳），同一批数据不会「变新」
+        etag:
+          type: string
+          description: 与响应头 ETag 同值（不含引号）
+        total: { type: integer }
+        items:
+          type: array
+          items:
+            type: object
+            required: [id, slug, kind, url, bytes, updatedAt]
+            properties:
+              id: { type: string }
+              slug: { type: string }
+              kind: { type: string, enum: [static, dynamic] }
+              url: { type: string }
+              bytes: { type: integer }
+              sha256: { type: [string, 'null'] }
+              width: { type: [integer, 'null'] }
+              height: { type: [integer, 'null'] }
+              fps: { type: [number, 'null'] }
+              variants:
+                type: array
+                items: { $ref: '#/components/schemas/Variant' }
+              posterUrl: { type: [string, 'null'] }
+              tags:
+                type: array
+                items: { type: string }
+              license: { type: [string, 'null'] }
+              updatedAt: { type: integer }
