@@ -55,3 +55,46 @@ test('公开 DTO：没有变体时字段存在且为空数组（老客户端读�
   assert.equal(withVariant.variants.length, 1);
   assert.equal(withVariant.url, '/media/wallpapers/wp_1/orig.mp4');
 });
+
+test('variants：label 以 store 为准，不再用 height 反算（4K@60 → 4K@30）', () => {
+  const KEY_4K30 = 'wallpapers/wp_1/9f3c1a2b3c4d5e6f.30fps.mp4';
+  const out = variantsDto({
+    variants: JSON.stringify([
+      // 同分辨率降帧：height 与原画相同（2160），label 必须原样出来
+      { label: '4K30', height: 2160, width: 3840, key: KEY_4K30, bytes: 2015122, sha256: 'aa' },
+      // 降分辨率档：label 是 1080p
+      { label: '1080p', height: 1080, width: 1920, key: KEY, bytes: 523756, sha256: 'bb' },
+    ]),
+  }, 'https://cdn.test');
+  assert.deepEqual(out.map((item) => item.label), ['1080p', '4K30']);
+  assert.equal(out[1].height, 2160);
+  assert.equal(out[1].url, `https://cdn.test/${KEY_4K30}`);
+  // 关键回归：4K30 那一档**不许**被说成 2160p（否则客户端分不清哪档是本机可播的）
+  assert.notEqual(out[1].label, '2160p');
+});
+
+test('variants：label 只认非空字符串，其余一律回落 height/alt（老库形状不变）', () => {
+  const cases = [
+    [{ height: 2160, key: KEY, bytes: 1 }, '2160p'],
+    [{ height: 2160, key: KEY, bytes: 1, label: '' }, '2160p'],
+    [{ height: 2160, key: KEY, bytes: 1, label: '   ' }, '2160p'],
+    [{ height: 2160, key: KEY, bytes: 1, label: 30 }, '2160p'],
+    [{ height: 2160, key: KEY, bytes: 1, label: null }, '2160p'],
+    [{ height: 2160, key: KEY, bytes: 1, label: ' 2K  ' }, '2K'],
+    [{ key: KEY, bytes: 1 }, 'alt'],
+  ];
+  for (const [item, want] of cases) {
+    const out = variantsDto({ variants: JSON.stringify([item]) });
+    assert.equal(out[0].label, want, `item=${JSON.stringify(item)}`);
+  }
+});
+
+test('公开 DTO：4K30 变体原样出现在 API 的 variants 里（插件按 label 选档用得到）', () => {
+  const dto = wallpaperDto(rowWith(JSON.stringify([
+    { label: '4K30', height: 2160, width: 3840, key: 'wallpapers/wp_1/x.30fps.mp4', bytes: 2015122 },
+  ])));
+  assert.equal(dto.variants.length, 1);
+  assert.equal(dto.variants[0].label, '4K30');
+  assert.equal(dto.variants[0].height, 2160);
+  assert.equal(dto.variants[0].url, '/media/wallpapers/wp_1/x.30fps.mp4');
+});

@@ -22,8 +22,31 @@ export function categoryDto(row) {
 }
 
 /**
- * 同一条壁纸的降档变体（目前是 1080p）。弱网用户靠它 5 秒出画面：
- * 4K 原画 40–50 MB，1080p 只有 5–8 MB。
+ * 变体 label 的唯一口径：**以 `variants` 列里存的 label 为准**，height 只当兜底。
+ *
+ * 为什么不能再用 `height` 反算：从 2026-11 起变体不再只有「降分辨率」一档，还有
+ * **同分辨率降帧**（4K@60 → 4K@30）。两者的 height 都是 2160，用 `height + 'p'` 反算
+ * 会把 `4K30` 说成 `2160p` —— 客户端拿到两个 2160 高的档（一个 60fps 原画、一个 30fps
+ * 变体）就分不清哪一档是「本机一定能播」的那份，选档只能退回本地转码。
+ * 老库里的记录没有 label 字段（`batch.py` 只写了 height/key/bytes/sha256），
+ * 这时仍按 `${height}p` 兜底，行为与升级前逐字节一致。
+ *
+ * @param {any} item variants 列里的一项
+ * @param {number|null} height 已归一的高度
+ * @returns {string}
+ */
+function variantLabel(item, height) {
+  const raw = item?.label;
+  if (typeof raw === 'string') {
+    const label = raw.trim();
+    if (label) return label;
+  }
+  return height ? `${height}p` : 'alt';
+}
+
+/**
+ * 同一条壁纸的降档变体（1080p / 同分辨率 30fps）。弱网用户靠它 5 秒出画面：
+ * 4K 原画 40–50 MB，1080p 只有 5–8 MB；4K@60 的解码失败靠 4K@30 变体兜住。
  *
  * DB 里 variants 是一列 JSON 文本（D1 迁移见 schema/014）。坏数据一律降级成
  * 空数组 —— 变体是「锦上添花」，绝不能因为一行脏 JSON 让整条壁纸 500。
@@ -39,7 +62,7 @@ export function variantsDto(row, mediaBase = '') {
       const height = Number(item.height) || null;
       const bytes = Number(item.bytes);
       return {
-        label: height ? `${height}p` : 'alt',
+        label: variantLabel(item, height),
         height,
         bytes,
         sha256: item.sha256 ?? null,
