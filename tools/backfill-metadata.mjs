@@ -211,6 +211,9 @@ async function fetchHead(url, bytes = 256 * 1024) {
 async function makePoster(url, outPath) {
   await runProcess(FFMPEG, [
     '-hide_banner', '-v', 'error',
+    // `-ss 0` 必须放在 `-i` 前面（输入侧 seek）：不加时 ffmpeg 会顺序解析整段，
+    // 个别 4K/长 GOP 素材会一直读到 180s 超时；加上后 ~6s 出首帧，画面仍是第 0 帧。
+    '-ss', '0',
     '-i', url,
     '-frames:v', '1',
     '-vf', `scale=${args.posterWidth}:-2`,
@@ -264,7 +267,7 @@ const rows = await d1(
      WHERE storage_key IS NOT NULL
      ORDER BY CASE WHEN mime LIKE 'video/%' THEN 0 WHEN mime LIKE 'image/%' THEN 1 ELSE 2 END, id`,
 );
-const picked = (args.only ? rows.filter((row) => row.slug === args.only) : rows)
+const picked = (args.only ? rows.filter((row) => row.slug === args.only || row.id === args.only) : rows)
   .slice(0, args.limit > 0 ? args.limit : rows.length);
 
 console.log(`[backfill] 共 ${rows.length} 条有文件，本次处理 ${picked.length} 条${args.dryRun ? '（dry-run）' : ''}`);
