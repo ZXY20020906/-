@@ -272,7 +272,7 @@ components:
     featured:
       name: featured
       in: query
-      description: `1` / `true` 只返回置顶
+      description: 传 1 / true 只返回置顶
       schema: { type: string, enum: ['0', '1', 'true', 'false'] }
     sort:
       name: sort
