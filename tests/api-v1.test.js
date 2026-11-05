@@ -146,6 +146,42 @@ test('ETag：v1 清单带 ETag，If-None-Match 命中返回 304 且无 body', as
   assert.equal(weak.status, 304);
 });
 
+test('边缘缓存：普通请求命中缓存（HIT），带 If-None-Match 时绕过缓存并回 304', async (t) => {
+  const { env } = makeSite();
+  const store = new Map();
+  const saved = globalThis.caches;
+  globalThis.caches = {
+    default: {
+      async match(request) {
+        const hit = store.get(request.url);
+        return hit ? new Response(hit.text, { status: hit.status, headers: new Headers(hit.headers) }) : undefined;
+      },
+      async put(request, response) {
+        const text = await response.text();
+        store.set(request.url, { status: response.status, headers: new Headers(response.headers), text });
+      },
+    },
+  };
+  t.after(() => {
+    if (saved === undefined) delete globalThis.caches;
+    else globalThis.caches = saved;
+  });
+
+  const url = 'https://example.test/api/v1/public/wallpapers?limit=2';
+  const first = await handle(new Request(url), env);
+  assert.equal(first.status, 200);
+  const etag = first.headers.get('etag');
+  await first.text();
+
+  const warm = await handle(new Request(url), env);
+  assert.equal(warm.headers.get('x-folia-edge'), 'HIT', '普通请求应命中缓存');
+  await warm.text();
+
+  const conditional = await handle(new Request(url, { headers: { 'if-none-match': etag } }), env);
+  assert.equal(conditional.status, 304, '缓存不能把条件请求的 304 盖成 200');
+  assert.equal(await conditional.text(), '');
+});
+
 test('manifest：形状完整（apiVersion/generatedAt/etag/total/items），且与清单同口径', async () => {
   const { env } = makeSite();
   const res = await call(env, '/api/v1/public/manifest.json', { useGate: true });

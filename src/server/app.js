@@ -258,8 +258,13 @@ export async function handle(request, env) {
     // 公开只读接口在边缘缓存 30 秒：插件反复打开列表时不用每次都查 D1。
     // 只缓存公开路由（GET/HEAD），带身份的管理接口一律不缓存。
     // cacheKey 只吃白名单参数（cacheKeyUrl），未知 query 不会把缓存击穿。
+    //
+    // 带 If-None-Match 的请求**绕过边缘缓存**：缓存命中时直接回缓存的 200 会丢掉 304，
+    // 客户端每次条件请求都要重下整包（2xx 与 304 语义就废了）。绕过后由 handler
+    // 重新算 ETag 并正确回 304；条件请求本来就不多，这点回源成本值得。
     const edgeCacheable = route.cors
       && (request.method === 'GET' || request.method === 'HEAD')
+      && !request.headers.get('if-none-match')
       && typeof caches !== 'undefined'
       && caches.default;
     const cacheKey = edgeCacheable ? new Request(cacheKeyUrl(url), { method: 'GET' }) : null;
