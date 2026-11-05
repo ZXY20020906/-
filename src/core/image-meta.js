@@ -48,9 +48,6 @@ function ascii(bytes, start, end) {
 function be16(b, i) {
   return (b[i] << 8) | b[i + 1];
 }
-function be24(b, i) {
-  return (b[i] << 16) | (b[i + 1] << 8) | b[i + 2];
-}
 function be32(b, i) {
   return ((b[i] << 24) >>> 0) + ((b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]);
 }

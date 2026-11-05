@@ -56,17 +56,22 @@ export function constantTimeEqual(a, b) {
   return diff === 0;
 }
 
-export function bytesToMb(bytes) {
-  return Math.round((Number(bytes || 0) / (1024 * 1024)) * 10) / 10;
-}
-
+/** JSON 解析，坏数据一律回落到 `fallback`（**不抛**：一行脏数据不该让整条记录 500）。 */
 export function safeJsonParse(value, fallback) {
   if (value === null || value === undefined || value === '') return fallback;
   try {
     return JSON.parse(value);
   } catch {
+    // 刻意不抛也不打日志：调用方（DTO/列表）每次都可能在读老库里的脏 JSON，
+    // 逐行打日志会刷屏，而「读到坏数据 ⇒ 用兜底值」本身就是预期的降级行为。
     return fallback;
   }
+}
+
+/** 同 safeJsonParse，但只接受数组（`tags` 这类列）：非数组一律回落到 `fallback`。 */
+export function safeJsonArray(value, fallback = []) {
+  const parsed = safeJsonParse(value, fallback);
+  return Array.isArray(parsed) ? parsed : fallback;
 }
 
 /**

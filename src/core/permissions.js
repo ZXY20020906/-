@@ -13,10 +13,6 @@ import { forbidden } from './errors.js';
 export const ROLE = Object.freeze({ ADMIN: 'admin', EDITOR: 'editor' });
 export const ROLES = Object.freeze([ROLE.ADMIN, ROLE.EDITOR]);
 export const ROLE_LABELS = Object.freeze({ admin: '管理员', editor: '编辑' });
-export const ROLE_HINTS = Object.freeze({
-  admin: '可管理分类、成员、发布与删除任何壁纸，可查审计日志',
-  editor: '可上传壁纸并维护自己上传的草稿，可选择已有分类，不能发布/删除',
-});
 
 export const ACTION = Object.freeze({
   WALLPAPER_READ: 'wallpaper:read',

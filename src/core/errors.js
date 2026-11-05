@@ -53,6 +53,3 @@ export const storageVerifyFailed = (message = 'R2 写入校验失败（对象缺
  */
 export const importIncomplete = (message = '导入失败：缺少必填字段', details = null) =>
   new HttpError(422, 'import_incomplete', message, details);
-
-export const internal = (message = '服务器内部错误') =>
-  new HttpError(500, 'internal_error', message);

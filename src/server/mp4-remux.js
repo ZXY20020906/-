@@ -142,5 +142,3 @@ export function repairMp4Faststart(bytes) {
   }
   return out;
 }
-
-export const __test = { boxAt, siblings };

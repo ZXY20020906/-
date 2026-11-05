@@ -34,10 +34,6 @@ export function failure(error) {
   });
 }
 
-export function noContent(extraHeaders = {}) {
-  return new Response(null, { status: 204, headers: { ...BASE_HEADERS, ...extraHeaders } });
-}
-
 /** 读 JSON 请求体，带类型与体积校验。 */
 export async function readJson(request, { maxBytes = 512 * 1024 } = {}) {
   const contentType = request.headers.get('content-type') ?? '';

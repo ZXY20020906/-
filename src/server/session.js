@@ -31,8 +31,6 @@ export const SESSION_IDLE_MS = 60 * 60 * 1000;
 /** last_seen_at 最多每分钟写一次库。 */
 export const SESSION_TOUCH_MS = 60 * 1000;
 
-const DEVICE_RE = /^[A-Za-z0-9_-]{43}$/;
-
 function parseCookieHeader(header) {
   const out = new Map();
   if (!header) return out;
@@ -56,10 +54,6 @@ export function sessionTokenFromRequest(request) {
 
 export function deviceIdFromRequest(request) {
   return cookiesOf(request).get(DEVICE_COOKIE) ?? null;
-}
-
-export function isValidDeviceId(value) {
-  return typeof value === 'string' && DEVICE_RE.test(value);
 }
 
 export function isSecureRequest(request) {
@@ -139,6 +133,19 @@ export async function createSession(env, user, request) {
   };
 }
 
+/**
+ * 会话表里「顺手做」的写（删过期行 / 刷新 last_seen_at）都吞掉异常，理由统一写在这里：
+ *
+ * - 这些写不是本次请求的业务结果，令牌**已经**被判定为有效或无效了；
+ *   为了「顺手清理」把一个正常请求变成 500 是更糟的取舍，下次请求会重新判一次。
+ * - 刻意不逐次 console.warn：这是每个请求都走的热路径，D1 一抖就会把日志刷满，
+ *   真要看失败应该去看 D1/Worker 的错误指标，而不是在会话路径上打点。
+ * 结论：**只有这三个「会话维护写」允许静默失败**，其余 catch 必须留痕。
+ */
+function swallowSessionWrite(promise) {
+  return promise.catch(() => {});
+}
+
 /** @returns {Promise<{user: object, tokenHash: string}|null>} */
 export async function readSession(env, request) {
   const token = sessionTokenFromRequest(request);
@@ -149,7 +156,7 @@ export async function readSession(env, request) {
 
   const now = Date.now();
   if (Number(row.expires_at) <= now) {
-    await run(env, Q.deleteSession, tokenHash).catch(() => {});
+    await swallowSessionWrite(run(env, Q.deleteSession, tokenHash));
     return null;
   }
   if (row.active !== 1 && row.active !== true) return null;
@@ -164,13 +171,13 @@ export async function readSession(env, request) {
   // 闲置超时
   const lastSeen = Number(row.last_seen_at ?? row.created_at ?? 0);
   if (!lastSeen || now - lastSeen > SESSION_IDLE_MS) {
-    await run(env, Q.deleteSession, tokenHash).catch(() => {});
+    await swallowSessionWrite(run(env, Q.deleteSession, tokenHash));
     return null;
   }
 
   // 有活动就续期，但最多每分钟写一次库
   if (now - lastSeen > SESSION_TOUCH_MS) {
-    await run(env, Q.touchSession, now, tokenHash).catch(() => {});
+    await swallowSessionWrite(run(env, Q.touchSession, now, tokenHash));
   }
 
   return { user: buildUser(row), tokenHash };
@@ -191,8 +198,4 @@ export async function destroySession(env, tokenHash) {
 
 export async function destroyAllSessions(env, userId) {
   await run(env, Q.deleteUserSessions, userId);
-}
-
-export async function pruneExpiredSessions(env) {
-  await run(env, Q.deleteExpiredSessions, Date.now()).catch(() => {});
 }

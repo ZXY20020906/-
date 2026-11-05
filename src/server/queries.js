@@ -3,7 +3,14 @@
  * 好处：一份文件就能用 sqlite3 做语法/字段名校验（见 tools/check-sql.py）。
  *
  * 约定：占位符按出现顺序编号（? 或 ?N），参数个数与顺序必须和调用处一致。
+ *
+ * 复用的三条规则（**不要再抄第四份**）：
+ *   - 片段一律写成「接收占位符编号、返回 SQL 文本」的小函数（tagMatch / aspectMatch /
+ *     extraFilters / adminWallpaperFilters）。这样同一段业务规则只有一份定义，
+ *     而各条查询仍能保留自己的编号（编号一改，路由层的 bind 顺序就得跟着改，出错面大）。
+ *   - 阈值（宽高比 0.06）从 core/media-limits.js 来，不写字面量。
  */
+import { ASPECT_TOLERANCE } from '../core/aspects.js';
 
 const PUBLIC_COLUMNS = `w.id, w.slug, w.title, w.description, w.subtag, w.category_id, w.kind, w.mime, w.bytes, w.width, w.height,
   w.duration_ms, w.tags, w.featured, w.sort_order, w.published_at, w.created_at, w.updated_at,
@@ -41,14 +48,27 @@ const tagMatch = (placeholder) => `EXISTS (SELECT 1 FROM json_each(w.tags) j
     WHERE j.value IN (SELECT value FROM json_each(${placeholder})))`;
 
 /**
- * 列表额外筛选（Wallpaper Engine 那套）：标签 + 分辨率。
- * 用 ?8/?9 而不是把前面的重新编号——SQL 里编号可以乱序出现，
- * 这样新增筛选不用动已有游标参数，出错面小得多。
+ * 宽高比匹配（容差见 core/media-limits.js 的 ASPECT_TOLERANCE）。
+ * 清单 / facets / 计数三处原来各抄了一遍这段 ABS(...) < 0.06，现在只有这里一份。
  */
-const PUBLIC_EXTRA = `AND (?8 IS NULL OR ${tagMatch('?8')})
-  AND (?9 IS NULL OR (w.width > 0 AND w.height > 0
-    AND ABS((w.width * 1.0 / w.height) - ?9) < 0.06))
-  AND (?11 IS NULL OR w.subtag = ?11)`;
+const aspectMatch = (placeholder) => `(w.width > 0 AND w.height > 0
+    AND ABS((w.width * 1.0 / w.height) - ${placeholder}) < ${ASPECT_TOLERANCE})`;
+
+/**
+ * 列表额外筛选（Wallpaper Engine 那套）：标签 + 分辨率 + 子标签。
+ *
+ * 参数是**占位符编号**而不是值：PUBLIC_EXTRA 用 ?8/?9/?11（前面还有游标 ?5/?6/?7），
+ * 而 publicCount 用 ?5/?6/?7。同一段规则、不同编号，所以只能传编号进来。
+ * 用 ?N 而不是把前面的重新编号——SQL 里编号可以乱序出现，这样新增筛选不用动已有
+ * 游标参数，出错面小得多。
+ */
+function extraFilters({ tag, aspect, subtag }) {
+  return `AND (${tag} IS NULL OR ${tagMatch(tag)})
+  AND (${aspect} IS NULL OR ${aspectMatch(aspect)})
+  AND (${subtag} IS NULL OR w.subtag = ${subtag})`;
+}
+
+const PUBLIC_EXTRA = extraFilters({ tag: '?8', aspect: '?9', subtag: '?11' });
 
 /** 公开子标签列表：只统计已发布、有文件的 */
 export const PUBLIC_SUBTAGS = `SELECT w.subtag AS name, COUNT(*) AS n FROM wallpapers w
@@ -73,15 +93,8 @@ export const PUBLIC_SUBTAGS = `SELECT w.subtag AS name, COUNT(*) AS n FROM wallp
 export const PUBLIC_FACETS = `WITH base AS (
     SELECT w.id, w.category_id, w.subtag, w.tags
     FROM wallpapers w LEFT JOIN categories c ON c.id = w.category_id
-    WHERE ${PUBLIC_VISIBLE}
-      AND (?1 IS NULL OR c.slug = ?1)
-      AND (?2 IS NULL OR w.kind = ?2)
-      AND (?3 IS NULL OR w.title LIKE ?3)
-      AND (?4 = 0 OR w.featured = 1)
-      AND (?5 IS NULL OR ${tagMatch('?5')})
-      AND (?6 IS NULL OR (w.width > 0 AND w.height > 0
-        AND ABS((w.width * 1.0 / w.height) - ?6) < 0.06))
-      AND (?7 IS NULL OR w.subtag = ?7)
+    WHERE ${PUBLIC_FILTERS}
+      ${extraFilters({ tag: '?5', aspect: '?6', subtag: '?7' })}
   )
   SELECT 'category' AS facet, b.category_id AS id, c.slug AS slug, c.name AS name,
       NULL AS value, COUNT(*) AS n
@@ -96,6 +109,40 @@ export const PUBLIC_FACETS = `WITH base AS (
     FROM base b
     WHERE b.subtag IS NOT NULL AND b.subtag <> ''
     GROUP BY b.subtag`;
+
+/**
+ * 后台列表 / 计数的**同一套筛选条件**（原来抄了两份，改一处忘另一处就会让
+ * 「列表 12 条、总数 15 条」对不上）。
+ *
+ * 为什么参数是四个编号而不是从 1 排起：`adminListWallpapers` 的 ?7/?8 已经被
+ * `LIMIT/OFFSET` 占了，所以后四条筛选往后挪到 ?9..?12；而 count 没有分页，正好是 ?7..?10。
+ * 编号不同、规则相同，所以由调用方把编号传进来。
+ */
+function adminWallpaperFilters({ likes, review, subtag, media }) {
+  return `(?1 IS NULL OR w.status = ?1)
+      AND (?2 IS NULL OR w.category_id = ?2)
+      AND (?3 IS NULL OR w.kind = ?3)
+      AND (?4 IS NULL OR w.created_by = ?4)
+      AND (?5 IS NULL OR w.title LIKE ?5)
+      AND (?6 IS NULL OR w.tags LIKE ?6)
+      AND (?${likes} IS NULL OR EXISTS (SELECT 1 FROM likes l WHERE l.wallpaper_id = w.id AND l.user_id = ?${likes}))
+      AND (?${review} IS NULL OR w.review_status = ?${review})
+      AND (?${subtag} IS NULL OR w.subtag = ?${subtag})
+      AND (?${media} IS NULL
+        OR (?${media} = 'video' AND w.mime LIKE 'video/%')
+        OR (?${media} = 'zip' AND w.mime = 'application/zip')
+        OR (?${media} = 'image' AND w.mime LIKE 'image/%'))`;
+}
+
+/**
+ * 标签计数（后台标签云 / 公开标签云）：同一段 FROM + json_each + GROUP BY，
+ * 只有 WHERE 和 LIMIT 不同。原来两份几乎逐字相同，这里只留一份。
+ */
+function tagCounts(where, tail = '') {
+  return `SELECT t.value AS tag, COUNT(*) AS n
+    FROM wallpapers w, json_each(w.tags) t
+    ${where} GROUP BY t.value ORDER BY n DESC, t.value${tail}`;
+}
 
 export const Q = {
   // ------------------------------------------------------------------ users
@@ -122,7 +169,6 @@ export const Q = {
   touchSession: `UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?`,
   deleteSession: `DELETE FROM sessions WHERE token_hash = ?`,
   deleteUserSessions: `DELETE FROM sessions WHERE user_id = ?`,
-  deleteExpiredSessions: `DELETE FROM sessions WHERE expires_at < ?`,
 
   // ------------------------------------------------------------- categories
   listCategories: `SELECT c.id, c.slug, c.name, c.description, c.sort_order, c.is_public, c.created_at, c.updated_at,
@@ -233,35 +279,11 @@ export const Q = {
     FROM wallpapers w
     LEFT JOIN categories c ON c.id = w.category_id
     LEFT JOIN users u ON u.id = w.created_by
-    WHERE (?1 IS NULL OR w.status = ?1)
-      AND (?2 IS NULL OR w.category_id = ?2)
-      AND (?3 IS NULL OR w.kind = ?3)
-      AND (?4 IS NULL OR w.created_by = ?4)
-      AND (?5 IS NULL OR w.title LIKE ?5)
-      AND (?6 IS NULL OR w.tags LIKE ?6)
-      AND (?9 IS NULL OR EXISTS (SELECT 1 FROM likes l WHERE l.wallpaper_id = w.id AND l.user_id = ?9))
-      AND (?10 IS NULL OR w.review_status = ?10)
-      AND (?11 IS NULL OR w.subtag = ?11)
-      AND (?12 IS NULL
-        OR (?12 = 'video' AND w.mime LIKE 'video/%')
-        OR (?12 = 'zip' AND w.mime = 'application/zip')
-        OR (?12 = 'image' AND w.mime LIKE 'image/%'))
+    WHERE ${adminWallpaperFilters({ likes: 9, review: 10, subtag: 11, media: 12 })}
     ORDER BY w.updated_at DESC, w.id DESC
     LIMIT ?7 OFFSET ?8`,
   adminCountWallpapers: `SELECT COUNT(*) AS n FROM wallpapers w
-    WHERE (?1 IS NULL OR w.status = ?1)
-      AND (?2 IS NULL OR w.category_id = ?2)
-      AND (?3 IS NULL OR w.kind = ?3)
-      AND (?4 IS NULL OR w.created_by = ?4)
-      AND (?5 IS NULL OR w.title LIKE ?5)
-      AND (?6 IS NULL OR w.tags LIKE ?6)
-      AND (?7 IS NULL OR EXISTS (SELECT 1 FROM likes l WHERE l.wallpaper_id = w.id AND l.user_id = ?7))
-      AND (?8 IS NULL OR w.review_status = ?8)
-      AND (?9 IS NULL OR w.subtag = ?9)
-      AND (?10 IS NULL
-        OR (?10 = 'video' AND w.mime LIKE 'video/%')
-        OR (?10 = 'zip' AND w.mime = 'application/zip')
-        OR (?10 = 'image' AND w.mime LIKE 'image/%'))`,
+    WHERE ${adminWallpaperFilters({ likes: 7, review: 8, subtag: 9, media: 10 })}`,
 
   // ------------------------------------------------------------ public feed
   publicRecent: `SELECT ${PUBLIC_COLUMNS} FROM wallpapers w LEFT JOIN categories c ON c.id = w.category_id
@@ -300,21 +322,16 @@ export const Q = {
 
   publicCount: `SELECT COUNT(*) AS n FROM wallpapers w LEFT JOIN categories c ON c.id = w.category_id
     WHERE ${PUBLIC_FILTERS}
-      AND (?5 IS NULL OR ${tagMatch('?5')})
-      AND (?6 IS NULL OR (w.width > 0 AND w.height > 0
-        AND ABS((w.width * 1.0 / w.height) - ?6) < 0.06))
-      AND (?7 IS NULL OR w.subtag = ?7)`,
+      ${extraFilters({ tag: '?5', aspect: '?6', subtag: '?7' })}`,
 
   /** 标签云：Wallpaper Engine 左侧那一列标签，按出现次数排序 */
-  publicTags: `SELECT t.value AS tag, COUNT(*) AS n
-    FROM wallpapers w, json_each(w.tags) t
-    WHERE w.status = 'published' AND w.storage_key IS NOT NULL
-    GROUP BY t.value ORDER BY n DESC, t.value LIMIT 40`,
+  publicTags: tagCounts(
+    `WHERE w.status = 'published' AND w.storage_key IS NOT NULL`,
+    ' LIMIT 40',
+  ),
 
   /** 后台用：不限状态地统计每个标签用了多少次 */
-  adminTagStats: `SELECT t.value AS tag, COUNT(*) AS n
-    FROM wallpapers w, json_each(w.tags) t
-    GROUP BY t.value ORDER BY n DESC, t.value`,
+  adminTagStats: tagCounts(''),
 
   // ------------------------------------------------------------------ tags
   listTags: `SELECT * FROM tags ORDER BY sort_order, name`,
