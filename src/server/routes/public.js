@@ -12,12 +12,13 @@
  */
 import { Q } from '../queries.js';
 import { PUBLIC_LIST_BY_SORT } from '../queries.js';
-import { all, first } from '../db.js';
+import { all, first, isD1Unavailable } from '../db.js';
 import { json } from '../http.js';
 import { mediaBaseFor, publicUrl } from '../storage.js';
 import { sha256Hex } from '../util.js';
 import { etagMatches } from '../../core/etag.js';
 import { KINDS, STATUSES } from '../../core/validate.js';
+import { snapshotPluginFeed } from '../public-api.js';
 import * as v1 from './public-v1.js';
 
 /** 以下五个是 v1 的兼容转发：签名与返回值完全不变。 */
@@ -36,31 +37,40 @@ export const getWallpaper = (ctx) => v1.getWallpaper(ctx);
  * - 带 ETag，插件可 If-None-Match 轮询，没变化时 304，几乎不耗流量。
  */
 export async function pluginFeed({ env, request, url }) {
-  const rows = await all(env, Q.pluginFeed);
   const wanted = url.searchParams.get('type') || 'all';
-
-  const items = rows.map((row) => {
-    const mime = row.mime ?? '';
-    const type = mime.startsWith('video/') ? 'video'
-      : mime.startsWith('image/') ? 'image'
-        : mime === 'application/zip' ? 'bundle' : 'other';
-    const url_ = publicUrl(row.storage_key, mediaBaseFor(env));
-    return {
-      id: row.id,
-      title: row.title,
-      type,
-      // video / image 可以直接用；bundle 只能下载，得靠 Wallpaper Engine 才能用
-      playable: type === 'video' || type === 'image',
-      url: url_,
-      thumbUrl: publicUrl(row.thumb_key, mediaBaseFor(env)) ?? url_,
-      mime,
-      bytes: Number(row.bytes ?? 0),
-      width: row.width ?? null,
-      height: row.height ?? null,
-      durationMs: row.duration_ms ?? null,
-      updatedAt: Number(row.updated_at ?? 0),
-    };
-  }).filter((item) => (wanted === 'all' ? true : item.type === wanted));
+  let items;
+  let snapshotMeta = null;
+  try {
+    const rows = await all(env, Q.pluginFeed);
+    items = rows.map((row) => {
+      const mime = row.mime ?? '';
+      const type = mime.startsWith('video/') ? 'video'
+        : mime.startsWith('image/') ? 'image'
+          : mime === 'application/zip' ? 'bundle' : 'other';
+      const url_ = publicUrl(row.storage_key, mediaBaseFor(env));
+      return {
+        id: row.id,
+        title: row.title,
+        type,
+        // video / image 可以直接用；bundle 只能下载，得靠 Wallpaper Engine 才能用
+        playable: type === 'video' || type === 'image',
+        url: url_,
+        thumbUrl: publicUrl(row.thumb_key, mediaBaseFor(env)) ?? url_,
+        mime,
+        bytes: Number(row.bytes ?? 0),
+        width: row.width ?? null,
+        height: row.height ?? null,
+        durationMs: row.duration_ms ?? null,
+        updatedAt: Number(row.updated_at ?? 0),
+      };
+    }).filter((item) => (wanted === 'all' ? true : item.type === wanted));
+  } catch (error) {
+    if (!isD1Unavailable(error) || env?.PUBLIC_SNAPSHOT_FALLBACK === '0') throw error;
+    const fallback = snapshotPluginFeed({ url });
+    items = fallback.items;
+    snapshotMeta = { degraded: true, snapshotGeneratedAt: fallback.snapshotGeneratedAt };
+    console.warn('[plugin-feed] D1 不可用，回落快照', error?.message ?? error);
+  }
 
   const stamp = await sha256Hex(items.map((item) => `${item.id}:${item.updatedAt}`).join('|') || 'empty');
   const etag = `"${stamp.slice(0, 24)}"`;
@@ -80,16 +90,30 @@ export async function pluginFeed({ env, request, url }) {
       bundle: items.filter((item) => item.type === 'bundle').length,
     },
     items,
+    ...(snapshotMeta ?? {}),
   }, { headers });
 }
 
 /** 供后台初始化时探测：是否已初始化、可用排序值等。 */
 export async function meta({ env }) {
-  const total = Number((await first(env, Q.countUsers))?.n ?? 0);
+  let initialized = false;
+  let degraded = false;
+  try {
+    const total = Number((await first(env, Q.countUsers))?.n ?? 0);
+    initialized = total > 0;
+  } catch (error) {
+    if (!isD1Unavailable(error) || env?.PUBLIC_SNAPSHOT_FALLBACK === '0') throw error;
+    // 快照来自已初始化的生产站。D1 不可用时仍按「已初始化」返回，前台才会继续走
+    // 公开接口（它们自己有快照兜底），而不是回退到并不存在的静态 catalog。
+    initialized = true;
+    degraded = true;
+    console.warn('[meta] D1 不可用，按已初始化返回', error?.message ?? error);
+  }
   return json({
-    initialized: total > 0,
+    initialized,
     statuses: STATUSES,
     kinds: KINDS,
     sorts: [...Object.keys(PUBLIC_LIST_BY_SORT)],
+    ...(degraded ? { degraded: true } : {}),
   });
 }

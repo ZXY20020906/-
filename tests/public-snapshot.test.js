@@ -99,6 +99,19 @@ test('快照回落：categories / tags / subtags / 详情 / manifest 全部 200'
   const missing = await call(env, '/api/v1/public/wallpapers/no-such-wallpaper');
   assert.equal(missing.status, 404);
 
+  // 前台 detectMode 会先问 /api/meta；D1 不可用时不能 500，否则会回退到不存在的静态 catalog。
+  const meta = await call(env, '/api/meta');
+  assert.equal(meta.status, 200);
+  assert.equal(meta.body.data.initialized, true);
+  assert.equal(meta.body.data.degraded, true);
+
+  // 历史插件版本可能还在用 /api/plugin/feed；同样要有快照兜底。
+  const feed = await call(env, '/api/plugin/feed?type=video');
+  assert.equal(feed.status, 200);
+  assert.ok(feed.body.data.count > 0);
+  assert.ok(feed.body.data.items.every((item) => item.type === 'video'));
+  assert.equal(feed.body.data.degraded, true);
+
   const manifest = await call(env, '/api/v1/public/manifest.json');
   assert.equal(manifest.status, 200);
   assert.equal(manifest.body.total, 110);

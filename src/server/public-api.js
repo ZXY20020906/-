@@ -475,6 +475,47 @@ function snapshotManifestPayload() {
   return { ...SNAPSHOT.manifest, ...snapshotMeta() };
 }
 
+/**
+ * `/api/plugin/feed` 的快照版本（插件精简清单）。
+ *
+ * 这个接口不是 v1 契约的一部分，但历史插件版本可能还在用；D1 不可用时同样不能 500。
+ * 字段映射与 `routes/public.js` 的 live 版本保持一致（type/playable/thumbUrl/updatedAt）。
+ */
+export function snapshotPluginFeed({ url }) {
+  const wanted = url.searchParams.get('type') || 'all';
+  const items = (SNAPSHOT.items ?? []).map((item) => {
+    const mime = item.mime ?? '';
+    const type = mime.startsWith('video/') ? 'video'
+      : mime.startsWith('image/') ? 'image'
+        : mime === 'application/zip' ? 'bundle' : 'other';
+    return {
+      id: item.id,
+      title: item.title,
+      type,
+      playable: type === 'video' || type === 'image',
+      url: item.url,
+      thumbUrl: item.thumbUrl ?? item.url,
+      mime,
+      bytes: Number(item.bytes ?? 0),
+      width: item.width ?? null,
+      height: item.height ?? null,
+      durationMs: item.durationMs ?? null,
+      updatedAt: Number(item.updatedAt ?? 0),
+    };
+  }).filter((item) => (wanted === 'all' ? true : item.type === wanted));
+  return {
+    version: 1,
+    count: items.length,
+    counts: {
+      video: items.filter((item) => item.type === 'video').length,
+      image: items.filter((item) => item.type === 'image').length,
+      bundle: items.filter((item) => item.type === 'bundle').length,
+    },
+    items,
+    ...snapshotMeta(),
+  };
+}
+
 function fallbackOrThrow(error, env, build) {
   if (!shouldFallback(error, env)) throw error;
   noteSnapshotFallback(error);
