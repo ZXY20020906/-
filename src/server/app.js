@@ -131,8 +131,12 @@ const ROUTES = DEFINITIONS.map(compile);
  */
 export const CACHE_PARAMS = [
   'category', 'kind', 'q', 'sort', 'featured', 'page', 'cursor', 'limit', 'tag', 'aspect', 'subtag', 'type',
-  // 第一期新增：许可证筛选（第二期的数值/可播筛选依次追加在后面，顺序固定）
+  // 第一期：许可证筛选
   'license',
+  // 第二期：尺寸 / 时长 / 体积 / 帧率上限 / 可播档位 / 音轨（顺序固定，新参数只能往后加）
+  'minWidth', 'maxWidth', 'minHeight', 'maxHeight',
+  'minDurationMs', 'maxDurationMs', 'minBytes', 'maxBytes',
+  'fpsMax', 'playable', 'audio',
 ];
 
 export function cacheKeyUrl(url) {

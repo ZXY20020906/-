@@ -46,7 +46,8 @@ const PUBLIC_FILTERS = `${PUBLIC_VISIBLE}
  * 语义差别只有一处：LIKE 对 ASCII 大小写不敏感，这里是逐字节相等（更符合「标签精确匹配」）。
  */
 const tagMatch = (placeholder) => `EXISTS (SELECT 1 FROM json_each(w.tags) j
-    WHERE j.value IN (SELECT value FROM json_each(${placeholder})))`;
+    LEFT JOIN tag_aliases a ON a.alias = j.value
+    WHERE COALESCE(a.canonical, j.value) IN (SELECT value FROM json_each(${placeholder})))`;
 
 /**
  * 宽高比匹配（容差见 core/media-limits.js 的 ASPECT_TOLERANCE）。
@@ -56,15 +57,24 @@ const aspectMatch = (placeholder) => `(w.width > 0 AND w.height > 0
     AND ABS((w.width * 1.0 / w.height) - ${placeholder}) < ${ASPECT_TOLERANCE})`;
 
 /**
- * 列表额外筛选（素材网那套）：标签 + 宽高比 + 子标签 + 许可证。
+ * 列表额外筛选（素材网那套）：标签 + 宽高比 + 子标签 + 许可证 + 数值/可播/音轨。
  *
- * 参数是**占位符编号**而不是值：清单用 ?8/?9/?11/?12，计数与 facets 用 ?5/?6/?7/?8。
+ * 参数是**占位符编号**而不是值：清单用 ?8…?23，计数与 facets 用 ?5…?19。
  * 同一段规则、不同编号，所以只能传编号进来。用 ?N 而不是把前面的重新编号——
  * SQL 里编号可以乱序出现，这样新增筛选不用动已有游标参数，出错面小得多。
  *
- * 后续（第二期）的数值/可播/音轨参数也走这里：**只增不改**，已有编号永不挪位。
+ * 语义约定（与 docs/openapi.yaml 一致）：
+ *   - 数值筛选对**条目自身**生效；字段为 NULL（未知）时**不匹配**（不能证明满足就别放行）；
+ *   - `playable` 是「某个档位存在**且**满足 1920×1080@30 上限」：
+ *       original ⇒ 原画本身就在 1080p30 内；1080p30 ⇒ 原画或某个 variant 满足；
+ *     变体缺 fps 时视为满足（ingest 只放行 ≤30fps 的变体，历史数据在回填前没有 fps）；
+ *   - `audio=1/0` 只匹配 `has_audio` 非空的条目（UNKNOWN 不参与）。
  */
-function extraFilters({ tag, aspect, subtag, license }) {
+function extraFilters({
+  tag, aspect, subtag, license,
+  minWidth, maxWidth, minHeight, maxHeight,
+  minDurationMs, maxDurationMs, minBytes, maxBytes, fpsMax, playable, audio,
+}) {
   const clauses = [
     `AND (${tag} IS NULL OR ${tagMatch(tag)})`,
     `AND (${aspect} IS NULL OR ${aspectMatch(aspect)})`,
@@ -74,10 +84,50 @@ function extraFilters({ tag, aspect, subtag, license }) {
   if (license) {
     clauses.push(`AND (${license} IS NULL OR LOWER(COALESCE(w.license, '')) = ${license})`);
   }
+  if (minWidth) clauses.push(`AND (${minWidth} IS NULL OR w.width >= ${minWidth})`);
+  if (maxWidth) clauses.push(`AND (${maxWidth} IS NULL OR w.width <= ${maxWidth})`);
+  if (minHeight) clauses.push(`AND (${minHeight} IS NULL OR w.height >= ${minHeight})`);
+  if (maxHeight) clauses.push(`AND (${maxHeight} IS NULL OR w.height <= ${maxHeight})`);
+  if (minDurationMs) clauses.push(`AND (${minDurationMs} IS NULL OR w.duration_ms >= ${minDurationMs})`);
+  if (maxDurationMs) clauses.push(`AND (${maxDurationMs} IS NULL OR w.duration_ms <= ${maxDurationMs})`);
+  if (minBytes) clauses.push(`AND (${minBytes} IS NULL OR w.bytes >= ${minBytes})`);
+  if (maxBytes) clauses.push(`AND (${maxBytes} IS NULL OR w.bytes <= ${maxBytes})`);
+  if (fpsMax) clauses.push(`AND (${fpsMax} IS NULL OR w.fps <= ${fpsMax})`);
+  if (audio) clauses.push(`AND (${audio} IS NULL OR w.has_audio = ${audio})`);
+  if (playable) {
+    clauses.push(`AND (${playable} IS NULL OR (
+      (${playable} = 'original'
+        AND w.width IS NOT NULL AND w.height IS NOT NULL AND w.fps IS NOT NULL
+        AND w.width <= 1920 AND w.height <= 1080 AND w.fps <= 30)
+      OR (${playable} = '1080p30' AND (
+        (w.width IS NOT NULL AND w.height IS NOT NULL AND w.fps IS NOT NULL
+          AND w.width <= 1920 AND w.height <= 1080 AND w.fps <= 30)
+        OR EXISTS (SELECT 1 FROM json_each(w.variants) v
+          WHERE json_extract(v.value, '$.width') IS NOT NULL
+            AND json_extract(v.value, '$.height') IS NOT NULL
+            AND json_extract(v.value, '$.width') <= 1920
+            AND json_extract(v.value, '$.height') <= 1080
+            AND (json_extract(v.value, '$.fps') IS NULL OR json_extract(v.value, '$.fps') <= 30))
+      ))
+    ))`);
+  }
   return clauses.join('\n  ');
 }
 
-const PUBLIC_EXTRA = extraFilters({ tag: '?8', aspect: '?9', subtag: '?11', license: '?12' });
+const PUBLIC_EXTRA = extraFilters({
+  tag: '?8', aspect: '?9', subtag: '?11', license: '?12',
+  minWidth: '?13', maxWidth: '?14', minHeight: '?15', maxHeight: '?16',
+  minDurationMs: '?17', maxDurationMs: '?18', minBytes: '?19', maxBytes: '?20',
+  fpsMax: '?21', playable: '?22', audio: '?23',
+});
+
+/** 计数 / facets 的同一套筛选（编号从 ?8 起）。 */
+const PUBLIC_COUNT_EXTRA = extraFilters({
+  tag: '?5', aspect: '?6', subtag: '?7', license: '?8',
+  minWidth: '?9', maxWidth: '?10', minHeight: '?11', maxHeight: '?12',
+  minDurationMs: '?13', maxDurationMs: '?14', minBytes: '?15', maxBytes: '?16',
+  fpsMax: '?17', playable: '?18', audio: '?19',
+});
 
 /** 公开子标签列表：只统计已发布、有文件的 */
 export const PUBLIC_SUBTAGS = `SELECT w.subtag AS name, COUNT(*) AS n FROM wallpapers w
@@ -103,16 +153,17 @@ export const PUBLIC_FACETS = `WITH base AS (
     SELECT w.id, w.category_id, w.subtag, w.tags
     FROM wallpapers w LEFT JOIN categories c ON c.id = w.category_id
     WHERE ${PUBLIC_FILTERS}
-      ${extraFilters({ tag: '?5', aspect: '?6', subtag: '?7', license: '?8' })}
+      ${PUBLIC_COUNT_EXTRA}
   )
   SELECT 'category' AS facet, b.category_id AS id, c.slug AS slug, c.name AS name,
       NULL AS value, COUNT(*) AS n
     FROM base b JOIN categories c ON c.id = b.category_id AND c.is_public = 1
     GROUP BY b.category_id
   UNION ALL
-  SELECT 'tag', NULL, NULL, NULL, j.value, COUNT(*)
+  SELECT 'tag', NULL, NULL, NULL, COALESCE(a.canonical, j.value), COUNT(*)
     FROM base b, json_each(b.tags) j
-    GROUP BY j.value
+    LEFT JOIN tag_aliases a ON a.alias = j.value
+    GROUP BY COALESCE(a.canonical, j.value)
   UNION ALL
   SELECT 'subtag', NULL, NULL, NULL, b.subtag, COUNT(*)
     FROM base b
@@ -146,11 +197,15 @@ function adminWallpaperFilters({ likes, review, subtag, media }) {
 /**
  * 标签计数（后台标签云 / 公开标签云）：同一段 FROM + json_each + GROUP BY，
  * 只有 WHERE 和 LIMIT 不同。原来两份几乎逐字相同，这里只留一份。
+ *
+ * 第二期起按 canonical 聚合：`anime` 的计数并到 `动漫`，与 facets 是同一套口径
+ * （tag_aliases 表由 schema/017 种入，词表见 core/tag-vocabulary.js）。
  */
 function tagCounts(where, tail = '') {
-  return `SELECT t.value AS tag, COUNT(*) AS n
+  return `SELECT COALESCE(a.canonical, t.value) AS tag, COUNT(*) AS n
     FROM wallpapers w, json_each(w.tags) t
-    ${where} GROUP BY t.value ORDER BY n DESC, t.value${tail}`;
+    LEFT JOIN tag_aliases a ON a.alias = t.value
+    ${where} GROUP BY COALESCE(a.canonical, t.value) ORDER BY n DESC, 2${tail}`;
 }
 
 export const Q = {
@@ -341,7 +396,7 @@ export const Q = {
 
   publicCount: `SELECT COUNT(*) AS n FROM wallpapers w LEFT JOIN categories c ON c.id = w.category_id
     WHERE ${PUBLIC_FILTERS}
-      ${extraFilters({ tag: '?5', aspect: '?6', subtag: '?7', license: '?8' })}`,
+      ${PUBLIC_COUNT_EXTRA}`,
 
   /** 标签云：Wallpaper Engine 左侧那一列标签，按出现次数排序 */
   publicTags: tagCounts(
@@ -363,7 +418,9 @@ export const Q = {
   updateTag: `UPDATE tags SET name = ?, sort_order = ?, category_id = ?, updated_at = ? WHERE id = ?`,
   deleteTag: `DELETE FROM tags WHERE id = ?`,
   updateTagSort: `UPDATE tags SET sort_order = ?, updated_at = ? WHERE id = ?`,
-  countWallpapersWithTag: `SELECT COUNT(*) AS n FROM wallpapers w, json_each(w.tags) t WHERE t.value = ?`,
+  countWallpapersWithTag: `SELECT COUNT(*) AS n FROM wallpapers w, json_each(w.tags) t
+    LEFT JOIN tag_aliases a ON a.alias = t.value
+    WHERE COALESCE(a.canonical, t.value) = ?`,
 
   // ----------------------------------------------------------------- likes
   likesForUser: `SELECT w.slug, w.title, c.slug AS category_slug, l.created_at
@@ -386,6 +443,14 @@ export const Q = {
     WHERE ${PUBLIC_VISIBLE}
     ORDER BY COALESCE(w.published_at, w.created_at) DESC, w.id DESC
     LIMIT 1000`,
+
+  /**
+   * manifest 的 `generatedAt`：公开可见集合里最新的 `updated_at`（毫秒）。
+   * 与 manifest 分两条查询而不是在 JS 里取 items 最大值：items 受 LIMIT 1000 约束，
+   * 而 generatedAt 要代表「整库数据版本」，空库时也要能给出 0。
+   */
+  publicMaxUpdatedAt: `SELECT COALESCE(MAX(w.updated_at), 0) AS n FROM wallpapers w
+    WHERE ${PUBLIC_VISIBLE}`,
 
   // ------------------------------------------------------------------ audit
   insertAudit: `INSERT INTO audit_log (at, actor_id, actor_email, actor_role, action, target_type, target_id, detail)

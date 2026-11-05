@@ -21,6 +21,7 @@ import { cleanEnum, parseLimit, parsePage, parseSort } from '../core/validate.js
 import { KINDS } from '../core/validate.js';
 import { ASPECTS, parseAspect } from '../core/aspects.js';
 import { badRequest, notFound } from '../core/errors.js';
+import { normalizeTag } from '../core/tag-vocabulary.js';
 import { mediaBaseFor, publicUrl } from './storage.js';
 import { safeJsonArray } from './util.js';
 import { categoryDto, variantsDto, wallpaperDto } from './dto.js';
@@ -42,6 +43,9 @@ export const FACET_LIMIT = 50;
 /**
  * 解析 `tag` 参数：逗号分隔的多值，语义是 **OR**（命中任意一个标签即算匹配）。
  *
+ * 第二期起每个值先过 `normalizeTag()`：`anime` → `动漫`，于是「筛 anime」和
+ * 「筛 动漫」返回同一批（SQL 那边再把库里的 alias 值映射到 canonical）。
+ *
  * 库里的 `wallpapers.tags` 是 JSON 数组文本，所以这里转成 JSON 数组字符串交给
  * `json_each`（见 queries.js 的 tagMatch），一个占位符搞定多值。
  * 单值输入与旧版完全一致：清洗规则（剔掉 `% _ \ "`）、长度上限、`filters.tag` 输出都不变。
@@ -55,7 +59,8 @@ export function parseTagFilter(raw) {
     if (!value) continue;
     // 与旧版一致：单个标签过长是 400，而不是悄悄截断
     if (value.length > TAG_VALUE_MAX) throw badRequest('tag 参数过长');
-    if (!values.includes(value)) values.push(value);
+    const canonical = normalizeTag(value);
+    if (!values.includes(canonical)) values.push(canonical);
   }
   if (values.length > TAG_MAX_VALUES) throw badRequest(`tag 参数过多（最多 ${TAG_MAX_VALUES} 个）`);
   return { values, json: values.length ? JSON.stringify(values) : null };
@@ -74,14 +79,34 @@ export function parseLicense(raw) {
   return value;
 }
 
-/** 数值筛选参数：缺省 → null；非数字/越界 → 400（不静默忽略）。 */
+/** 数值筛选参数：缺省 → null；非整数/越界 → 400（不静默忽略）。 */
 export function parseOptionalInt(raw, name, { min = 0, max = 1e12 } = {}) {
   if (raw === null || raw === undefined || raw === '') return null;
   const n = Number(raw);
-  if (!Number.isFinite(n) || n < min || n > max) {
-    throw badRequest(`${name} 必须是 ${min}~${max} 之间的数字`);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < min || n > max) {
+    throw badRequest(`${name} 必须是 ${min}~${max} 之间的整数`);
   }
-  return Math.trunc(n);
+  return n;
+}
+
+/** `playable` 的两种档位语义见 queries.js 的 extraFilters 注释。 */
+export const PLAYABLE = Object.freeze(['1080p30', 'original']);
+
+/** `audio=true|false`（也接受 1/0）→ 1/0/null；其它值 400。 */
+export function parseAudio(raw) {
+  if (raw === null || raw === undefined || raw === '') return null;
+  const value = String(raw).trim().toLowerCase();
+  if (value === 'true' || value === '1') return 1;
+  if (value === 'false' || value === '0') return 0;
+  throw badRequest('audio 只能是 true / false');
+}
+
+/** `playable` 参数校验。 */
+export function parsePlayable(raw) {
+  if (raw === null || raw === undefined || raw === '') return null;
+  const value = String(raw).trim();
+  if (!PLAYABLE.includes(value)) throw badRequest(`playable 只能是 ${PLAYABLE.join(' / ')}`);
+  return value;
 }
 
 /**
@@ -162,19 +187,40 @@ export async function wallpapersPayload({ env, url }) {
   if (!sql) throw badRequest('不支持的排序方式');
 
   const subtag = String(params.get('subtag') ?? '').replace(/[%_\\]/g, '').trim().slice(0, 40) || null;
+
+  // ---- 第二期筛选：尺寸 / 时长 / 体积 / 帧率上限 / 可播档位 / 音轨 ----------------
+  // 全部走 parseOptionalInt：非法值 400（不静默忽略），缺省 null（不过滤）。
+  const range = (name, extra = {}) => parseOptionalInt(params.get(name), name, extra);
+  const minWidth = range('minWidth', { max: 100000 });
+  const maxWidth = range('maxWidth', { max: 100000 });
+  const minHeight = range('minHeight', { max: 100000 });
+  const maxHeight = range('maxHeight', { max: 100000 });
+  const minDurationMs = range('minDurationMs', { max: 86400000 });
+  const maxDurationMs = range('maxDurationMs', { max: 86400000 });
+  const minBytes = range('minBytes', { max: Number.MAX_SAFE_INTEGER });
+  const maxBytes = range('maxBytes', { max: Number.MAX_SAFE_INTEGER });
+  const fpsMax = parseOptionalInt(params.get('fpsMax'), 'fpsMax', { min: 1, max: 1000 });
+  const playable = parsePlayable(params.get('playable'));
+  const audio = parseAudio(params.get('audio'));
+
   const rows = await all(
     env, sql,
     category, kind, like, featuredOnly, cursorKey, cursorId, limit + 1, tagFilter.json, aspect, offset, subtag,
-    license,
+    license, minWidth, maxWidth, minHeight, maxHeight, minDurationMs, maxDurationMs, minBytes, maxBytes,
+    fpsMax, playable, audio,
   );
   const total = Number((await first(
     env, Q.publicCount,
     category, kind, like, featuredOnly, tagFilter.json, aspect, subtag, license,
+    minWidth, maxWidth, minHeight, maxHeight, minDurationMs, maxDurationMs, minBytes, maxBytes,
+    fpsMax, playable, audio,
   ))?.n ?? 0);
   // 面板数据：一次聚合查询，条件与上面的清单完全一致（分页参数不参与，facets 永远针对整个筛选结果）。
   const facets = facetsFromRows(await all(
     env, PUBLIC_FACETS,
     category, kind, like, featuredOnly, tagFilter.json, aspect, subtag, license,
+    minWidth, maxWidth, minHeight, maxHeight, minDurationMs, maxDurationMs, minBytes, maxBytes,
+    fpsMax, playable, audio,
   ));
   const items = rows.slice(0, limit);
   const hasMore = paged ? offset + items.length < total : rows.length > limit;
@@ -266,14 +312,20 @@ export function manifestItem(row, mediaBase = '') {
 /**
  * manifest 快照的数据部分（HTTP 层负责 ETag/304，见 routes/public-v1.js）。
  *
- * `generatedAt` 取**这批条目里最新的 updated_at**：它是数据自身的版本号，
- * 不是「这次请求的时间」。这样同一份数据无论什么时候取，generatedAt 都不变，
- * 客户端可以放心地拿它判断「有没有新内容」。
+ * `generatedAt` 取 **D1 里公开集合最新的 `updated_at`**（单独一条 MAX 查询），
+ * 而不是「这批 items 的最大值」或「请求时间」：
+ *   - 与请求时间脱钩 ⇒ 同一份数据反复取 generatedAt 不变；
+ *   - 与 LIMIT 1000 脱钩 ⇒ 条目数超限时仍然代表整库数据版本；
+ *   - 空库时给 0（而不是 NaN / null）。
+ * 客户端据此判断「有没有新内容」，配合 ETag 可以完全避免无变化时的全量传输。
  */
 export async function manifestPayload(env) {
   const rows = await all(env, Q.publicManifest);
+  const maxUpdated = Number((await first(env, Q.publicMaxUpdatedAt))?.n ?? 0);
   const mediaBase = mediaBaseFor(env);
   const items = rows.map((row) => manifestItem(row, mediaBase));
-  const generatedAt = rows.reduce((max, row) => Math.max(max, Number(row.updated_at ?? 0)), 0);
+  const fromRows = rows.reduce((max, row) => Math.max(max, Number(row.updated_at ?? 0)), 0);
+  // 兜底：查询没给值（老库/假环境）时退回这批 items 的最大值，绝不返回 NaN
+  const generatedAt = maxUpdated > 0 ? maxUpdated : fromRows;
   return { apiVersion: 'v1', generatedAt, total: items.length, items };
 }

@@ -7,6 +7,7 @@ import { all, batch, count, first, run, statement } from '../db.js';
 import { nowMs } from '../db.js';
 import { ACTION, assertCan } from '../../core/permissions.js';
 import { cleanId, cleanText } from '../../core/validate.js';
+import { normalizeTag } from '../../core/tag-vocabulary.js';
 import { buildReorderPlan, nextSortOrder } from '../../core/ordering.js';
 import { created, json, readJson } from '../http.js';
 import { badRequest, conflict, notFound } from '../../core/errors.js';
@@ -53,7 +54,8 @@ export async function list({ env, actor }) {
 export async function create({ env, actor, request }) {
   assertCan(actor, ACTION.CATEGORY_CREATE);
   const body = await readJson(request);
-  const name = cleanText(body.name, 'name', { min: 1, max: 24, collapse: true });
+  // 词表归一：新建「anime」会落到「动漫」；若已存在则走 conflict，而不是造出第二个同义标签
+  const name = normalizeTag(cleanText(body.name, 'name', { min: 1, max: 24, collapse: true }));
   const categoryId = (await cleanCategoryId(env, body.categoryId)) ?? null;
   await assertNameFree(env, name);
 
@@ -74,7 +76,7 @@ export async function update({ env, actor, request, params }) {
   const body = await readJson(request);
   const name = body.name === undefined
     ? row.name
-    : cleanText(body.name, 'name', { min: 1, max: 24, collapse: true });
+    : normalizeTag(cleanText(body.name, 'name', { min: 1, max: 24, collapse: true }));
   if (name !== row.name) await assertNameFree(env, name, row.id);
 
   const categoryId = body.categoryId === undefined

@@ -4,6 +4,7 @@
  */
 import { badRequest } from './errors.js';
 import { TAGS } from './tags.js';
+import { normalizeTag } from './tag-vocabulary.js';
 
 export const LIMITS = Object.freeze({
   title: 120,
@@ -108,6 +109,8 @@ export function cleanPassword(value, field = 'password') {
 /**
  * 标签只接受库里已存在的词。allowed 由调用方从 DB 取（以前是代码里的常量）。
  * 自由输入会让「动漫 / 动画 / anime」三种写法并存，筛选栏就废了。
+ *
+ * 第二期起先做 alias 归一（`anime` → `动漫`）再查词表：同一个概念只落一种写法。
  */
 export function cleanTags(value, allowed = TAGS) {
   if (value === undefined || value === null) return [];
@@ -116,7 +119,7 @@ export function cleanTags(value, allowed = TAGS) {
   const out = [];
   for (const item of list) {
     if (typeof item !== 'string') fail('tags', '标签必须是字符串');
-    const tag = item.trim();
+    const tag = normalizeTag(item);
     if (!tag) continue;
     if (!allowed.includes(tag)) {
       unknown.push(tag);
@@ -134,6 +137,8 @@ export function cleanTags(value, allowed = TAGS) {
  * 兼容老数据的标签清洗：库里已经有「皮肤 / black / gold」这类不在词表里的标签
  * （批量导入、早期数据），严格按词表校验会让它们一保存就被拒。
  * 这里只做格式约束，词表退化成输入建议。
+ *
+ * 仍然做 alias 归一：写入侧不归一会让 facets 的 canonical 聚合永远等不到干净数据。
  */
 export function cleanFreeTags(value, field = 'tags') {
   if (value === undefined || value === null) return [];
@@ -141,7 +146,7 @@ export function cleanFreeTags(value, field = 'tags') {
   const out = [];
   for (const item of list) {
     if (typeof item !== 'string') fail(field, '标签必须是字符串');
-    const tag = item.trim();
+    const tag = normalizeTag(item);
     if (!tag) continue;
     if (tag.length > LIMITS.tagLength) fail(field, `单个标签最多 ${LIMITS.tagLength} 个字`);
     if (!out.includes(tag)) out.push(tag);

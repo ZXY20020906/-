@@ -43,6 +43,17 @@ paths:
         - $ref: '#/components/parameters/subtag'
         - $ref: '#/components/parameters/aspect'
         - $ref: '#/components/parameters/license'
+        - $ref: '#/components/parameters/minWidth'
+        - $ref: '#/components/parameters/maxWidth'
+        - $ref: '#/components/parameters/minHeight'
+        - $ref: '#/components/parameters/maxHeight'
+        - $ref: '#/components/parameters/minDurationMs'
+        - $ref: '#/components/parameters/maxDurationMs'
+        - $ref: '#/components/parameters/minBytes'
+        - $ref: '#/components/parameters/maxBytes'
+        - $ref: '#/components/parameters/fpsMax'
+        - $ref: '#/components/parameters/playable'
+        - $ref: '#/components/parameters/audio'
         - $ref: '#/components/parameters/featured'
         - $ref: '#/components/parameters/sort'
         - $ref: '#/components/parameters/limit'
@@ -189,6 +200,7 @@ components:
       description: |
         标签名精确匹配；支持逗号分隔多值，语义是 **OR**。
         单个标签最长 30 字，一次最多 20 个。
+        第二期起先做 alias 归一（`anime` → `动漫`），筛 alias 与筛 canonical 结果相同。
       schema: { type: string }
       example: 动漫,游戏
     subtag:
@@ -205,6 +217,58 @@ components:
       in: query
       description: 许可证标识（小写，如 cc0 / cc-by / personal）；空值不被命中
       schema: { type: string, pattern: '^[a-z0-9][a-z0-9._-]*$', maxLength: 40 }
+    minWidth:
+      name: minWidth
+      in: query
+      description: 原画最小宽度（px）；宽高未知的条目不匹配
+      schema: { type: integer, minimum: 0, maximum: 100000 }
+    maxWidth:
+      name: maxWidth
+      in: query
+      description: 原画最大宽度（px）
+      schema: { type: integer, minimum: 0, maximum: 100000 }
+    minHeight:
+      name: minHeight
+      in: query
+      schema: { type: integer, minimum: 0, maximum: 100000 }
+    maxHeight:
+      name: maxHeight
+      in: query
+      schema: { type: integer, minimum: 0, maximum: 100000 }
+    minDurationMs:
+      name: minDurationMs
+      in: query
+      description: 最短时长（毫秒）；图片无时长 ⇒ 不匹配
+      schema: { type: integer, minimum: 0, maximum: 86400000 }
+    maxDurationMs:
+      name: maxDurationMs
+      in: query
+      schema: { type: integer, minimum: 0, maximum: 86400000 }
+    minBytes:
+      name: minBytes
+      in: query
+      schema: { type: integer, minimum: 0 }
+    maxBytes:
+      name: maxBytes
+      in: query
+      schema: { type: integer, minimum: 0 }
+    fpsMax:
+      name: fpsMax
+      in: query
+      description: 帧率上限；`fps` 未知的条目不匹配
+      schema: { type: integer, minimum: 1, maximum: 1000 }
+    playable:
+      name: playable
+      in: query
+      description: |
+        `1080p30`：原画或某个变体满足 ≤1920×1080 且 ≤30fps；
+        `original`：原画本身满足。变体缺 fps 时视为满足。
+      schema: { type: string, enum: ['1080p30', 'original'] }
+    audio:
+      name: audio
+      in: query
+      description: 是否有音轨；`has_audio` 未知的条目不参与
+      schema: { type: string, enum: ['true', 'false', '1', '0'] }
     featured:
       name: featured
       in: query
@@ -387,7 +451,7 @@ components:
               count: { type: integer }
         tags:
           type: array
-          description: 与清单同源，按 count 降序，最多 50
+          description: 与清单同源，按 count 降序，最多 50；第二期起 name 是 canonical（alias 计数已合并）
           items:
             type: object
             properties:

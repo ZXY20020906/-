@@ -286,10 +286,17 @@ Content-Type: video/mp4
 |---|---|
 | `category` | 分类 slug（不是 id） |
 | `kind` | `static` / `dynamic` |
-| `tag` | 标签名精确匹配；**支持逗号分隔多值，语义是 OR**（`tag=动漫,游戏` → 带其中任意一个标签即命中）。单个标签最长 30 字，一次最多 20 个 |
+| `tag` | 标签名精确匹配；**支持逗号分隔多值，语义是 OR**（`tag=动漫,游戏` → 带其中任意一个标签即命中）。单个标签最长 30 字，一次最多 20 个。**第二期起先做 alias 归一**（`anime` → `动漫`），筛 alias 与筛 canonical 结果相同 |
 | `subtag` | 子标签名精确匹配 |
 | `aspect` | 宽高比档位：`16:9` / `21:9` / `32:9` / `9:16` / `4:3` / `1:1`（容差 6%） |
 | `license` | 许可证标识（小写，如 `cc0` / `cc-by` / `personal`）；大小写不敏感，空值不命中 |
+| `minWidth` / `maxWidth` | 原画宽度范围（px，整数）；字段为 NULL（未知）时不匹配 |
+| `minHeight` / `maxHeight` | 原画高度范围（px） |
+| `minDurationMs` / `maxDurationMs` | 视频时长范围（毫秒）；图片无时长 ⇒ 不匹配 |
+| `minBytes` / `maxBytes` | 文件体积范围（字节） |
+| `fpsMax` | 帧率上限；`fps` 未知的条目不匹配（不能证明满足就别放行） |
+| `playable` | `1080p30`：原画或某个变体满足 ≤1920×1080 且 ≤30fps；`original`：原画本身满足。变体缺 `fps` 时视为满足（ingest 只放行 ≤30fps 的变体） |
+| `audio` | `true` / `false`（也接受 `1`/`0`）；`has_audio` 为 NULL 的条目不参与|
 | `q` | 标题模糊搜索（≤60 字，`%` `_` 会被剔除） |
 | `sort` | `recent`(默认) / `oldest` / `name` / `size` / `resolution` |
 | `featured=1` | 只要置顶的 |
@@ -331,7 +338,7 @@ Content-Type: video/mp4
 - **统计口径与当前筛选条件一致**：`category`、`kind`、`tag`、`subtag`、`aspect`、`q`、`featured` 有的都算进去（分页参数不参与，永远针对整个筛选结果）。所以「点开某分类后的角标」和「切回全部后的角标」都是对的，前端不需要自己算。
 - **可见性门槛与清单同源**：两处都取自 `src/server/queries.js` 的同一个 `PUBLIC_VISIBLE`（`published` + 有文件 + `verified_at` 非空 + `review_status = 'approved'`）。因此同一筛选条件下 `sum(facets.categories[].count)` **恒等于**清单的 `total`。唯一例外：`category_id` 为 `NULL` 的未分类作品会进清单与 tags/subtags，但没有分类可归，所以不计入 `categories` 分组（合计比 `total` 少这几条）。回归测试见 `tests/public-facets.test.js` 的「一致性」用例。
 - **`categories`**：`{id, slug, name, count}`。跟当前筛选走 —— 带了 `category` 时只剩该分类；某个分类下 0 条就不会出现（未分类的作品也不会出现在这里）。
-- **`tags`**：`{name, count}`，只含 `count > 0` 的标签，按 `count` 降序，最多 **50** 个。
+- **`tags`**：`{name, count}`，只含 `count > 0` 的标签，按 `count` 降序，最多 **50** 个。第二期起 `name` 是 **canonical** 名（`anime` 的计数并到 `动漫`，见「标签治理」）。
 - **`subtags`**：`{name, count}`，同上（空子标签不计）。
 - 三个数组共用**一条**聚合 SQL（`GROUP BY` + `json_each`），不是按条目逐条查；单次清单请求固定 3 条 SQL（列表 / 计数 / facets）。
 - **旧接口的 count 口径更宽，可能与 facets 不同**：`/api/public/tags` 与 `/api/public/subtags` 是历史接口，它们的 `count` 只要求「已发布 + 有文件」，**不看** `verified_at` / `review_status`（未审核或未验证的条目也会被算进去）。所以两个数可能对不上：**筛选面板一律以 `facets` 为准**，旧接口的 count 只当参考。
@@ -389,6 +396,45 @@ facets 聚合，与其它筛选同源（`tests/metadata.test.js` 有用例）。
 **回填**：存量条目由 `tools/backfill-metadata.mjs` 处理 —— 对视频用 ffprobe 只读文件头
 （HTTP Range，不整档下载）补 `fps/codec/pix_fmt/has_audio`，用 ffmpeg 抽首帧生成 1280 宽
 WebP 写上 `poster_key`，再由 API 输出 `posterUrl`。脚本可重复执行（只补空缺/变化的值）。
+
+### 标签治理（第二期）
+
+库里的标签是自由文本，同一概念可能并存 `动漫` / `anime` / `动画`。第二期起做了三层治理：
+
+1. **受控词表**：`src/core/tag-vocabulary.js` 是唯一事实来源（canonical 列表 + alias 映射）；
+2. **写入归一**：`cleanFreeTags()` / 后台标签管理在落库前过 `normalizeTag()`，
+   `anime` 存成 `动漫`；检索时 `?tag=anime` 也先归一；
+3. **facets 按 canonical 聚合**：`tag_aliases` 表（schema/017）在 SQL 里 `LEFT JOIN`，
+   `anime` 的计数并到 `动漫`，面板里只出现一行；`/api/public/tags` 的 count 同一口径。
+
+新增别名只用追加（不要改已有 canonical 行）：
+
+```sql
+INSERT OR IGNORE INTO tag_aliases (alias, canonical, created_at) VALUES ('アニメ', '动漫', 0);
+```
+
+`schema/017_tag_aliases.sql` 的种子必须与词表文件一致 —— `tests/tag-alias.test.js`
+会解析 SQL 逐条比对，改一处忘另一处会直接红。
+
+> 应用迁移请用 `node tools/d1-apply-schema.mjs --file=schema/017_tag_aliases.sql`。
+> **不要用 PowerShell 的 `Invoke-RestMethod` 发中文种子**：PS 5.1 默认按 ANSI 编码发请求体，
+> 中文会变成 `??`（2026-11 已踩过一次，`tag_aliases` 里出现过 `?? -> ??` 的脏行）。
+> 那个工具内部用 Node fetch，UTF-8 正确。
+
+### manifest 快照语义（第二期）
+
+`GET /api/v1/public/manifest.json` 返回的是**文档**而不是 `{ok,data}` 包装：
+
+```json
+{ "apiVersion": "v1", "generatedAt": 1761700000000, "etag": "cb1f…", "total": 110, "items": [ /* … */ ] }
+```
+
+- `generatedAt` = D1 里**公开可见集合最新的 `updated_at`**（毫秒），不是请求时间，
+  所以同一批数据反复取不会「变新」；空库给 `0`。
+- `etag` 同时出现在 body 与响应头（响应头带引号）；带 `If-None-Match` 命中返回 `304`（无 body）。
+- `items` 的字段固定为 `id / slug / kind / url / bytes / sha256 / width / height / fps /
+  variants / posterUrl / tags / license / updatedAt`（与 `docs/openapi.yaml` 的 Manifest schema 一致）。
+- 上限 1000 条（当前站点 232 条）。到量级再改游标分片，`generatedAt` 语义不变。
 
 ## 媒体
 

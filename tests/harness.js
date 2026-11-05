@@ -43,6 +43,8 @@ const DEFAULT_HANDLERS = {
   [Q.wallpaperColumnExists]: ([name]) => [{ name }],
   // v1 manifest：假环境没有快照，默认空清单（形状由 tests/api-v1.test.js 验）
   [Q.publicManifest]: () => [],
+  // manifest 的 generatedAt 取「公开集合最新 updated_at」；假环境给 0 → 回落到 items 最大值
+  [Q.publicMaxUpdatedAt]: () => [{ n: 0 }],
   [Q.wallpaperTitleBytesTaken]: () => [],
   // 大文件指纹去重：假环境「没有重复」，与 schema/013 列存在时的行为对齐
   [Q.wallpaperFingerprintTaken]: () => [],
