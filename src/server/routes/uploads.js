@@ -55,6 +55,19 @@ async function loadRow(env, id) {
   return row;
 }
 
+/** 扫 mp4 顶层 box：先遇到 moov ⇒ faststart；先遇到 mdat ⇒ 非 faststart；读不到返回 null */
+function detectFaststart(bytes) {
+  let offset = 0;
+  for (let guard = 0; guard < 64 && offset + 8 <= bytes.length; guard += 1) {
+    const size = ((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0;
+    const type = String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
+    if (type === 'moov') return true;
+    if (type === 'mdat') return false;
+    if (!size || size < 8) break;
+    offset += size;
+  }
+  return null;
+}
 async function readRange(env, key, offset, length) {
   const object = await env.BUCKET.get(key, { range: { offset, length } });
   if (!object) return null;
@@ -131,14 +144,17 @@ async function ingestStreamed(env, actor, row, tmpKey, size, warnings) {
   if (!ALLOWED_MIME.includes(meta.mime)) throw unsupportedMedia(`不支持的类型：${meta.mime}`);
 
   const videoInfo = isVideoMime(meta.mime) ? readVideoInfo(head, meta.mime) : { fps: null, codec: null, faststart: null };
-  if (isVideoMime(meta.mime) && videoInfo.faststart === false) {
+  const faststart = isVideoMime(meta.mime) && meta.mime === 'video/mp4'
+    ? detectFaststart(head)
+    : videoInfo.faststart;
+  if (isVideoMime(meta.mime) && meta.mime === 'video/mp4' && faststart === false) {
     throw unsupportedMedia('mp4 需要 faststart（moov 在文件头）。请先用 ffmpeg -movflags +faststart 重封装');
   }
   if (isVideoMime(meta.mime)) {
     const fps = readVideoFps(head, meta.mime) ?? videoInfo.fps ?? null;
     const compliance = checkVideoCompliance({
       mime: meta.mime, width: meta.width, height: meta.height, fps,
-      codec: videoInfo.codec, bytes: size,
+      codec: videoInfo.codec, faststart, bytes: size,
     });
     if (!compliance.ok) {
       throw unsupportedMedia(complianceMessage(compliance), {
