@@ -137,6 +137,9 @@ export function createEnv(handlers, { bucket } = {}) {
       // 阶段三：默认不自动重建公开快照（假桶存不了快照，真 SQL 也没注册）。
       // 需要快照路径的用例显式设 SNAPSHOT_AUTO: '1'。
       SNAPSHOT_AUTO: '0',
+      // 阶段四：后台列表的 60s 短缓存默认关掉 —— 用例之间会直接改夹具数据，
+      // 缓存会让「刚插的行看不见」。缓存行为由 tests/admin-list.test.js 显式打开。
+      ADMIN_LIST_CACHE_MS: '0',
     },
     calls,
     puts,

@@ -171,6 +171,8 @@ export function openSite(rows = []) {
     PUBLIC_ORIGIN: 'https://example.test',
     PUBLIC_SNAPSHOT_FALLBACK: '0',
     SNAPSHOT_AUTO: '0',
+    // 阶段四：后台列表短缓存默认关（用例之间会直接改库），需要时显式打开。
+    ADMIN_LIST_CACHE_MS: '0',
   };
   return {
     db,
@@ -194,20 +196,22 @@ export function snapshotEnv(base, overrides = {}) {
 }
 
 /** 走真实路由（不带 gate），返回 status/headers/body/text。 */
-export async function call(env, path, { method = 'GET', headers = {} } = {}) {
+export async function call(env, path, { method = 'GET', headers = {}, body } = {}) {
   const saved = globalThis.caches;
   delete globalThis.caches;
   try {
-    const request = new Request(`https://example.test${path}`, { method, headers });
+    const init = { method, headers };
+    if (body !== undefined) init.body = body;
+    const request = new Request(`https://example.test${path}`, init);
     const response = await handle(request, env);
     const text = await response.text();
-    let body = null;
+    let body_ = null;
     try {
-      body = text ? JSON.parse(text) : null;
+      body_ = text ? JSON.parse(text) : null;
     } catch {
-      body = { raw: text };
+      body_ = { raw: text };
     }
-    return { status: response.status, headers: response.headers, body, text };
+    return { status: response.status, headers: response.headers, body: body_, text };
   } finally {
     if (saved !== undefined) globalThis.caches = saved;
   }

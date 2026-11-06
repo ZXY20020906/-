@@ -24,8 +24,32 @@ import {
  * 而一次清单要跑「清单 + count + facets」三条 SQL。2026-11-05 线上 D1 免费额度被耗尽，
  * 公开接口全部 500，根子是读取量而不是数据坏了。5 分钟缓存把回源次数压到原来的 1/10，
  * 配合 app.js 的「条件请求也走缓存」，插件轮询基本不再产生 D1 读。
+ *
+ * 阶段三之后正常的公开读是 **0 次 D1 行读**（走 R2 快照），5 分钟只是兜住「快照也没命中」
+ * 的那一刻；阶段四进一步规定：**降级响应不缓存**（见 cacheHeadersFor）。
  */
 const CACHE_CONTROL = 'public, max-age=300, stale-while-revalidate=3600';
+
+/**
+ * 降级响应的缓存策略：`no-store`。
+ *
+ * 理由：`degraded: true` 表示这次是回源 D1（或用了仓库内嵌快照）才答出来的。
+ * 如果把它缓存 5 分钟，快照恢复之后客户端还要继续看旧副本，而且真正的故障窗口
+ * 会被缓存掩盖。同时打 `x-folia-degraded`，让 `app.js` 的边缘缓存也知道别存。
+ */
+const DEGRADED_CACHE_CONTROL = 'no-store, max-age=0';
+
+/** 载荷是不是「降级回答」（`{ok,data:{degraded}}` 与文档型 `{degraded}` 都认）。 */
+export function isDegradedPayload(payload) {
+  return payload?.data?.degraded === true || payload?.degraded === true;
+}
+
+/** 按是否降级给缓存头；阶段四的 TTL 表见 docs/OPS.md。 */
+export function cacheHeadersFor(payload) {
+  return isDegradedPayload(payload)
+    ? { 'cache-control': DEGRADED_CACHE_CONTROL, 'x-folia-degraded': '1' }
+    : { 'cache-control': CACHE_CONTROL };
+}
 
 // 兼容旧引用：ETag 规则已经收敛到 src/core/etag.js，这里只做转发。
 export { normalizeEtag };
@@ -45,8 +69,8 @@ export async function etagJson(payload, request, { status = 200 } = {}) {
     'content-type': 'application/json; charset=utf-8',
     'x-content-type-options': 'nosniff',
     'referrer-policy': 'same-origin',
+    ...cacheHeadersFor(payload),
     etag,
-    'cache-control': CACHE_CONTROL,
   };
   if (etagMatches(request?.headers?.get('if-none-match'), etag)) {
     return new Response(null, { status: 304, headers });
@@ -54,8 +78,13 @@ export async function etagJson(payload, request, { status = 200 } = {}) {
   return new Response(body, { status, headers });
 }
 
+/** 分类 / 标签 / 子标签 / 详情：形状是 `{...字段, degraded?}`，缓存头按是否降级给。 */
+function publicJson(payload, options = {}) {
+  return json(payload, { ...options, headers: { ...cacheHeadersFor(payload), ...(options.headers ?? {}) } });
+}
+
 export async function listCategories({ env }) {
-  return json(await categoriesPayload(env));
+  return publicJson(await categoriesPayload(env));
 }
 
 /**
@@ -95,11 +124,11 @@ export async function currentJson({ env, request }) {
 }
 
 export async function listTags({ env, url }) {
-  return json(await tagsPayload({ env, url }));
+  return publicJson(await tagsPayload({ env, url }));
 }
 
 export async function listSubtags({ env, url }) {
-  return json(await subtagsPayload({ env, url }));
+  return publicJson(await subtagsPayload({ env, url }));
 }
 
 /** `GET /api/v1/public/wallpapers`：清单 + facets，带 ETag/304（与旧路径同一份响应）。 */
@@ -110,7 +139,7 @@ export async function listWallpapers(ctx) {
 
 /** `GET /api/v1/public/wallpapers/:slug`：详情，公开可读。 */
 export async function getWallpaper(ctx) {
-  return json(await wallpaperPayload(ctx));
+  return publicJson(await wallpaperPayload(ctx));
 }
 
 /**
@@ -129,8 +158,8 @@ export async function manifest(ctx) {
     'content-type': 'application/json; charset=utf-8',
     'x-content-type-options': 'nosniff',
     'referrer-policy': 'same-origin',
+    ...cacheHeadersFor(core),
     etag,
-    'cache-control': CACHE_CONTROL,
   };
   if (etagMatches(ctx.request?.headers?.get('if-none-match'), etag)) {
     return new Response(null, { status: 304, headers });

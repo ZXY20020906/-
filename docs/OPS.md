@@ -19,17 +19,31 @@
 | `degraded: true` | 回退 D1，说明快照缺失/损坏 | 跑 `node tools/build-snapshot.mjs` |
 | `degraded: true` + `snapshotGeneratedAt` | 连 D1 都不可用，用的是仓库内嵌快照 | 查 D1 额度 / 绑定，见 §6 |
 
-## 2. 缓存 TTL
+## 2. 缓存 TTL（端点级，阶段四复核）
 
-| 对象 | 头 | 为什么 |
+| 端点 / 对象 | 缓存头 | 谁在缓存 |
 |---|---|---|
-| `snapshots/<version>/**`（R2 对象） | `public, max-age=31536000, immutable` | version 里含内容哈希前 8 位，换内容必换 URL |
-| `current.json`（R2 对象 + `/api/v1/public/current.json`） | `public, max-age=300` | 可变指针，5 分钟内必须能切过去 |
-| `/api/v1/public/*`、`/api/public/*` | `public, max-age=300, stale-while-revalidate=3600` | 与边缘缓存（`app.js`）对齐 |
+| `GET /api/v1/public/current.json` | `public, max-age=300` | 边缘 + 浏览器 |
+| R2 `snapshots/<version>/**` | `public, max-age=31536000, immutable` | 任何下游 |
+| `GET /api/v1/public/wallpapers`（清单） | `public, max-age=300, stale-while-revalidate=3600` | 边缘（`app.js`） |
+| `GET /api/v1/public/wallpapers/:slug` | 同上 | 边缘 |
+| `GET /api/v1/public/categories` / `tags` / `subtags` | 同上 | 边缘 |
+| `GET /api/v1/public/manifest.json` | 同上 + ETag | 边缘 |
+| 旧路径 `/api/public/*` | 与 v1 完全一致 | 边缘（同一份 handler） |
+| **任何 `degraded: true` 的公开响应** | `no-store, max-age=0` + `x-folia-degraded: 1` | **不缓存** |
+| `GET /api/admin/wallpapers`（后台列表） | `no-store` | **进程内 60s**，见 §3.2 |
+| `/api/admin/*` 其他接口 | `no-store` | 不缓存 |
+
+**降级不缓存**（阶段四裁定）：`degraded: true` 表示这次是回源 D1（或用了仓库内嵌快照）才答出来的。
+缓存 5 分钟会出现「快照已恢复、客户端还在看旧副本」，也会把真正的故障窗口藏起来。
+实现上除了 `no-store`，还打 `x-folia-degraded: 1`；`app.js` 的边缘缓存看到它就跳过
+（否则 Workers 的 `caches.default` 会把 200 一起存进去，覆盖掉 no-store 的意图）。
 
 **不要**把 `current.json` 调成 immutable 或长于 5 分钟：发布新素材后最长要等这么久才切过去。
 
-## 3. 失效（重建快照）
+## 3. 失效
+
+### 3.1 公开读：重建快照
 
 自动触发（`SNAPSHOT_AUTO !== '0'`，默认开）——失败只记日志，不阻断主流程：
 
@@ -52,6 +66,27 @@ node tools/build-snapshot.mjs --force             # 内容没变也写新版本�
 
 内容没变时**不会**写新对象（`wrote=false`）：版本号是 `utcCompact-sha256(wallpapers.json)[0..8]`，
 同一份内容永远是同一个版本，客户端 ETag 不会无端变化。
+
+### 3.2 后台列表：60s 进程内短缓存
+
+后台列表（`GET /api/admin/wallpapers`）有 60 秒的**进程内**缓存，
+键 = 登录人 + 全部筛选参数 + 分页（`actor.id` 必须在键里，否则会串号）。
+
+- 任何 `/api/admin/*` 写操作成功后，`app.js` 统一清空该缓存（不是每个 handler 自己清，漏不掉）；
+- 想彻底关掉：`env.ADMIN_LIST_CACHE_MS=0`（Pages 环境变量）；
+- **已知局限**：缓存只在当前 isolate 内。Cloudflare 会在不同 colo 起多个 isolate，
+  跨 isolate 的失效最多等 60s（与 `rate-limit.js` 的进程内计数同一类限制）。
+  公开读的一致性靠快照，不靠这个缓存。
+
+### 3.3 D1 用量观测
+
+```bash
+CF_API_TOKEN=… CF_ACCOUNT_ID=… node tools/d1-usage.mjs          # 今日行读/行写/使用率
+node tools/d1-usage.mjs --days 7 --json                          # 按日趋势，机器可读
+```
+
+使用率 > 80% 时退出码 2（可以直接挂到定时任务里告警）；缺权限退 3。
+免费额度口径写在 `tools/d1-usage.mjs` 的 `FREE_TIER`。
 
 ## 4. 回滚
 

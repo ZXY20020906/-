@@ -21,7 +21,7 @@ import { THUMB_MAX_BYTES } from '../../core/media-limits.js';
 import { specFromFileName } from '../../core/variant-label.js';
 import { ACTION, assertCan } from '../../core/permissions.js';
 import {
-  cleanCategoryRef, cleanEnum, cleanId, cleanLicense, cleanNullableText, has, parseLimit,
+  cleanCategoryRef, cleanEnum, cleanId, cleanLicense, cleanNullableText, has, parseLimit, parsePage,
   parseWallpaperCreate, parseWallpaperPatch, AUTHOR_MAX, SOURCE_MAX,
 } from '../../core/validate.js';
 import { KINDS, REVIEW_STATUSES, STATUSES } from '../../core/validate.js';
@@ -44,6 +44,7 @@ import {
   ingestVariantAsset, ingestVariantFromObject, publishWallpaper, recordDailyUsage, removeVariant,
 } from '../ingest.js';
 import { rebuildSnapshotQuietly } from '../snapshot.js';
+import { cacheKey, getCached, setCached } from '../short-cache.js';
 
 /** 大文件跳过完整 sha256 的阈值（真正的实现在 ingest.js，这里 re-export 供测试/工具引用）。 */
 export { HASH_LIMIT, THUMB_WIDTH, DEFAULT_MEDIA_TOOLS, AUTO_FIX, IMPORT_WARNING } from '../ingest.js';
@@ -99,9 +100,32 @@ async function ensureCategory(env, categoryId) {
   if (!row) throw badRequest('分类不存在', { field: 'categoryId' });
 }
 
+/**
+ * 后台列表的**分页 + 短缓存**（阶段四）。
+ *
+ * 为什么要有缓存：后台每次刷新都要跑「清单 + 计数」两条 SQL，200 条 DTO 还要逐个拼
+ * URL/变体（纯 CPU）。管理端刷新的频率远高于内容变化频率，60s 的进程内缓存能把
+ * 「连点 10 次刷新」压成 1 次数据库往返（验收口径：D1 行读增量 ≤ 20）。
+ *
+ * 缓存键必须带上 `actor.id`：`mine` / `liked` 两个筛选是按当前登录人算的，
+ * 少了它就会出现「A 看到 B 的草稿」这种越权。
+ *
+ * 失效：任何 `/api/admin/*` 写操作成功后由 `app.js` 统一 `clearCache('admin:')` ——
+ * 放在路由里逐个调太容易漏，而漏一次的后果是「改完看不到」。
+ */
+export const ADMIN_LIST_CACHE_PREFIX = 'admin:list:';
+/** 默认每页条数（派单口径：后台默认 limit=20）。前端现在显式传 limit=200，不受影响。 */
+export const ADMIN_LIST_DEFAULT_LIMIT = 20;
+
+function adminListCacheTtl(env) {
+  const raw = Number(env?.ADMIN_LIST_CACHE_MS ?? 60_000);
+  return Number.isFinite(raw) && raw > 0 ? raw : 0;
+}
+
 export async function list({ env, actor, url }) {
   assertCan(actor, ACTION.WALLPAPER_READ);
-  // 阶段二：待转码队列（needs_variant=1），后台专用
+  // 阶段二：待转码队列（needs_variant=1），后台专用。条数固定上限 200，单独一条查询，
+  // 不参与分页缓存（它是「待办列表」，本来就该是最新的）。
   if (url.searchParams.get('needsVariant') === '1') {
     const rows = await all(env, Q.listNeedsVariant, 200);
     return json({
@@ -124,13 +148,37 @@ export async function list({ env, actor, url }) {
   // 格式筛选：视频（mp4/webm）/ zip 包 / 图片
   const formatRaw = String(params.get('format') ?? '').trim();
   const format = ['video', 'zip', 'image'].includes(formatRaw) ? formatRaw : null;
-  const limit = parseLimit(params.get('limit'), { def: 50, max: 200 });
-  const offset = Math.min(100000, Math.max(0, Number(params.get('offset') ?? 0) || 0));
+
+  const limit = parseLimit(params.get('limit'), { def: ADMIN_LIST_DEFAULT_LIMIT, max: 200 });
+  // 分页模型：page（1 起）优先；不传 page 时沿用旧的 offset（前端与脚本都还在用）。
+  const pageParam = params.get('page');
+  const paged = pageParam !== null && pageParam !== '';
+  const page = paged ? parsePage(pageParam) : null;
+  const legacyOffset = Math.min(100000, Math.max(0, Number(params.get('offset') ?? 0) || 0));
+  const offset = paged ? (page - 1) * limit : legacyOffset;
+
+  const cacheTtl = adminListCacheTtl(env);
+  const key = cacheKey(ADMIN_LIST_CACHE_PREFIX, [
+    actor.id, status, categoryId, kind, mine, like, tagLike, likedOnly, review, subtag, format, limit, offset,
+  ]);
+  // TTL <= 0 表示「关掉缓存」（单测夹具默认如此）：读也不读，避免拿到上一条用例留下的响应。
+  const cached = cacheTtl > 0 ? getCached(key) : undefined;
+  if (cached) return json(cached);
 
   const rows = await all(env, Q.adminListWallpapers, status, categoryId, kind, mine ? actor.id : null, like, tagLike, limit, offset, likedOnly ? actor.id : null, review, subtag, format);
   const total = Number((await first(env, Q.adminCountWallpapers, status, categoryId, kind, mine ? actor.id : null, like, tagLike, likedOnly ? actor.id : null, review, subtag, format))?.n ?? 0);
 
-  return json({ items: rows.map((row) => wallpaperDto(row, { admin: true, mediaBase: mediaBaseFor(env) })), total, limit, offset });
+  const body = {
+    items: rows.map((row) => wallpaperDto(row, { admin: true, mediaBase: mediaBaseFor(env) })),
+    total,
+    limit,
+    offset,
+    page,
+    pageCount: Math.max(1, Math.ceil(total / limit)),
+    hasMore: offset + rows.length < total,
+  };
+  setCached(key, body, cacheTtl);
+  return json(body);
 }
 
 export async function get({ env, actor, params }) {

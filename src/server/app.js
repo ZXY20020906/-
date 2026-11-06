@@ -4,6 +4,8 @@
  */
 import { assertSafeRequest, corsHeaders, failure, methodNotAllowed, preflight } from './http.js';
 import { etagMatches } from '../core/etag.js';
+import { clearCache } from './short-cache.js';
+import { ADMIN_LIST_CACHE_PREFIX } from './routes/wallpapers.js';
 import { readSession, clientIp } from './session.js';
 import { hit } from './rate-limit.js';
 import { findApiKey, readApiKey, touchApiKey } from './api-keys.js';
@@ -166,6 +168,9 @@ export function cacheKeyUrl(url) {
 /** 公开读接口的频率上限：每 IP 每分钟 120 次（isolate 内存计数，见 rate-limit.js 的局限说明）。 */
 export const PUBLIC_RATE = { max: 120, windowMs: 60 * 1000 };
 
+/** 会改数据的方法（清单缓存只在它们成功后失效）。 */
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
 /**
  * 公开只读路径前缀（旧路径 + v1）。OPTIONS 预检只对这些路径回 CORS 头：
  * 插件 / 素材网客户端从任意源 fetch 都要能过预检，写接口一个都不放。
@@ -318,9 +323,23 @@ export async function handle(request, env, context) {
     const response = await route.handler({ request: handlerRequest, env, url, params, actor, waitUntil });
     const final = route.cors ? withCors(response, env) : response;
 
+    // 阶段四：管理端写操作成功后统一清掉后台列表的短缓存。
+    //
+    // 为什么放在路由层而不是每个 handler 里：漏一次的表现是「改完刷新看不到」，
+    // 而路由层只有这一处，漏不掉。代价是「所有 admin 写」都会清一次（多清不多错）。
+    if (MUTATING_METHODS.has(request.method) && url.pathname.startsWith('/api/admin/') && response.status < 400) {
+      clearCache(ADMIN_LIST_CACHE_PREFIX);
+    }
+
     // 只缓存 GET 的完整实体：HEAD 没有 body，若把 HEAD 的响应写进 GET 的 key，
     // 后续 GET 会拿到空 body。HEAD 仍然可以**读**上面的缓存。
-    if (edgeCacheable && final.status === 200 && request.method === 'GET') {
+    //
+    // 降级响应（`degraded: true`，说明这次没走快照、直接打了 D1）**不进缓存**：
+    // 阶段四的裁决是「降级不缓存」，否则快照恢复之后客户端还要再看 5 分钟旧副本。
+    const cacheable = final.status === 200
+      && request.method === 'GET'
+      && final.headers.get('x-folia-degraded') !== '1';
+    if (edgeCacheable && cacheable) {
       const headers = new Headers(final.headers);
       headers.set('cache-control', 'public, max-age=300, stale-while-revalidate=3600');
       headers.set('x-folia-edge', 'MISS');
