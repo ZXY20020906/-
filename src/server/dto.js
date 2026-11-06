@@ -61,7 +61,10 @@ function variantLabel(item, height) {
  * 所以这里统一用 publicUrl 生成，前缀跟着站点配置走。
  */
 export function variantsDto(row, mediaBase = '') {
-  const raw = safeJsonParse(row?.variants, []);
+  // D1 里是 JSON 字符串；但调用方也可能直接传数组（例如刚刚 attachVariant 的返回值）。
+  // 两种形态都要能吃，否则会出现「后台有、公开没有」。
+  let raw = row?.variants;
+  if (typeof raw === 'string') raw = safeJsonParse(raw, []);
   if (!Array.isArray(raw)) return [];
   return raw
     .filter((item) => item && typeof item === 'object' && item.key && Number(item.bytes) > 0)

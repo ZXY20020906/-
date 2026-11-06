@@ -19,7 +19,7 @@ import { created, json, readJson } from '../http.js';
 import { deleteAsset, mediaBaseFor } from '../storage.js';
 import { wallpaperDto } from '../dto.js';
 import { newId } from '../util.js';
-import { ingestAsset, ingestStreamedAsset } from '../ingest.js';
+import { ingestAsset, ingestStreamedAsset, ingestVariantFromObject } from '../ingest.js';
 
 /** 单文件上限：2GB（产品需求） */
 export const MAX_MULTIPART_BYTES = 2 * 1024 * 1024 * 1024;
@@ -145,6 +145,29 @@ export async function complete({ request, env, actor }) {
   if (expected && expected !== size) {
     await deleteAsset(env, key);
     throw badRequest(`总长度不符：声明 ${expected}，实际 ${size}`);
+  }
+
+  // 变体模式：分片对象直接转成变体（>100MB 的变体走这条路）
+  if (meta.variantLabel) {
+    try {
+      const row = await loadRow(env, meta.wallpaperId);
+      assertCan(actor, ACTION.WALLPAPER_UPDATE, row);
+      const label = String(meta.variantLabel).trim().slice(0, 24) || '1080p';
+      const result = await ingestVariantFromObject(env, actor, row, {
+        key, size, label, fps: Number(meta.fps) || null,
+      });
+      await deleteAsset(env, key);
+      const freshRow = await first(env, Q.wallpaperById, row.id);
+      return json({
+        variant: { label, key: result.key },
+        variants: result.variants,
+        wallpaper: wallpaperDto(freshRow, { admin: true, mediaBase: mediaBaseFor(env) }),
+        mode: 'variant',
+      });
+    } catch (error) {
+      await deleteAsset(env, key).catch(() => {});
+      throw error;
+    }
   }
 
   try {

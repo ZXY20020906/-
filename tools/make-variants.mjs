@@ -68,11 +68,11 @@ async function main() {
   if (LIMIT > 0) items = items.slice(0, LIMIT);
   console.log(`待转码 ${items.length} 条${DRY ? '（dry-run）' : ''}`);
 
-  let done = 0; let skipped = 0; const failed = [];
+  let done = 0; let skippedEmpty = 0; let processed = 0; const failed = [];
   for (const item of items) {
     const existing = (item.variants || []).filter((v) => playable(v));
     if (existing.length) {
-      skipped += 1;
+      skippedEmpty += 1;
       console.log(`  跳过 ${item.title}（已有可播变体 ${existing.map((v) => v.label).join('/')}）`);
       continue;
     }
@@ -103,23 +103,48 @@ async function main() {
       if (produced.length > 100 * 1024 * 1024) throw new Error('变体超过 100MB，请降低码率后再传');
 
       const label = width > 1920 ? '1080p' : `${height}p`;
-      const upload = await fetch(`${BASE}/api/admin/wallpapers/${item.id}/variant?label=${encodeURIComponent(label)}&fps=30`, {
-        method: 'PUT', headers: { ...auth, 'content-type': 'video/mp4' }, body: produced,
-      });
-      const uploaded = await upload.json().catch(() => null);
-      if (!upload.ok || !uploaded?.ok) throw new Error(`上传变体失败 ${upload.status} ${JSON.stringify(uploaded).slice(0, 120)}`);
+      if (produced.length > 400 * 1024 * 1024) throw new Error('变体超过 400MB 上限，请降低 crf 或分辨率');
+      if (produced.length > 100 * 1024 * 1024) {
+        // 超 100MB：走分片，再让服务端把 _tmp 对象转成变体
+        const init = await (await fetch(`${BASE}/api/admin/uploads/init`, {
+          method: 'POST', headers: { ...auth, 'content-type': 'application/json' },
+          body: JSON.stringify({ fileName: 'variant.mp4', size: produced.length, contentType: 'video/mp4' }),
+        })).json();
+        const parts = [];
+        const partSize = init.data.partSize;
+        for (let i = 0; i * partSize < produced.length; i += 1) {
+          const chunk = produced.subarray(i * partSize, Math.min(produced.length, (i + 1) * partSize));
+          const res = await fetch(`${BASE}/api/admin/uploads/part?uploadId=${encodeURIComponent(init.data.uploadId)}&part=${i + 1}&key=${encodeURIComponent(init.data.key)}`, {
+            method: 'PUT', headers: { ...auth, 'content-type': 'application/octet-stream' }, body: chunk,
+          });
+          const payload = await res.json();
+          if (!payload.ok) throw new Error(`变体分片 ${i + 1} 上传失败`);
+          parts.push({ partNumber: i + 1, etag: payload.data.etag });
+        }
+        const done2 = await (await fetch(`${BASE}/api/admin/uploads/complete`, {
+          method: 'POST', headers: { ...auth, 'content-type': 'application/json' },
+          body: JSON.stringify({ uploadId: init.data.uploadId, key: init.data.key, parts, meta: { wallpaperId: item.id, variantLabel: label, fps: 30, size: produced.length } }),
+        })).json();
+        if (!done2?.ok) throw new Error(`变体合并失败 ${JSON.stringify(done2).slice(0, 120)}`);
+      } else {
+        const upload = await fetch(`${BASE}/api/admin/wallpapers/${item.id}/variant?label=${encodeURIComponent(label)}&fps=30`, {
+          method: 'PUT', headers: { ...auth, 'content-type': 'video/mp4' }, body: produced,
+        });
+        const uploaded = await upload.json().catch(() => null);
+        if (!upload.ok || !uploaded?.ok) throw new Error(`上传变体失败 ${upload.status} ${JSON.stringify(uploaded).slice(0, 120)}`);
+      }
 
       const pub = await fetch(`${BASE}/api/admin/wallpapers/${item.id}/publish`, { method: 'POST', headers: auth });
       const published = await pub.json().catch(() => null);
       if (!pub.ok || !published?.ok) {
-        // 回滚变体记录：把刚加的 label 删掉
-        await fetch(`${BASE}/api/admin/wallpapers/${item.id}/variants`, {
-          method: 'POST', headers: { ...auth, 'content-type': 'application/json' },
-          body: JSON.stringify({ label: `__rollback__${Date.now()}` }),
+        // 真正回滚：删掉刚写入的变体记录（含 R2 引用），不留半发布
+        await fetch(`${BASE}/api/admin/wallpapers/${item.id}/variant?label=${encodeURIComponent(label)}`, {
+          method: 'DELETE', headers: auth,
         }).catch(() => {});
         throw new Error(`发布失败 ${pub.status} ${JSON.stringify(published).slice(0, 120)}`);
       }
       done += 1;
+      processed += 1;
       console.log(`  ✓ ${item.title} → ${label} 30fps · ${(produced.length / 1048576).toFixed(1)}MB · published`);
     } catch (error) {
       failed.push({ title: item.title, reason: error.message });
@@ -130,8 +155,9 @@ async function main() {
   }
 
   console.log('\n汇总');
+  row('待转码', String(items.length));
   row('处理', String(done));
-  row('跳过', String(skipped));
+  row('跳过', String(skippedEmpty));
   row('失败', String(failed.length));
   for (const item of failed) console.log(`  - ${item.title}：${item.reason}`);
 }

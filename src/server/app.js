@@ -66,6 +66,7 @@ const DEFINITIONS = [
   // 阶段二：待转码队列 / 变体 / 发布
   { method: 'POST', path: '/api/admin/wallpapers/:id/variants', handler: wallpaperRoutes.addVariant, auth: 'session' },
   { method: 'PUT', path: '/api/admin/wallpapers/:id/variant', handler: wallpaperRoutes.uploadVariant, auth: 'session' },
+  { method: 'DELETE', path: '/api/admin/wallpapers/:id/variant', handler: wallpaperRoutes.deleteVariant, auth: 'session' },
   { method: 'POST', path: '/api/admin/wallpapers/:id/publish', handler: wallpaperRoutes.publish, auth: 'session' },
   { method: 'PUT', path: '/api/admin/wallpapers/:id/asset', handler: wallpaperRoutes.upload, auth: 'session' },
   { method: 'PUT', path: '/api/admin/wallpapers/:id/thumb', handler: wallpaperRoutes.uploadThumb, auth: 'session' },

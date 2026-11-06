@@ -41,7 +41,7 @@ import { clientIp } from '../session.js';
 import { readMediaMeta } from '../../core/image-meta.js';
 import {
   assertDailyQuota, attachVariant, buildImportReport, createWallpaperRow, importMedia, ingestAsset,
-  ingestVariantAsset, publishWallpaper, recordDailyUsage,
+  ingestVariantAsset, ingestVariantFromObject, publishWallpaper, recordDailyUsage, removeVariant,
 } from '../ingest.js';
 
 /** 大文件跳过完整 sha256 的阈值（真正的实现在 ingest.js，这里 re-export 供测试/工具引用）。 */
@@ -453,6 +453,19 @@ export async function addVariant({ env, actor, request, params }) {
   const body = await readJson(request);
   const label = String(body.label ?? '').trim().slice(0, 24);
   if (!label) throw badRequest('缺少变体 label');
+  if (typeof body.tmpKey === 'string' && body.tmpKey) {
+    const result = await ingestVariantFromObject(env, actor, row, {
+      key: body.tmpKey,
+      size: Number(body.bytes) || Number(body.size) || 0,
+      label,
+      fps: Number(body.fps) || null,
+    });
+    const freshRow = await first(env, Q.wallpaperById, row.id);
+    return json({
+      variants: result.variants,
+      wallpaper: wallpaperDto(freshRow, { admin: true, mediaBase: mediaBaseFor(env) }),
+    });
+  }
   const variants = await attachVariant(env, actor, row, {
     label,
     width: Number(body.width) || null,
@@ -492,6 +505,17 @@ export async function uploadVariant({ env, actor, request, params, url }) {
 }
 
 /** 阶段二：发布（原片可播 或 已有可播变体），成功后清 needs_variant */
+
+/** DELETE /api/admin/wallpapers/:id/variant?label= —— 发布失败回滚 */
+export async function deleteVariant({ env, actor, params, url }) {
+  assertCan(actor, ACTION.WALLPAPER_UPDATE);
+  const row = await loadWallpaper(env, params.id);
+  const label = String(url.searchParams.get('label') ?? '').trim();
+  if (!label) throw badRequest('缺少变体 label');
+  const variants = await removeVariant(env, actor, row, label);
+  return json({ variants });
+}
+
 export async function publish({ env, actor, params }) {
   assertCan(actor, ACTION.WALLPAPER_UPDATE);
   const row = await loadWallpaper(env, params.id);

@@ -966,6 +966,63 @@ export async function ingestVariantAsset(env, actor, row, { bytes, label, fps },
   return { key, variants: list };
 }
 
+
+/** 删除一个变体（发布失败回滚用） */
+export async function removeVariant(env, actor, row, label, { now = nowMs() } = {}) {
+  const list = safeJsonParse(row.variants, []).filter((item) => item && item.label !== label);
+  await run(env, Q.updateWallpaperVariants, JSON.stringify(list), now, row.id);
+  return list;
+}
+
+/**
+ * 用已上传到 `_tmp/` 的对象生成变体（>100MB 的变体走分片后走这里）。
+ * 与 ingestVariantAsset 同一套校验，只是不再把整段文件读进内存。
+ */
+export async function ingestVariantFromObject(env, actor, row, { key, size, label, fps }, { now = nowMs() } = {}) {
+  if (!key || !String(key).startsWith('_tmp/')) throw badRequest('临时对象 key 不合法');
+  const total = Number(size) || 0;
+  if (!(total > 0)) throw badRequest('临时对象为空');
+  if (total > 400 * 1024 * 1024) throw payloadTooLarge('单个变体不能超过 400MB（请降低 crf 或分辨率后重试）');
+
+  const head = await readRangeBytes(env, key, 0, Math.min(STREAM_PROBE_BYTES, total));
+  if (!head) throw badRequest('临时对象不存在');
+  const tail = total > STREAM_PROBE_BYTES
+    ? await readRangeBytes(env, key, Math.max(0, total - STREAM_PROBE_BYTES), Math.min(STREAM_PROBE_BYTES, total))
+    : new Uint8Array(0);
+  const meta = readMediaMeta(head);
+  if (!meta.mime) throw unsupportedMedia(meta.error ?? '无法识别的变体文件');
+
+  const merged = new Uint8Array(head.byteLength + tail.byteLength);
+  merged.set(head, 0);
+  merged.set(tail, head.byteLength);
+  const sha = await sha256Bytes(merged);
+  const mime = meta.mime;
+  const vkey = variantKey(row.id, sha, { label }, mime);
+
+  const source = await env.BUCKET.get(key);
+  if (!source) throw badRequest('临时对象不存在');
+  await env.BUCKET.put(vkey, source.body, {
+    httpMetadata: { contentType: mime, cacheControl: 'public, max-age=31536000, immutable' },
+  });
+  const check = await verifyAsset(env, vkey, total);
+  if (!check.ok) {
+    await deleteAsset(env, vkey);
+    throw storageVerifyFailed('变体写入校验失败，请重试');
+  }
+  const info = readVideoInfo(head, mime);
+  const list = await attachVariant(env, actor, row, {
+    label,
+    width: meta.width,
+    height: meta.height,
+    fps: Number(fps) || info.fps || null,
+    codec: info.codec ?? 'h264',
+    bytes: check.size,
+    sha256: sha,
+    key: vkey,
+  }, { now });
+  return { key: vkey, variants: list };
+}
+
 /** 发布：原片可播 或 已有可播变体；成功后清 needs_variant */
 export async function publishWallpaper(env, actor, row, { now = nowMs() } = {}) {
   const variants = safeJsonParse(row.variants, []);
