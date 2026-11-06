@@ -435,7 +435,26 @@
     return report;
   }
 
-  /** 导入报告弹窗：成功 N / 复用 M / 失败 K，每条失败给原因，每条成功给自动修正项。 */
+  /**
+   * 跳过原因归类：把「因为具体数值而不同」的 reason 归成一条，
+   * 这样顶部的汇总才读得懂（否则 267 条能给你列出 267 种原因）。
+   */
+  function skipReasonKind(reason) {
+    const text = String(reason || '');
+    if (/场景包/.test(text)) return '场景包（只有 .pkg 场景 / 低清预览，需要录屏或转 mp4）';
+    if (/超过单文件上限|超限/.test(text)) return '超过单文件上限（图片/视频 55MB、zip 64MB）';
+    if (/低于 1600px|低清/.test(text)) return '图片宽度不足 1600px（拿不到高清原图）';
+    if (/扫描失败/.test(text)) return '目录扫描失败（授权或读取异常）';
+    return text || '未说明原因';
+  }
+
+  /**
+   * 导入报告弹窗：成功 N / 复用 M / 失败 K / 跳过 J。
+   *
+   * 2026-11-07 修：以前「跳过」那一行只显示「跳过 · 无需修正」，**原因根本没渲染**，
+   * 于是「扫描上传 0 条成功」时完全看不出为什么 —— 267 条跳过等于 267 个谜。
+   * 现在失败和跳过都把 `reason` 打出来，顶部再加一行按原因归类的汇总。
+   */
   function showImportReport(report) {
     const failures = report.items.filter((item) => item.status === 'failed');
     const fixes = new Map();
@@ -446,15 +465,28 @@
       .map(([code, count]) => `${IMPORT_AUTOFIX_LABEL[code] || code} × ${count}`)
       .join('；');
     const skipped = report.items.filter((item) => item.status === 'skipped');
+
+    // 跳过原因汇总：按类别计数，按条数降序
+    const skipBuckets = new Map();
+    for (const item of skipped) {
+      const kind = skipReasonKind(item.reason);
+      skipBuckets.set(kind, (skipBuckets.get(kind) || 0) + 1);
+    }
+    const skipLine = [...skipBuckets.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([kind, count]) => `${kind} × ${count}`)
+      .join('；');
+
     const row = (item) => {
       const badge = item.status === 'skipped' ? '跳过'
         : item.status === 'reused' ? '已存在'
           : item.status === 'failed' ? '失败' : '成功';
-      const detail = item.status === 'failed'
-        ? esc(item.reason || '导入失败')
+      // 失败与跳过都必须给原因；成功给自动修正项
+      const detail = (item.status === 'failed' || item.status === 'skipped')
+        ? esc(item.reason || (item.status === 'failed' ? '导入失败' : '未导入'))
         : esc((item.autoFixes || []).map((code) => IMPORT_AUTOFIX_LABEL[code] || code).join('、') || '无需修正');
-      return `<li class="wep-item${item.status === 'failed' ? ' skipped' : ''}">
-        <span class="wep-title">${esc(item.title || '(未命名)')}</span>
+      return `<li class="wep-item ${item.status === 'failed' ? 'failed' : item.status === 'skipped' ? 'skipped' : ''}">
+        <span class="wep-title" title="${esc(item.title || '')}">${esc(item.title || '(未命名)')}</span>
         <span class="wep-meta">${badge} · ${detail}</span>
       </li>`;
     };
@@ -465,6 +497,7 @@
       <h3>导入报告</h3>
       <p class="hint">报告号 ${esc(report.reportId)}<br>
         成功 ${report.imported} · 复用 ${report.reused} · 失败 ${report.failed}${skipped.length || report.skipped ? ` · 跳过 ${report.skipped || skipped.length}` : ''}</p>
+      ${skipLine ? `<p class="hint"><strong>跳过的原因</strong>：${esc(skipLine)}</p>` : ''}
       ${fixLine ? `<p class="hint">自动修正：${esc(fixLine)}</p>` : ''}
       ${failures.length ? `<p class="hint">失败 ${failures.length} 条 —— 原因列在下面；这些条目**没有**入库。</p>` : ''}
       ${body}
@@ -954,13 +987,15 @@
             title: baseTitle, file: video, kind: 'dynamic', tags, variants: variant ? [variant] : [],
           });
         } else {
-          // 场景包（.pkg）没有可用的原图，preview 只是缩略图，不能当作品
+          // 场景包（.pkg）没有可用的原图，preview 只是缩略图，不能当作品。
+          // 两条出路：录屏转 mp4 再扫；或 `tools/pack-we-project.mjs` 打包成 zip，
+          // 用「批量导入本地文件」上传（那条路接受 .zip，服务端按 bundle 豁免宽高）。
           entries.push({
             title: baseTitle,
             file: null,
             kind: 'static',
             tags,
-            skipReason: '场景包只有低清预览，需要录屏转 mp4',
+            skipReason: '场景包只有低清预览：需录屏转 mp4，或用 pack-we-project 打包成 zip 后「批量导入本地文件」',
           });
         }
       }

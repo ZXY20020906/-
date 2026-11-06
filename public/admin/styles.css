@@ -687,3 +687,13 @@ tr.needs-variant td { background: rgba(251, 191, 36, 0.06); }
 .queue-item.uploading .queue-meta,
 .queue-item.hashing .queue-meta { color: var(--warn); }
 .queue-item.skipped { opacity: 0.55; }
+
+/* 导入报告：长标题不能把「状态 · 原因」挤出可视区（flex 子项默认 min-width:auto 会撑破） */
+.wep-title { min-width: 0; }
+.wep-item { flex-wrap: nowrap; }
+.wep-meta { white-space: nowrap; }
+@media (max-width: 720px) {
+  .wep-item { flex-wrap: wrap; }
+  .wep-meta { white-space: normal; }
+}
+.wep-item.failed { border-color: #4a2a2a; background: rgba(248, 113, 113, 0.08); opacity: 1; }
