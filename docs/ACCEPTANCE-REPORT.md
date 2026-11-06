@@ -149,7 +149,7 @@ B4   发布后公开列表命中=1 · 详情 variants 同上 · ?playable=1080p3
 | `e7ccf916` | 阶段五进度看板 + 证据 |
 | `d55e3db3` | **本轮**：补快照对象 HTTP 出口（C2）+ cleanup dryRun/会话认证（E4） |
 | `05aff4f5` | **本轮**：边缘缓存不改写 immutable（C3） |
-| `<本报告>` | docs(acceptance)：A–G 验收报告 + cleanup dry-run 单测 |
+| `feef1e6b` | **本轮**：docs(acceptance) A–G 验收报告 + `tests/upload-cleanup.test.js`（dry-run 分支） |
 
 ## 四、遗留与建议（不影响开工）
 
