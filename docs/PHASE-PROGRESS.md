@@ -9,7 +9,7 @@
 | 阶段一 | 分片上传（≤2GB，multipart + 断点续传 + 清理工具） | ✅ 已完成并线上验收 | `4668895b` / `91b0bfc3` / `e2c8fa6d` |
 | 阶段二 | 60fps/超限原片先入库后转码（needs_variant + make-variants） | ✅ 已完成并线上验收 | `8fdb3319` / `ee50739a` / `b35b1f1b` / `fd25009` |
 | 阶段三 | 公开读静态化（snapshot.js + current.json + parity） | ✅ 已完成并线上验收 | `6d44af03` / `3b946955` |
-| 阶段四 | 后台分页 + 短缓存 + TTL 文档 | ⬜ 未开始 | — |
+| 阶段四 | 后台分页 + 短缓存 + TTL 文档 | ✅ 已完成并线上验收 | `1fa27774` |
 | 阶段六 | 运维三件套（inspect-assets / d1-usage / export-d1） | ⬜ 未开始 | — |
 | 阶段五 | 管理端效率（批量上传 / 重试 / 去重 / 批量改标签） | ⬜ 未开始 | — |
 
@@ -78,15 +78,56 @@ node tools/build-snapshot.mjs --force      # 内容没变也写新版本（排�
 
 ---
 
+## 阶段四：后台分页 + 短缓存 + TTL 文档（已完成，2026-11-06）
+
+### 做了什么
+
+| 文件 | 作用 |
+|---|---|
+| `src/server/short-cache.js`（新） | 进程内 TTL 缓存：前缀清理、FIFO 淘汰（64 条上限）、`cacheStats()` 诊断 |
+| `src/server/routes/wallpapers.js` | 后台列表默认 `limit=20`，支持 `page`（1 起）+ 旧 `offset`；返回 `total/limit/offset/page/pageCount/hasMore`；60s 短缓存（键 = 登录人 + 全部筛选 + 分页） |
+| `src/server/app.js` | 任何 `/api/admin/*` 写操作成功后统一清 `admin:list:`；**降级响应不进边缘缓存**（看 `x-folia-degraded`） |
+| `src/server/routes/public-v1.js` | `cacheHeadersFor()`：正常 300s / `degraded` 改 `no-store` + `x-folia-degraded: 1`；分类/标签/子标签/详情也补齐缓存头 |
+| `tools/d1-usage.mjs`（新） | 按 `date` 维度出今日与近 N 天的行读/行写/使用率；>80% 退 2，缺权限退 3 |
+| `docs/OPS.md` | 端点级 TTL 表、「降级不缓存」、后台缓存局限、D1 用量观测 |
+| `tests/admin-list.test.js`（新） | D1–D6：分页 / 缓存命中不查库 / 写后失效 / 关缓存 / 降级头 / 清理 |
+
+> 说明：`tools/d1-usage.mjs` 原本排在阶段六，但阶段四的验收口径就要用它观测，
+> 所以提前落地（阶段六再补 `inspect-assets` / `export-d1`）。
+
+### 测试基线
+
+`npm test`：**367 pass / 0 fail**（阶段三基线 361，新增 6 条）。
+`check-sql`：111 条查询 0 失败。`check-syntax`：57 个模块通过。`smoke`：9/9。
+阶段三 ①–⑦ 复跑：11/11（快照路径没有被阶段四改坏）。
+
+### 线上验收（2026-11-06）
+
+| # | 项 | 证据 |
+|---|---|---|
+| ① | 后台连点 10 次「刷新」⇒ D1 行读增量 ≤ 20 | 冷启动一次 **1174 行**；随后 9 次热请求共 **36 行**；对照组（同样 9 次 `/api/auth/me`，只有会话鉴权、没有列表查询）也是 **36 行** ⇒ **列表本身增量 A−B = 0 行**。逐秒：`4/8/8/4/4/6/2` vs `4/8/12/12` |
+| ② | 公开清单连点 10 次 ⇒ D1 行读增量 ≈ 0 | 阶段三 ④ 的同一组探针复跑：10/10 `degraded` 为空、`x-folia-edge: MISS`、该窗口 D1 analytics 无分片 |
+| ③ | 上传/编辑后后台列表立即可见（写操作清缓存生效） | 预热同一 URL（1059ms, total=235）→ POST 建条目 → **同一 URL** 立刻 `total=236` 且能查到新条目 → PATCH 改名 → 列表立即变 `阶段四验收-已改名` → DELETE → `total` 回到 235。走的都是 60s 缓存窗口内，证明是「主动清」不是「自然过期」 |
+| ④ | 缓存头复核 | `GET /api/v1/public/categories` 现在是 `public, max-age=300, stale-while-revalidate=3600`（此前是 `no-store`，与边缘缓存行为不一致）；`current.json` 300s、`snapshots/**` immutable 不变；`degraded` 响应 `no-store` + `x-folia-degraded: 1`（本地 D5 用例断言，线上 ⑥ 场景可复现） |
+| ⑤ | D1 用量可见 | `node tools/d1-usage.mjs --days 3`：今日 692,807 / 5,000,000（13.9%）；11-04、11-05 分别 5.67M / 5.56M（正是额度事故那两天） |
+
+### 已知局限（写进 OPS）
+
+- 后台列表缓存是**进程内**的：不同 colo 的 isolate 各自一份，跨 isolate 失效最多等 60s
+  （与 `rate-limit.js` 同类限制）。公开读的一致性靠快照，不靠它。
+- 后台列表默认 `limit=20`，但管理端前端目前显式传 `limit=200`（一次拉全量）。
+  前端分页留给阶段五的「管理端效率」一起做 —— 后端接口已经支持 `page`。
+
+---
+
 ## 缺失文档
 
 派单里提到的 `docs/SITE-CHARTER.md` 在仓库中**不存在**（`docs/PHASE-PROGRESS.md` 即本文件）。
 
 ## 下一步（按派单顺序）
 
-1. 阶段四：后台分页 + 短缓存 + TTL 文档（有了快照，`current.json` 的 TTL 可以放心拉长）
-2. 阶段六：运维三件套（inspect-assets / d1-usage / export-d1）
-3. 阶段五：管理端效率（批量上传 / 重试 / 去重 / 批量改标签）
+1. 阶段六：运维三件套（`inspect-assets` / `d1-usage` ✅ / `export-d1`）——`d1-usage` 已在阶段四落地
+2. 阶段五：管理端效率（批量上传 / 重试 / 去重 / 批量改标签 / 前端分页）
    每阶段独立验收后再进下一阶段。
 
 ## 已知风险
