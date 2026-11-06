@@ -1,72 +1,50 @@
-# 阶段三交接（给新会话直接粘贴）
+# 阶段三交接（公开读静态化）
 
-> 用途：协作者机器开新会话时，把下面「提示词」整段粘贴进去即可无缝续做。
-> 主文档：`docs/PHASE3-EXECUTION.md`（步骤 1–7）；本文补充已裁决事项与硬要求。
+> 状态：**未实现**。本文只固化裁决与实施清单，供新会话直接开工。
+> 开工第一件事：`git pull --rebase origin main`，再读 `docs/PHASE3-EXECUTION.md`。
 
----
+## 已裁决（不要再问）
 
-## 已裁决事项（不要重新讨论）
+1. **快照范围**：`status='published'` **且** 所属分类 `categories.is_public = 1`（A 方案）
+   - 不给 `wallpapers` 加列；分类改公开/隐藏 ⇒ 重建快照即生效
+2. **新旧分工**
+   - `src/server/snapshot.js`（新）= 静态快照，正常路径，0 D1 行读
+   - `src/server/public-snapshot.js`（旧，181KB 单行 JSON）= D1 不可用时的 degraded 兜底
+   - 两条互不替代，**不重命名、不删除**
+3. **必须新增 `tests/snapshot-parity.test.js`**：同一份数据两条路径对拍
+   - 断言：排序后的 ids 序列、total、facets 完全一致；排序键（updatedAt/publishedAt/featured）也要对拍
+   - 覆盖 16 块：无参 / category / kind / tag / subtag / q / aspect / featured /
+     minWidth+maxWidth / minHeight+maxHeight / minDurationMs+maxDurationMs /
+     minBytes+maxBytes / fpsMax / playable / audio / page+limit / 组合 3–4 个
+   - 命名建议 S10a…S10p；任何不一致 ⇒ 红，不许放宽断言
 
-| # | 事项 | 结论 |
-|---|---|---|
-| 1 | 快照包含哪些条目 | **A 方案**：`status='published'` 且 `所属分类 categories.is_public=1`；不给 wallpapers 加 is_public 列 |
-| 2 | 旧的 `src/server/public-snapshot.js` | **保留做 degraded 兜底**，不改、不删；新的 `src/server/snapshot.js` 只负责静态快照 |
-| 3 | 筛选等价性 | 必须新增 `tests/snapshot-parity.test.js`，16 块逐块对拍（ids 排序后 / total / facets / sort） |
-| 4 | 顺序 | 按 `PHASE3-EXECUTION.md` 的 1→7 一次做完，不推半成品 |
-| 5 | 空桶 `folia-upload` | 不使用；单桶 + `_tmp/`；空桶删除或标注废弃 |
-| 6 | 禁止 | 不改绑定名 / 不用 S3 预签名 / Worker 无 ffmpeg / 不绕过 ingestAsset / 不 force push / 不提交 token |
+## 实施顺序
 
----
+1. **先读** `src/server/public-api.js`（筛选实现）与 `src/server/queries.js`（对应 SQL）——
+   这是全部风险所在，未读完不要动读取层
+2. `src/server/snapshot.js`
+   - `SNAPSHOT_PREFIX = 'snapshots'`
+   - `computeVersion(env, payload)`：`utcCompact + '-' + sha256(wallpapersJson).slice(0,8)`，内容不变返回原 version
+   - `buildSnapshot(env)`：复用 queries + dto，产出 `{version, manifest, wallpapers}`
+   - `publishSnapshot(env)`：写 `snapshots/<version>/{manifest,wallpapers}.json` + 覆盖 `current.json`
+   - `readSnapshot(env)`：先 `current.json`，再对应版本文件；缺失返回 null
+3. `public-api.js`：`readSnapshot` 命中 ⇒ 内存筛选/分页/排序（参数与 SQL 全等价）；
+   未命中 ⇒ 现有 D1 路径 + `degraded: true`；详情先快照后 D1
+4. `routes/public-v1.js`：`GET /api/v1/public/current.json`；
+   `current.json` → `public, max-age=300`；`snapshots/**` → `public, max-age=31536000, immutable`
+5. `ingest.js` 四个触发点（上传 complete / attachVariant / publishWallpaper / 下架编辑），
+   用 `env.SNAPSHOT_AUTO !== '0'` 控制，失败只记日志不阻断主流程
+6. `tools/build-snapshot.mjs`：`--dry-run` / `--force`
+7. 测试：`tests/snapshot.test.js` 9 条 + `tests/snapshot-parity.test.js` 16 块
+8. 线上验收 ①–⑦
 
-## 提示词（新会话直接粘贴）
+## 风险提示
 
-```
-仓库：folia-admin，先 git pull --rebase origin main。
-任务：实现「阶段三 公开读静态化」，按 docs/PHASE3-EXECUTION.md 的 1→7 一次做完。
+- 内存筛选与 SQL 不等价 ⇒ **全站公开列表错乱**，必须先有 parity 测试再切读取层
+- 构建失败要保留旧 `current.json`；不要删旧快照（回滚 = 把 current 指回上一版）
+- `public-snapshot.js` 是单行大 JSON，**不要用 grep/less 直接打印**（会刷屏）
 
-已裁决（不要再问）：
-· 快照包含 status='published' 且 categories.is_public=1 的条目（A 方案，不加 is_public 列）
-· 旧的 src/server/public-snapshot.js 保留做 degraded 兜底，不改不删
-· 必须新增 tests/snapshot-parity.test.js：同一份数据分别走「快照内存筛选」与「D1 SQL」，
-  16 块逐块对拍 ids（排序后）/ total / facets / sort，任何一块不一致都算失败
-  （覆盖：无参 / category / kind / tag / subtag / q / aspect / featured /
-    min+maxWidth / min+maxHeight / minDurationMs+maxDurationMs / minBytes+maxBytes /
-    fpsMax / playable / audio / page+limit / 3–4 参数组合）
+## 后续阶段
 
-实现要点：
-1) src/server/snapshot.js：computeVersion / buildSnapshot / publishSnapshot / readSnapshot
-   · 复用 queries.js + dto.js（不新写 SQL、不复制 item 构造）
-   · version = UTC紧凑时间戳 + sha256(wallpapers).slice(0,8)；内容未变不切换
-   · R2：snapshots/<version>/{manifest,wallpapers}.json + current.json（覆盖写）
-2) public-api.js：读取层快照优先 → 内存筛选/分页/排序 → 快照缺失回退 D1 + degraded:true
-   15 个筛选参数与 sort 全部保持兼容；facets 直接用快照里的计数
-3) public-v1.js：current.json 路由；缓存头 current=300s、snapshots=immutable 1 年；304 不回源
-4) ingest.js 四个触发点：上传 complete / attachVariant / publishWallpaper / 下架编辑
-   失败只记日志，不阻断主流程
-5) tools/build-snapshot.mjs：--dry-run / --force，输出 version/items/耗时/是否切换
-6) tests/snapshot.test.js 9 条（S1–S9，见执行文档）+ parity 16 块
-7) 部署后线上验收 ①–⑦：
-   ① 6 端点 200、total=110；② facets 合计==total；③ manifest ETag 稳定 + 304
-   ④ 连点 10 次清单 D1 行读≈0（tools/d1-usage.mjs 或面板）
-   ⑤ 传一条新素材 ⇒ current.json 版本变化 ⇒ 列表立即可见
-   ⑥ 手动删一个快照对象 ⇒ 回退 D1 + degraded:true，不 500
-   ⑦ 详情 variants 含 label/width/height/fps，与列表一致
-
-约束：不改 wrangler.toml 绑定名；不删 R2 旧对象；不 force push；不提交 token；
-      draft 不得出现在快照；全量测试与 check-sql 必须 0 失败；每次 commit 后 push 并等部署。
-
-汇报：改动文件 + 新增测试条数 + 上述 ①–⑦ 证据 + commit hash。
-```
-
----
-
-## 我（主开发机）的复核清单
-
-```
-1) npm test 全绿（≥331 + 新增 snapshot/parity）
-2) 连点 10 次清单：D1 行读增量≈0
-3) 删一个快照对象：回退 D1、degraded:true、不 500
-4) 上传新素材：current.json 版本变化、列表立即可见
-5) 详情 variants 字段与列表一致（label/width/height/fps）
-6) parity 测试抽查 3 块：手工构造参数组合，两条路径结果一致
-```
+`docs/PHASE4-6-HANDOFF.md`（阶段四 TTL / 阶段五 管理端效率 / 阶段六 运维三件套）——
+按派单顺序：阶段三 → 阶段四 → 阶段六 → 阶段五，每阶段独立验收后再进下一阶段。
