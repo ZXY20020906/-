@@ -101,7 +101,7 @@ async function main() {
       ], { stdio: 'inherit', timeout: 10 * 60 * 1000 });
       const produced = readFileSync(out);
       if (!produced.length) throw new Error('ffmpeg 产物为空');
-      if (produced.length > 100 * 1024 * 1024) throw new Error('变体超过 100MB，请降低码率后再传');
+      // >100MB 不再拒绝：下面会自动走分片上传（服务端硬上限 400MB）
 
       const label = width > 1920 ? '1080p' : `${height}p`;
       if (produced.length > 400 * 1024 * 1024) throw new Error('变体超过 400MB 上限，请降低 crf 或分辨率');
