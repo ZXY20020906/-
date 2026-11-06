@@ -11,7 +11,7 @@
 | 阶段三 | 公开读静态化（snapshot.js + current.json + parity） | ✅ 已完成并线上验收 | `6d44af03` / `3b946955` |
 | 阶段四 | 后台分页 + 短缓存 + TTL 文档 | ✅ 已完成并线上验收 | `1fa27774` / `56f3478a` |
 | 阶段六 | 运维三件套（inspect-assets / d1-usage / export-d1） | ✅ 已完成并线上验收 | `2aac2db3` |
-| 阶段五 | 管理端效率（批量上传 / 重试 / 去重 / 批量改标签） | ⬜ 未开始 | — |
+| 阶段五 | 管理端效率（批量上传 / 重试 / 去重 / 批量改标签） | ✅ 已完成并线上验收 | `36b8091f` |
 
 ---
 
@@ -169,15 +169,57 @@ node tools/build-snapshot.mjs --force      # 内容没变也写新版本（排�
 
 ---
 
+## 阶段五：管理端效率（已完成，2026-11-06）
+
+### 做了什么
+
+| 文件 | 作用 |
+|---|---|
+| `src/server/routes/wallpapers.js` | 新增 `POST /api/admin/wallpapers/batch`（批量套同一份 patch）与 `POST /api/admin/wallpapers/duplicate-check`（上传前查重）；把单条 PATCH 的落库逻辑抽成 `applyWallpaperPatch()`，**批量与单条共用同一份规则** |
+| `src/server/app.js` | 注册上面两个路由 |
+| `public/admin/app.js` | 列表页可直接**拖文件**导入；导入队列 2 并发、逐条状态、失败原因人话化、失败项可重试；上传前算摘要查重；批量工具条（改分类/改标签/发布/下线/软删）；行内补待转码徽标 + fps + 变体档位；新增「待转码」筛选 |
+| `public/admin/styles.css` | 批量条、拖拽落区高亮、导入队列行状态、待转码行 |
+| `tests/admin-batch.test.js`（新） | 9 条（P1–P9）：批量改标签/发布下线软删/部分失败/权限/分类校验/快照重建/查重三条判据/未登录 |
+
+**为什么批量要单独做一个接口**：前端循环发 5 次 PATCH 会有 5 次审计、5 次快照重建，
+而且「第 3 条失败之后要不要继续」没有统一答案。现在服务端一次处理：逐条判权限与归属、
+部分失败不中断、失败原因逐条返回、整批只写一条审计、只重建一次快照。
+
+**查重的三级判据**（与导入管线一致）：`sha256` → `content_fingerprint`（>40MB 的采样指纹，
+浏览器用「首尾各 1MB」自己算，与服务端 `sampleFingerprint()` 同口径）→ 标题 + 字节数。
+
+### 测试基线
+
+`npm test`：**383 pass / 0 fail**（阶段六基线 374，新增 9 条）。
+`check-sql` 111 条 0 失败；`check-syntax` 57 模块；`check-ui`：后台 88 个 id / 37 个动作 / 31 个接口。
+
+### 线上验收（2026-11-06，全部走 UI 用的同一组接口）
+
+| # | 项 | 证据 |
+|---|---|---|
+| ① | 一次拖 10 个文件全部成功 | 10/10 `imported`（2 并发，与前端 `runImportQueue` 同一套顺序与 multipart 字段）· R2 对象 609 → **619（+10，一件素材一个对象）** · 无失败 |
+| ② | 重复文件提示复用、R2 对象数不增加 | 同一份文件再查：`duplicate-check` 命中 `matchedBy=sha256` ⇒ 前端跳过上传 · R2 对象 **619 → 619** · 服务端兜底（绕过前端再传一次）也会回 `reused` 而不是再写对象 |
+| ③ | 批量改 5 条生效 + 公开接口跟随 | 一次 `POST /batch`（`status=published + reviewStatus=approved + tags=[验ie3x]`）⇒ `updated=5`；公开接口 `?tag=验ie3x&limit=100` ⇒ **total=5**；`current.json` 版本 `…094616Z-7d8a23c8` → `…094654Z-5615e429`（快照确实重建了） |
+| ④ | 待转码徽标数 == `needs_variant` 数 | 造 2 条 `needs_variant=1` 的草稿：D1 计数 **2**、`GET /api/admin/wallpapers?needsVariant=1` **2** 条、完整列表里 `needsVariant=true` 的行 **2** 行；跑完即删 |
+| ⑤ | 收尾 | 10 条临时素材与 2 条探针全部删除（D1 里 `阶段五验收%`/`阶段五探针%` 均为 0，`needs_variant=1` 归 0），临时会话已删；`smoke` 9/9 通过 |
+
+> 本机没有浏览器，所以「拖拽」这一步的验收是**用 UI 完全相同的那套请求**跑的：
+> 同样的 `POST /api/admin/wallpapers/import`、同样的 2 并发、同样的先查重后上传；
+> UI 侧的接线（落区、队列状态、批量条、data-action、接口路径）由 `node tools/check-ui.mjs` 静态校验。
+
+---
+
 ## 缺失文档
 
 派单里提到的 `docs/SITE-CHARTER.md` 在仓库中**不存在**（阶段三、四、六三轮都确认过；
 `docs/PHASE-PROGRESS.md` 即本文件）。
 
-## 下一步（按派单顺序）
+## 下一步
 
-1. 阶段五：管理端效率（批量上传 / 重试 / 去重 / 批量改标签 / 前端分页 UI）
-   后端能力已就位：后台列表支持 `page`、批量入口走 `importMedia`、公开快照在写后自动重建。
+阶段一到六全部完成并线上验收。后续若要继续：
+- 管理端前端分页（后端 `page` 已就绪，UI 仍一次拉 200 条）
+- 定时任务落地（`.github/` 目前为空，`docs/OPS.md` §8 有现成 yaml）
+- 每阶段独立验收后再进下一阶段。
 
 ## 已知风险
 
