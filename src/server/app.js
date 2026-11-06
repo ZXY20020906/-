@@ -58,6 +58,9 @@ const DEFINITIONS = [
   // 批量入口（立即扫描/添加目录 + 批量导入本地文件）：一个文件一枪，返回导入报告。
   // 与单条 PUT /asset 走同一个 ingestAsset()，见 routes/wallpapers.js 的 importAsset()。
   { method: 'POST', path: '/api/admin/wallpapers/import', handler: wallpaperRoutes.importAsset, auth: 'session' },
+  // 阶段五：批量改（分类/标签/发布/下架/软删）与上传前查重
+  { method: 'POST', path: '/api/admin/wallpapers/batch', handler: wallpaperRoutes.batchUpdate, auth: 'session' },
+  { method: 'POST', path: '/api/admin/wallpapers/duplicate-check', handler: wallpaperRoutes.duplicateCheck, auth: 'session' },
   { method: 'POST', path: '/api/admin/wallpapers/reorder', handler: wallpaperRoutes.reorder, auth: 'session' },
   { method: 'GET', path: '/api/admin/wallpapers/:id', handler: wallpaperRoutes.get, auth: 'session' },
   { method: 'GET', path: '/api/admin/subtags', handler: subtagRoutes.list, auth: 'session' },

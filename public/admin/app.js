@@ -9,7 +9,7 @@
     wallpapers: { items: [], total: 0 },
     members: [],
     audit: [],
-    filters: { q: '', status: '', review: '', categoryId: '', tag: '', subtag: '', format: '' },
+    filters: { q: '', status: '', review: '', categoryId: '', tag: '', subtag: '', format: '', needsVariant: false },
     tagVocabulary: [],
     tags: [],
     subtags: [],
@@ -144,6 +144,73 @@
       throw error;
     }
     return payload.data;
+  }
+
+  // ------------------------------------------------------------------ 上传前查重（阶段五）
+  /**
+   * 多大的文件改走「采样指纹」。与 `core/media-limits.js` 的 HASH_LIMIT_BYTES 同一个数：
+   * 40MB 以内整文件算 sha256，超过就只取首尾各 1MB —— Worker 那边 128MB 内存同样装不下。
+   */
+  const HASH_LIMIT_BYTES = 40 * 1024 * 1024;
+
+  async function sha256HexOf(buffer) {
+    const digest = await crypto.subtle.digest('SHA-256', buffer);
+    return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  /**
+   * 文件摘要：小文件整段 sha256，大文件首尾各 1MB 的采样指纹。
+   * 口径必须和服务端一致，否则「查重说没有、导入说重复」会来回打脸：
+   *   sha256       ↔ ingest 的 `sha256Bytes()`
+   *   fingerprint  ↔ ingest 的 `sampleFingerprint()`
+   */
+  async function fileDigest(file) {
+    if (file.size <= HASH_LIMIT_BYTES) {
+      return { mode: 'sha256', value: await sha256HexOf(await file.arrayBuffer()) };
+    }
+    const chunk = 1024 * 1024;
+    const head = new Uint8Array(await file.slice(0, chunk).arrayBuffer());
+    const tail = new Uint8Array(await file.slice(Math.max(0, file.size - chunk)).arrayBuffer());
+    const merged = new Uint8Array(head.length + tail.length);
+    merged.set(head, 0);
+    merged.set(tail, head.length);
+    return { mode: 'fingerprint', value: await sha256HexOf(merged) };
+  }
+
+  /**
+   * 问服务端「这个文件是不是已经有了」。命中就直接复用，一个字节都不传。
+   * 查重失败按「没重复」处理：它是优化项，不能把正常上传卡死。
+   */
+  async function findDuplicate(entry) {
+    try {
+      const digest = entry.digest || await fileDigest(entry.file);
+      entry.digest = digest;
+      const data = await api('/admin/wallpapers/duplicate-check', {
+        method: 'POST',
+        body: {
+          sha256: digest.mode === 'sha256' ? digest.value : undefined,
+          fingerprint: digest.mode === 'fingerprint' ? digest.value : undefined,
+          bytes: entry.file.size,
+          title: entry.title,
+        },
+      });
+      return data.duplicate;
+    } catch (error) {
+      console.warn('[dedupe] 查重失败，按未重复处理', error.message);
+      return null;
+    }
+  }
+
+  /** 把接口异常翻译成「人话」，批量导入的失败原因直接展示这一句。 */
+  function describeImportError(error) {
+    const status = error && error.status;
+    if (status === 413) return '文件太大（413）';
+    if (status === 422) return `体检未通过（422）：${error.message}`;
+    if (status === 403) return '没有权限（403）';
+    if (status === 401) return '登录已过期（401）';
+    if (status === 429) return '太频繁了（429），稍后再试';
+    if (!status) return `网络中断：${error && error.message ? error.message : '连接失败'}`;
+    return `${status}：${error.message || '导入失败'}`;
   }
 
   /**
@@ -295,22 +362,75 @@
     };
   }
 
-  /** 逐条导入（服务端一次一个文件），最后拼成一份报告。 */
-  async function runImportQueue(entries, { categoryId, publish = false, skipped = [], onProgress } = {}) {
+  /** 并发度：2 个文件同时传。再高会把上行带宽切成碎片，单条反而更慢。 */
+  const IMPORT_CONCURRENCY = 2;
+
+  /**
+   * 并发跑一组导入任务（阶段五重写）。
+   *
+   * 三条规则：
+   *   1. **先查重再上传**：命中已有条目直接标「复用」，一个字节都不传（老流程是传完再由
+   *      服务端 sha 去重，40MB 的 mp4 白传一次）；
+   *   2. **单条失败只影响自己**：失败原因翻译成人话记进报告，其余条目继续跑；
+   *   3. **每个 entry 都留状态**：`onEntry` 每次状态变化回调一次，界面据此逐行刷新，
+   *      失败项还能拿同一份 entry 直接重试（retry 不需要重新选文件）。
+   */
+  async function runImportQueue(entries, { categoryId, publish = false, skipped = [], onProgress, onEntry, skipDuplicateCheck = false } = {}) {
     const reportId = `report_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
     const items = [...skipped];
+    const total = entries.length;
     let done = 0;
-    for (const entry of entries) {
+    const publishEntry = (entry, patch) => {
+      Object.assign(entry, patch);
+      if (onEntry) onEntry(entry, patch);
+    };
+
+    const runOne = async (entry) => {
       try {
-        items.push(await importEntry(entry, { categoryId, publish, reportId }));
+        publishEntry(entry, { state: 'hashing', detail: '计算摘要…' });
+        if (!skipDuplicateCheck) {
+          const duplicate = await findDuplicate(entry);
+          if (duplicate) {
+            entry.result = { title: entry.title, status: 'reused', reason: `已存在：${duplicate.title}`, autoFixes: [] };
+            items.push(entry.result);
+            publishEntry(entry, { state: 'reused', detail: `已存在：${duplicate.title}（${duplicate.status}）` });
+            return;
+          }
+        }
+        publishEntry(entry, { state: 'uploading', detail: '上传中…' });
+        const item = await importEntry(entry, { categoryId, publish, reportId });
+        entry.result = item;
+        items.push(item);
+        publishEntry(entry, {
+          state: item.status === 'reused' ? 'reused' : 'done',
+          detail: item.status === 'reused' ? '服务端判定重复，已复用' : '完成',
+        });
       } catch (error) {
-        // 网络/权限层的失败（4xx/5xx）：也要进报告，不能只在 console 里
-        items.push({ title: entry.title, status: 'failed', reason: error.message || '导入失败', autoFixes: [] });
+        // 网络/权限/体检层的失败：进报告 + 留在 entry 上，供「重试」复用
+        const reason = describeImportError(error);
+        entry.result = { title: entry.title, status: 'failed', reason, autoFixes: [] };
+        items.push(entry.result);
+        publishEntry(entry, { state: 'failed', detail: reason });
+      } finally {
+        done += 1;
+        if (onProgress) onProgress(done, total);
       }
-      done += 1;
-      if (onProgress) onProgress(done, entries.length);
-    }
+    };
+
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(IMPORT_CONCURRENCY, total) }, async () => {
+      for (;;) {
+        const index = cursor;
+        cursor += 1;
+        if (index >= entries.length) return;
+        await runOne(entries[index]);
+      }
+    });
+    await Promise.all(workers);
+
     const report = summarizeImport(reportId, items);
+    report.failedEntries = entries.filter((entry) => entry.state === 'failed');
+    report.entries = entries;
     console.info('[import] 导入报告', report.reportId, report);
     return report;
   }
@@ -1004,10 +1124,24 @@
         <span class="spacer"></span>
         <button class="btn small ghost" type="button" data-action="reset-filters" title="清空搜索和所有筛选">重置</button>
         <button class="btn small" type="button" data-action="approve-all" title="把已发布但未审核的作品全部标记为已审核">全部通过审核</button>
-        <button class="btn small danger" type="button" data-action="bulk-delete" id="wp-bulk-del" disabled>删除选中</button>
+        <button class="btn small${state.filters.needsVariant ? ' primary' : ' ghost'}" type="button" data-action="filter-needs-variant" id="wp-needs-btn" title="只看需要转码的条目（needs_variant=1）">待转码</button>
         <span class="muted small" id="wp-total"></span>
       </div>
-      <div id="wp-table"><p class="muted">加载中…</p></div>
+      <div class="bulk-bar" id="wp-bulk-bar">
+        <span class="muted small" id="wp-bulk-count">未选择</span>
+        <select id="wp-bulk-cat" class="small" disabled>
+          <option value="">改分类…</option>
+          ${state.categories.map((c) => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('')}
+        </select>
+        <input id="wp-bulk-tags" class="small" type="text" placeholder="标签（逗号分隔，覆盖原标签）" disabled>
+        <button class="btn small" type="button" data-action="bulk-tags" id="wp-bulk-tags-btn" disabled>应用标签</button>
+        <button class="btn small" type="button" data-action="bulk-publish" id="wp-bulk-pub" disabled>发布</button>
+        <button class="btn small" type="button" data-action="bulk-unpublish" id="wp-bulk-unpub" disabled>下线</button>
+        <button class="btn small" type="button" data-action="bulk-hide" id="wp-bulk-hide" disabled>软删</button>
+        <button class="btn small danger" type="button" data-action="bulk-delete" id="wp-bulk-del" disabled>删除选中</button>
+      </div>
+      <div id="wp-table" class="drop-target"><p class="muted">加载中…</p></div>
+      <p class="hint drop-hint" id="wp-drop-hint">把图片 / 视频 / zip 直接拖到这张表上，就能批量导入（重复文件会自动复用）。</p>
     `;
 
     $('#wp-cat').innerHTML = categoryOptions(state.filters.categoryId).replace('未分类', '全部分类');
@@ -1086,7 +1220,50 @@
       loadWallpapers().catch(reportError);
     });
 
+    // 批量改分类：选完直接生效（不需要再点按钮），失败会 toast 原因
+    $('#wp-bulk-cat')?.addEventListener('change', (event) => {
+      const categoryId = event.target.value;
+      if (!categoryId) return;
+      bulkPatch({ categoryId }, '批量改分类')
+        .catch(reportError)
+        .finally(() => { event.target.value = ''; });
+    });
+
     await loadWallpapers();
+
+    // ---- 拖拽导入：把文件直接拖到列表上（阶段五） ----------------------------
+    // 用 dragenter/dragleave 计数而不是「在子元素上判断 relatedTarget」：
+    // 拖过表格里任意一行都会触发子元素的 dragleave，浅判断会让高亮一闪一闪。
+    const dropTarget = $('#wp-table');
+    let dragDepth = 0;
+    const setDragging = (on) => {
+      dropTarget.classList.toggle('dragging', on);
+      const hint = $('#wp-drop-hint');
+      if (hint) hint.textContent = on ? '松开就开始导入（重复文件会自动复用）' : '把图片 / 视频 / zip 直接拖到这张表上，就能批量导入（重复文件会自动复用）。';
+    };
+    $('#wp-table').addEventListener('dragover', (event) => {
+      if (!event.dataTransfer || !event.dataTransfer.types.includes('Files')) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+      setDragging(true);
+    });
+    $('#wp-table').addEventListener('dragenter', (event) => {
+      if (!event.dataTransfer || !event.dataTransfer.types.includes('Files')) return;
+      event.preventDefault();
+      dragDepth += 1;
+      setDragging(true);
+    });
+    $('#wp-table').addEventListener('dragleave', () => {
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (!dragDepth) setDragging(false);
+    });
+    $('#wp-table').addEventListener('drop', (event) => {
+      if (!event.dataTransfer || !event.dataTransfer.files.length) return;
+      event.preventDefault();
+      dragDepth = 0;
+      setDragging(false);
+      openLocalImport([...event.dataTransfer.files]);
+    });
 
     // 挂载了本机目录就静默扫一遍：新增的直接进草稿
     await loadImportDirs();
@@ -1115,6 +1292,7 @@
     else if (state.filters.tag) params.set('tag', state.filters.tag);
     if (state.filters.subtag) params.set('subtag', state.filters.subtag);
     if (state.filters.format) params.set('format', state.filters.format);
+    if (state.filters.needsVariant) params.set('needsVariant', '1');
     params.set('limit', '200');
     const data = await api(`/admin/wallpapers?${params.toString()}`);
     state.wallpapers = data;
@@ -1171,8 +1349,22 @@
     const reviewBadge = item.reviewStatus === 'approved'
       ? '<span class="badge approved">已审核</span>'
       : '<span class="badge pending">未审核</span>';
+    // 阶段五：待转码徽标 —— 条数必须与 `needs_variant=1` 的行一一对应
+    // （`tools/make-variants.mjs --all-draft` 按同一个条件捞活）。
+    const variantBadge = item.needsVariant
+      ? `<span class="badge warn" title="原片超过可播门槛，等 make-variants 转码后再发布">待转码${item.variantReason ? ` · ${esc(item.variantReason)}` : ''}</span>`
+      : '';
+    const variantLabels = (item.variants || []).map((variant) => variant.label).filter(Boolean);
+    const techLine = [
+      item.width ? `${item.width}×${item.height}` : '—',
+      item.fps ? `${item.fps}fps` : '',
+      item.durationMs ? formatDuration(item.durationMs) : '',
+    ].filter(Boolean).join(' · ');
+    const variantsLine = variantLabels.length
+      ? `<span class="badge">${esc(variantLabels.join(' / '))}</span>`
+      : '';
     return `
-      <tr>
+      <tr${item.needsVariant ? ' class="needs-variant"' : ''}>
         <td class="pick"><input type="checkbox" class="wp-pick" value="${esc(item.id)}" aria-label="选择这件作品"></td>
         <td>${thumb}</td>
         <td>
@@ -1183,8 +1375,8 @@
         </td>
         <td class="hide-sm">${catSelect}</td>
         <td class="hide-sm">${tagCell}</td>
-        <td><span class="status-badges"><span class="badge ${esc(item.status)}">${esc(STATUS_LABEL[item.status] || item.status)}</span>${reviewBadge}${item.featured ? '<span class="badge">置顶</span>' : ''}</span></td>
-        <td class="hide-sm"><span class="badge fmt">${esc(formatLabel(item.mime))}</span> ${item.width ? `${item.width}×${item.height}` : '—'}${item.durationMs ? ` · ${formatDuration(item.durationMs)}` : ''}<br><span class="muted small">${formatBytes(item.bytes)}</span></td>
+        <td><span class="status-badges"><span class="badge ${esc(item.status)}">${esc(STATUS_LABEL[item.status] || item.status)}</span>${reviewBadge}${item.featured ? '<span class="badge">置顶</span>' : ''}${variantBadge}</span></td>
+        <td class="hide-sm"><span class="badge fmt">${esc(formatLabel(item.mime))}</span> ${techLine}<br><span class="muted small">${formatBytes(item.bytes)}</span>${variantsLine ? `<br>${variantsLine}` : ''}</td>
         <td class="hide-sm muted small">${esc(item.creatorEmail || '—')}</td>
         <td class="actions">${actions.join('')}</td>
       </tr>`;
@@ -1225,13 +1417,53 @@
     syncBulkButton();
   }
 
-  /** 「删除选中」按钮的文案与可用状态跟着勾选数量走。 */
+  /** 批量工具条的文案与可用状态跟着勾选数量走。 */
   function syncBulkButton() {
-    const button = $('#wp-bulk-del');
-    if (!button) return;
     const count = document.querySelectorAll('.wp-pick:checked').length;
-    button.disabled = count === 0;
-    button.textContent = count ? `删除选中（${count}）` : '删除选中';
+    const button = $('#wp-bulk-del');
+    if (button) {
+      button.disabled = count === 0;
+      button.textContent = count ? `删除选中（${count}）` : '删除选中';
+    }
+    const counter = $('#wp-bulk-count');
+    if (counter) counter.textContent = count ? `已选 ${count} 件` : '未选择';
+    for (const id of ['#wp-bulk-cat', '#wp-bulk-tags', '#wp-bulk-tags-btn', '#wp-bulk-pub', '#wp-bulk-unpub', '#wp-bulk-hide']) {
+      const node = $(id);
+      if (node) node.disabled = count === 0;
+    }
+  }
+
+  /** 勾选中的 id 列表（批量操作共用）。 */
+  function pickedIds() {
+    return [...document.querySelectorAll('.wp-pick:checked')].map((box) => box.value);
+  }
+
+  /**
+   * 批量套同一份 patch（阶段五）。
+   *
+   * 一次请求打到 `POST /api/admin/wallpapers/batch`：服务端逐条判权限、逐条记账、
+   * 整批只写一条审计、只重建一次公开快照。失败条数会带着原因一起回来。
+   */
+  async function bulkPatch(patch, label) {
+    const ids = pickedIds();
+    if (!ids.length) return;
+    const data = await api('/admin/wallpapers/batch', { method: 'POST', body: { ids, patch } });
+    const failed = data.failed || [];
+    const detail = failed.length ? `，失败 ${failed.length} 条（${failed[0].reason}）` : '';
+    toast(`${label}：成功 ${data.updated} 条${detail}`, failed.length ? 'error' : 'ok', 6000);
+    await loadWallpapers();
+  }
+
+  /** 批量改标签：输入框里的逗号分隔文本，整体覆盖（不是追加，避免「越改越多」）。 */
+  async function bulkSetTags() {
+    const input = $('#wp-bulk-tags');
+    const tags = String(input ? input.value : '')
+      .split(/[,，]/)
+      .map((tag) => tag.trim())
+      .filter(Boolean);
+    if (!tags.length) { toast('先在输入框里写标签，逗号分隔', 'info'); return; }
+    await bulkPatch({ tags }, `改标签（${tags.join(' / ')}）`);
+    if (input) input.value = '';
   }
 
   /** 批量删除：逐条走已有的 DELETE 接口，失败的单独计数，不中断其余删除。 */
@@ -1277,13 +1509,14 @@
   const MAX_IMPORT_BUNDLE_BYTES = 64 * 1024 * 1024;
   const importCapFor = (file) => (/\.zip$/i.test(file.name) ? MAX_IMPORT_BUNDLE_BYTES : MAX_IMPORT_BYTES);
 
-  /** 批量导入本地文件：多选，标题取文件名，导完再逐条改也可以 */
-  function openLocalImport() {
+  /** 批量导入本地文件：**拖拽或多选**，2 并发，逐条显示状态，失败可单条/全部重试 */
+  function openLocalImport(initialFiles = null) {
     openDialog(`
       <form id="loc-form">
         <h3>批量导入本地文件</h3>
         <p class="hint">图片 png/jpg/webp/avif/gif，视频 mp4/webm，单个不超过 55MB。<br>
-          标题取文件名（去掉扩展名），标签导入后可以再勾。</p>
+          标题取文件名（去掉扩展名），标签导入后可以再勾。<br>
+          重复文件会先查摘要：已有同一个文件就直接复用，<strong>不会重复占用 R2</strong>。</p>
         <div class="row">
           <label>放到哪个模块
             <select id="loc-module">
@@ -1298,18 +1531,20 @@
           </label>
         </div>
         <div class="dropzone" id="loc-pick">
-          <strong>点击选择文件（可多选）</strong>
+          <strong>把文件拖到这里，或点击选择（可多选）</strong>
           <span class="small" id="loc-status">还没有选择文件</span>
         </div>
         <div id="loc-list"></div>
         <footer>
           <button type="button" class="btn ghost" data-close>取消</button>
+          <button type="button" class="btn" id="loc-retry" hidden>重试失败项</button>
           <button type="submit" class="btn primary" id="loc-start" disabled>开始导入</button>
         </footer>
       </form>
     `, (dialog) => {
       let entries = [];
       let picked = new Set();
+      let running = false;
       $('[data-close]', dialog).addEventListener('click', closeDialog);
 
       const input = document.createElement('input');
@@ -1319,29 +1554,41 @@
       input.className = 'hidden';
       dialog.appendChild(input);
 
+      const STATE_LABEL = {
+        pending: '待导入', hashing: '计算摘要…', uploading: '上传中…',
+        done: '成功', reused: '已复用', failed: '失败', skipped: '跳过',
+      };
+
+      /** 逐行状态：导入过程中每变一次就重画一次（只重画列表，不重画整个弹窗）。 */
       const renderList = () => {
         const host = $('#loc-list', dialog);
         if (!entries.length) { host.innerHTML = ''; return; }
-        host.innerHTML = `<p class="hint">已选 ${picked.size} / ${entries.length} 个文件</p>
-          <div class="wep-items">${entries.map((entry, index) => `
-            <label class="wep-item${entry.skipped ? ' skipped' : ''}">
-              <input type="checkbox" data-index="${index}" ${picked.has(index) ? 'checked' : ''} ${entry.skipped ? 'disabled' : ''}>
+        const failed = entries.filter((entry) => entry.state === 'failed').length;
+        $('#loc-retry', dialog).hidden = running || failed === 0;
+        $('#loc-retry', dialog).textContent = `重试失败项（${failed}）`;
+        host.innerHTML = `<p class="hint">已选 ${picked.size} / ${entries.length} 个文件${running ? '（导入中，已完成的不再重传）' : ''}</p>
+          <ul class="queue-list">${entries.map((entry, index) => {
+            const state = entry.state || (entry.skipped ? 'skipped' : 'pending');
+            return `<li class="queue-item ${state}">
+              ${running || entry.state ? '' : `<input type="checkbox" data-index="${index}" ${picked.has(index) ? 'checked' : ''} ${entry.skipped ? 'disabled' : ''}>`}
               <span class="wep-title">${esc(entry.title)}</span>
-              <span class="wep-meta">${esc(entry.kindLabel)} · ${(entry.file.size / 1048576).toFixed(1)}MB</span>
-            </label>`).join('')}</div>`;
-        $('#loc-start', dialog).disabled = picked.size === 0;
+              <span class="queue-meta">${esc(STATE_LABEL[state] || state)}${entry.detail ? ` · ${esc(entry.detail)}` : ''}</span>
+              <span class="wep-meta">${esc(entry.kindLabel || '')} · ${(entry.file.size / 1048576).toFixed(1)}MB</span>
+            </li>`;
+          }).join('')}</ul>`;
+        const start = $('#loc-start', dialog);
+        if (!running) start.disabled = picked.size === 0;
       };
 
-      input.addEventListener('change', async () => {
+      /** 把一批 File 变成 entries（识别 1080p 变体、超限、低清），然后渲染。 */
+      const addFiles = async (files) => {
+        if (!files || !files.length) return;
         // 先把 `xxx.1080p.mp4` 挑出来：它不是独立条目，而是 `xxx.mp4` 的变体。
-        // 于是「把 prepare-upload 的输出和源文件一起多选」就能带上 1080p 档。
-        const files = [...input.files];
         const variantFiles = files.filter((file) => VARIANT_NAME_RE.test(file.name));
-        entries = await Promise.all(files
+        const fresh = await Promise.all(files
           .filter((file) => !VARIANT_NAME_RE.test(file.name))
           .map(async (file) => {
             const isVideo = /\.(mp4|webm)$/i.test(file.name);
-            // 皮肤包 / 开机动画包：zip 没有宽高，服务端按 bundle 豁免；缩略图只能另外补
             const isBundle = /\.zip$/i.test(file.name);
             const variant = variantFiles.find((candidate) => variantBase(candidate.name) === variantBase(file.name));
             const entry = {
@@ -1350,10 +1597,13 @@
               kind: isVideo ? 'dynamic' : 'static',
               kindLabel: `${isVideo ? '视频' : isBundle ? '资源包' : '图片'}${variant ? ' +1080p' : ''}`,
               variants: variant ? [variant] : [],
+              state: 'pending',
               skipped: false,
+              digest: null,
             };
             if (file.size > importCapFor(file)) {
               entry.skipped = true;
+              entry.state = 'skipped';
               entry.kindLabel = `${(file.size / 1048576).toFixed(0)}MB 超限`;
               return entry;
             }
@@ -1361,58 +1611,112 @@
               const width = await imageWidth(file);
               if (width > 0 && width < MIN_IMAGE_WIDTH) {
                 entry.skipped = true;
+                entry.state = 'skipped';
                 entry.kindLabel = `${width}px 低清`;
               }
             }
             return entry;
           }));
+        entries = [...entries, ...fresh];
         picked = new Set(entries.map((_, index) => index).filter((index) => !entries[index].skipped));
         $('#loc-status', dialog).textContent = `共 ${entries.length} 个文件`
           + `${variantFiles.length ? `（配到 ${variantFiles.length} 个 1080p 变体）` : ''}`;
         renderList();
+      };
+
+      // ---- 拖拽：dragover 一定要 preventDefault，否则浏览器会直接用文件打开页面 ----
+      const zone = $('#loc-pick', dialog);
+      let dragDepth = 0;
+      zone.addEventListener('dragover', (event) => {
+        event.preventDefault();
+        event.dataTransfer.dropEffect = 'copy';
+        zone.classList.add('active');
+      });
+      zone.addEventListener('dragenter', (event) => {
+        event.preventDefault();
+        dragDepth += 1;
+        zone.classList.add('active');
+      });
+      zone.addEventListener('dragleave', () => {
+        dragDepth = Math.max(0, dragDepth - 1);
+        if (!dragDepth) zone.classList.remove('active');
+      });
+      zone.addEventListener('drop', (event) => {
+        event.preventDefault();
+        dragDepth = 0;
+        zone.classList.remove('active');
+        if (running) { toast('正在导入，等这一批结束再拖', 'info'); return; }
+        addFiles([...event.dataTransfer.files]).catch(reportError);
       });
 
-      $('#loc-pick', dialog).addEventListener('click', () => input.click());
+      input.addEventListener('change', () => {
+        addFiles([...input.files]).catch(reportError);
+        input.value = '';
+      });
+      zone.addEventListener('click', () => { if (!running) input.click(); });
 
       dialog.addEventListener('change', (event) => {
         const box = event.target.closest('input[data-index]');
         if (!box) return;
         const index = Number(box.dataset.index);
         if (box.checked) picked.add(index); else picked.delete(index);
-        $('#loc-start', dialog).disabled = picked.size === 0;
         const hint = $('#loc-list p.hint', dialog);
         if (hint) hint.textContent = `已选 ${picked.size} / ${entries.length} 个文件`;
+        $('#loc-start', dialog).disabled = picked.size === 0;
       });
+
+      /** 跑一批（初次导入与重试共用）。 */
+      const runBatch = async (queue, { skipped = [] } = {}) => {
+        const start = $('#loc-start', dialog);
+        running = true;
+        start.disabled = true;
+        start.textContent = '导入中…';
+        const report = await runImportQueue(queue, {
+          categoryId: $('#loc-module', dialog).value,
+          publish: $('#loc-publish', dialog).value === '1',
+          skipped,
+          onProgress: (done, total) => { start.textContent = `导入中 ${done}/${total}`; },
+          onEntry: () => renderList(),
+        });
+        running = false;
+        start.textContent = '开始导入';
+        start.disabled = picked.size === 0;
+        renderList();
+        return report;
+      };
 
       $('#loc-form', dialog).addEventListener('submit', async (event) => {
         event.preventDefault();
-        const start = $('#loc-start', dialog);
-        const moduleId = $('#loc-module', dialog).value;
-        const publish = $('#loc-publish', dialog).value === '1';
-        const queue = [...picked].map((index) => entries[index]);
+        if (running) return;
+        const queue = [...picked].map((index) => entries[index]).filter((entry) => entry.state !== 'done' && entry.state !== 'reused');
         const skipped = entries
           .filter((entry, index) => entry.skipped && !picked.has(index))
           .map((entry) => ({ title: entry.title, status: 'skipped', reason: entry.kindLabel, autoFixes: [] }));
-        start.disabled = true;
-
-        // 走批量入库接口：合规体检 / sha256 / HEAD 回读 / 缩略图 / 变体 / 必填门都在服务端，
-        // 失败的条目不会留在库里；每条结果进导入报告。
-        const report = await runImportQueue(queue, {
-          categoryId: moduleId,
-          publish,
-          skipped,
-          onProgress: (done, total) => { start.textContent = `导入中 ${done}/${total}`; },
-        });
-
-        closeDialog();
+        for (const entry of queue) { entry.state = 'pending'; entry.detail = ''; }
+        const report = await runBatch(queue, { skipped });
         toast(
           `成功 ${report.imported} · 复用 ${report.reused} · 失败 ${report.failed}`,
           report.failed ? 'error' : 'ok',
           8000,
         );
         await loadWallpapers();
-        showImportReport(report);
+        // 有失败项就留在弹窗里（可单条/全部重试）；全成功才自动关
+        if (!report.failed) { closeDialog(); showImportReport(report); }
       });
+
+      $('#loc-retry', dialog).addEventListener('click', async () => {
+        if (running) return;
+        const failed = entries.filter((entry) => entry.state === 'failed');
+        if (!failed.length) return;
+        for (const entry of failed) { entry.state = 'pending'; entry.detail = ''; }
+        renderList();
+        const report = await runBatch(failed);
+        toast(`重试完成：成功 ${report.imported} · 复用 ${report.reused} · 仍失败 ${report.failed}`, report.failed ? 'error' : 'ok', 8000);
+        await loadWallpapers();
+        if (!report.failed) { closeDialog(); showImportReport(report); }
+      });
+
+      if (initialFiles && initialFiles.length) addFiles([...initialFiles]).catch(reportError);
     });
   }
 
@@ -2424,6 +2728,28 @@
         break;
       case 'bulk-delete':
         bulkDeleteWallpapers().catch(reportError);
+        break;
+      case 'bulk-tags':
+        bulkSetTags().catch(reportError);
+        break;
+      case 'bulk-publish':
+        bulkPatch({ status: 'published' }, '批量发布').catch(reportError);
+        break;
+      case 'bulk-unpublish':
+        bulkPatch({ status: 'draft' }, '批量下线').catch(reportError);
+        break;
+      case 'bulk-hide':
+        if (window.confirm(`把选中的 ${pickedIds().length} 件设为「已下线」（软删，记录和文件都保留）？`)) {
+          bulkPatch({ status: 'hidden' }, '批量软删').catch(reportError);
+        }
+        break;
+      case 'filter-needs-variant':
+        state.filters.needsVariant = !state.filters.needsVariant;
+        if (button.id === 'wp-needs-btn') {
+          button.classList.toggle('primary', state.filters.needsVariant);
+          button.classList.toggle('ghost', !state.filters.needsVariant);
+        }
+        loadWallpapers().catch(reportError);
         break;
       case 'new-category':
         openCategoryDialog();

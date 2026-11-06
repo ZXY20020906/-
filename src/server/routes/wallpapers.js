@@ -27,7 +27,7 @@ import {
 import { KINDS, REVIEW_STATUSES, STATUSES } from '../../core/validate.js';
 import { kindMatchesMime } from '../../core/image-meta.js';
 import {
-  badRequest, notFound, payloadTooLarge, storageVerifyFailed, tooManyRequests, unsupportedMedia,
+  HttpError, badRequest, notFound, payloadTooLarge, storageVerifyFailed, tooManyRequests, unsupportedMedia,
 } from '../../core/errors.js';
 import { created, json, readJson } from '../http.js';
 import { wallpaperDto } from '../dto.js';
@@ -42,6 +42,7 @@ import { readMediaMeta } from '../../core/image-meta.js';
 import {
   assertDailyQuota, attachVariant, buildImportReport, createWallpaperRow, importMedia, ingestAsset,
   ingestVariantAsset, ingestVariantFromObject, publishWallpaper, recordDailyUsage, removeVariant,
+  supportsFingerprintColumn,
 } from '../ingest.js';
 import { rebuildSnapshotQuietly } from '../snapshot.js';
 import { cacheKey, getCached, setCached } from '../short-cache.js';
@@ -226,10 +227,27 @@ export async function update({ env, actor, request, params }) {
   const allowedTags = await allowedTagNames(env);
   const patch = parseWallpaperPatch(await readJson(request), { allowedTags });
 
+  const fresh = await applyWallpaperPatch(env, actor, row, patch);
+  // 阶段三触发点：编辑标题/标签/分类/置顶/上下架都会改变公开字段（或让它从公开集合里
+  // 进/出），必须重建快照，否则线上会停在旧版本。失败只记日志，不影响这次保存。
+  await rebuildSnapshotQuietly(env, '编辑作品');
+  return json({ wallpaper: wallpaperDto(fresh, { admin: true, mediaBase: mediaBaseFor(env) }) });
+}
+
+/**
+ * 把一份 patch 落到一条作品上（**单条 PATCH 与批量共用这一份逻辑**）。
+ *
+ * 抽出来的理由：批量修改如果要和单条逐字节等价，就不能各写一套「发布时补 published_at」
+ * 的规则 —— 那正是第 4 期踩过的坑（列表 12 条、总数 15 条）。失败抛 HttpError，
+ * 由调用方决定是「整单 4xx」还是「记进批量报告继续跑」。
+ *
+ * @returns {Promise<object>} 落库后的最新行
+ */
+async function applyWallpaperPatch(env, actor, row, patch, { now = nowMs(), audit = true, skipCategoryCheck = false } = {}) {
   // 发布状态与置顶都属于「上线动作」，编辑角色没有这个权限
   if (has(patch, 'status')) assertCan(actor, ACTION.WALLPAPER_PUBLISH, row);
   if (has(patch, 'featured')) assertCan(actor, ACTION.WALLPAPER_PUBLISH, row);
-  if (has(patch, 'categoryId')) await ensureCategory(env, patch.categoryId);
+  if (has(patch, 'categoryId') && !skipCategoryCheck) await ensureCategory(env, patch.categoryId);
 
   const nextKind = patch.kind ?? row.kind;
   if (patch.kind && row.mime && !kindMatchesMime(patch.kind, row.mime)) {
@@ -243,7 +261,7 @@ export async function update({ env, actor, request, params }) {
   }
 
   let publishedAt = row.published_at ?? null;
-  if (nextStatus === 'published' && row.status !== 'published') publishedAt = nowMs();
+  if (nextStatus === 'published' && row.status !== 'published') publishedAt = now;
   if (nextStatus !== 'published') publishedAt = null;
 
   const next = {
@@ -261,7 +279,6 @@ export async function update({ env, actor, request, params }) {
     author: patch.author !== undefined ? patch.author : (row.author ?? null),
   };
 
-  const now = nowMs();
   await run(
     env,
     Q.updateWallpaper,
@@ -270,19 +287,124 @@ export async function update({ env, actor, request, params }) {
     next.license, next.source, next.author, row.id,
   );
 
-  await writeAudit(env, {
-    actor,
-    action: AUDIT_ACTION.WALLPAPER_UPDATE,
-    targetType: 'wallpaper',
-    targetId: row.id,
-    detail: `字段：${Object.keys(patch).join(', ')}`,
-  });
+  if (audit) {
+    await writeAudit(env, {
+      actor,
+      action: AUDIT_ACTION.WALLPAPER_UPDATE,
+      targetType: 'wallpaper',
+      targetId: row.id,
+      detail: `字段：${Object.keys(patch).join(', ')}`,
+    });
+  }
 
-  const fresh = await first(env, Q.wallpaperById, row.id);
-  // 阶段三触发点：编辑标题/标签/分类/置顶/上下架都会改变公开字段（或让它从公开集合里
-  // 进/出），必须重建快照，否则线上会停在旧版本。失败只记日志，不影响这次保存。
-  await rebuildSnapshotQuietly(env, '编辑作品');
-  return json({ wallpaper: wallpaperDto(fresh, { admin: true, mediaBase: mediaBaseFor(env) }) });
+  return first(env, Q.wallpaperById, row.id);
+}
+
+/**
+ * 批量修改（阶段五）：一次给 N 条套同一份 patch。
+ *
+ * 语义是**尽力而为 + 逐条记账**：某一条因为权限/状态被拒，不影响其余条目，
+ * 失败原因逐条返回给前端展示。整批只写一条审计、只重建一次快照
+ * （逐条重建会把「改 5 条」变成 5 次快照构建，没必要）。
+ */
+export async function batchUpdate({ env, actor, request }) {
+  // 顶层只判「你有没有改作品的资格」：拿 `{created_by: 自己}` 去探测。
+  // 编辑只有 update:own，用空 resource 判会把「改自己的」合法请求直接挡成 403。
+  // 逐条归属仍在循环里用真实行再判一次（assertCan(actor, UPDATE, row)）。
+  assertCan(actor, ACTION.WALLPAPER_UPDATE, { created_by: actor?.id });
+  const body = await readJson(request);
+  const rawIds = Array.isArray(body?.ids) ? body.ids : [];
+  if (!rawIds.length) throw badRequest('ids 不能为空');
+  if (rawIds.length > 100) throw badRequest('一次最多批量修改 100 条');
+
+  const allowedTags = await allowedTagNames(env);
+  const patch = parseWallpaperPatch(body?.patch ?? {}, { allowedTags });
+  if (has(patch, 'status')) assertCan(actor, ACTION.WALLPAPER_PUBLISH);
+  if (has(patch, 'featured')) assertCan(actor, ACTION.WALLPAPER_PUBLISH);
+  // 分类只校验一次：所有条目套的是同一个分类
+  if (has(patch, 'categoryId')) await ensureCategory(env, patch.categoryId);
+
+  const now = nowMs();
+  const updated = [];
+  const failed = [];
+  for (const rawId of rawIds) {
+    let id = '';
+    try {
+      id = cleanId(rawId, 'ids');
+      const row = await loadWallpaper(env, id);
+      assertCan(actor, ACTION.WALLPAPER_UPDATE, row);
+      await applyWallpaperPatch(env, actor, row, patch, { now, audit: false, skipCategoryCheck: true });
+      updated.push(id);
+    } catch (error) {
+      // 4xx 记进报告；5xx（数据库/网络）照旧抛出去，别把真故障藏成「批量部分失败」
+      if (error instanceof HttpError && error.status < 500) {
+        failed.push({ id: id || String(rawId ?? ''), status: error.status, reason: error.message });
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  if (updated.length) {
+    await writeAudit(env, {
+      actor,
+      action: AUDIT_ACTION.WALLPAPER_UPDATE,
+      targetType: 'wallpaper',
+      targetId: 'bulk',
+      detail: `批量改 ${Object.keys(patch).join('/')} × ${updated.length} 条`,
+    });
+    await rebuildSnapshotQuietly(env, `批量修改 ${updated.length} 条`);
+  }
+
+  return json({ updated: updated.length, failed, ids: updated, patch: Object.keys(patch) });
+}
+
+/**
+ * 查重（阶段五）：浏览器在**上传前**算好 sha256（>40MB 用采样指纹）来问一句。
+ *
+ * 为什么要有它：老流程是「传完再由服务端 sha 去重」，重复文件仍然会**传一遍**
+ * （40MB 的 mp4 白传一次）。现在先问后传，命中就直接复用，R2 对象数不增加。
+ *
+ * 三级判据（与导入管线里的一致）：sha256 → content_fingerprint（大文件采样）→ 标题+字节数。
+ */
+export async function duplicateCheck({ env, actor, request }) {
+  assertCan(actor, ACTION.WALLPAPER_READ);
+  const body = await readJson(request);
+  const hex64 = (value) => (typeof value === 'string' && /^[0-9a-f]{64}$/i.test(value) ? value.toLowerCase() : null);
+  const sha256 = hex64(body?.sha256);
+  const fingerprint = hex64(body?.fingerprint);
+  const bytes = Number(body?.bytes) > 0 ? Number(body.bytes) : null;
+  const title = typeof body?.title === 'string' ? body.title.trim().slice(0, 120) : '';
+
+  /** 命中后补一次完整行，返回前端够用的字段（不泄漏 storage_key）。 */
+  const hit = async (row, matchedBy) => {
+    const full = await first(env, Q.wallpaperById, row.id);
+    return json({
+      duplicate: {
+        id: full.id,
+        slug: full.slug,
+        title: full.title,
+        status: full.status,
+        kind: full.kind,
+        bytes: Number(full.bytes ?? 0),
+      },
+      matchedBy,
+    });
+  };
+
+  if (sha256) {
+    const row = await first(env, Q.wallpaperShaTaken, sha256);
+    if (row) return hit(row, 'sha256');
+  }
+  if (fingerprint && await supportsFingerprintColumn(env)) {
+    const row = await first(env, Q.wallpaperFingerprintTaken, fingerprint);
+    if (row) return hit(row, 'fingerprint');
+  }
+  if (title && bytes) {
+    const row = await first(env, Q.wallpaperTitleBytesTaken, title, bytes);
+    if (row) return hit(row, 'title+bytes');
+  }
+  return json({ duplicate: null, matchedBy: null });
 }
 
 /**
