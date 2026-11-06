@@ -173,6 +173,19 @@ export function cacheKeyUrl(url) {
 /** 公开读接口的频率上限：每 IP 每分钟 120 次（isolate 内存计数，见 rate-limit.js 的局限说明）。 */
 export const PUBLIC_RATE = { max: 120, windowMs: 60 * 1000 };
 
+/**
+ * 边缘缓存写入时用什么 cache-control。
+ *
+ * 默认 5 分钟（公开读的既有口径）；但**带 immutable 的响应不能被改写**——
+ * 快照对象 `/api/v1/public/snapshots/<version>/**` 靠 URL 里的内容哈希做永久缓存，
+ * 一旦被写成 300s，CDN 就会对它做无意义的重验证，验收 C3 也会直接不成立。
+ */
+export const EDGE_CACHE_CONTROL = 'public, max-age=300, stale-while-revalidate=3600';
+export function edgeCacheControl(existing) {
+  const value = String(existing ?? '');
+  return /immutable/i.test(value) ? value : EDGE_CACHE_CONTROL;
+}
+
 /** 会改数据的方法（清单缓存只在它们成功后失效）。 */
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -346,7 +359,7 @@ export async function handle(request, env, context) {
       && final.headers.get('x-folia-degraded') !== '1';
     if (edgeCacheable && cacheable) {
       const headers = new Headers(final.headers);
-      headers.set('cache-control', 'public, max-age=300, stale-while-revalidate=3600');
+      headers.set('cache-control', edgeCacheControl(headers.get('cache-control')));
       headers.set('x-folia-edge', 'MISS');
       try {
         await caches.default.put(cacheKey, new Response(final.clone().body, { status: 200, headers: new Headers(headers) }));

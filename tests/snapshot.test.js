@@ -16,6 +16,7 @@ import {
   buildSnapshot, computeVersion, publishSnapshot, readCurrent, readSnapshot,
 } from '../src/server/snapshot.js';
 import { SNAPSHOT } from '../src/server/public-snapshot.js';
+import { EDGE_CACHE_CONTROL, edgeCacheControl } from '../src/server/app.js';
 
 /** 一条 4K@60 的作品：原画不可播，但有 1080p 变体。 */
 const VARIANT_1080 = JSON.stringify([{
@@ -374,6 +375,13 @@ test('附加：快照对象本身可公开读取（immutable），其余路径�
     const res = await call(env, path);
     assert.equal(res.status, 404, `${path} 必须 404`);
   }
+});
+
+test('附加：边缘缓存不改写 immutable（快照对象否则会被降成 300s）', () => {
+  assert.equal(edgeCacheControl('public, max-age=31536000, immutable'), 'public, max-age=31536000, immutable');
+  assert.equal(edgeCacheControl('public, max-age=300'), EDGE_CACHE_CONTROL);
+  assert.equal(edgeCacheControl(null), EDGE_CACHE_CONTROL);
+  assert.equal(edgeCacheControl(undefined), EDGE_CACHE_CONTROL);
 });
 
 test('附加：兜底链 —— 无快照 + D1 不可用 ⇒ 内嵌快照（degraded + snapshotGeneratedAt）', async () => {
