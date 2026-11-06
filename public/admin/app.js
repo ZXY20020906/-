@@ -229,10 +229,12 @@
     }
   }
 
-  /** 传完原图顺手把缩略图也传上去 */
+  /** 传完原图顺手把缩略图也传上去；大文件走分片并跳过浏览器抽帧 */
   async function putAssetWithThumb(wallpaperId, file, onProgress) {
-    const thumb = await makeThumbnail(file);
-    await putAsset(wallpaperId, file, onProgress);
+    const large = file.size > MULTIPART_THRESHOLD;
+    const thumb = large ? null : await makeThumbnail(file);
+    if (large) await putAssetChunked(wallpaperId, file, onProgress);
+    else await putAsset(wallpaperId, file, onProgress);
     if (thumb) await putThumb(wallpaperId, thumb);
     return thumb ? thumb.size : 0;
   }
@@ -381,6 +383,125 @@
       xhr.onerror = () => reject(new Error('网络中断，上传失败'));
       xhr.send(file);
     });
+  }
+
+  // ---------------------------------------------------------- 大文件分片上传
+  /** 超过这个尺寸走分片（4×8MB 以内一次 PUT 最稳） */
+  const MULTIPART_THRESHOLD = 55 * 1024 * 1024;
+  const RESUME_PREFIX = 'folia-upload:';
+
+  const resumeKey = (wallpaperId, file) =>
+    `${RESUME_PREFIX}${wallpaperId}:${file.name}:${file.size}:${file.lastModified || 0}`;
+
+  function loadResume(wallpaperId, file) {
+    try {
+      const raw = localStorage.getItem(resumeKey(wallpaperId, file));
+      if (!raw) return null;
+      const state = JSON.parse(raw);
+      if (!state || !state.uploadId || !state.key) return null;
+      return state;
+    } catch {
+      return null;
+    }
+  }
+
+  function saveResume(wallpaperId, file, state) {
+    try {
+      localStorage.setItem(resumeKey(wallpaperId, file), JSON.stringify(state));
+    } catch { /* 配额满了就退化成不能续传，不影响本次上传 */ }
+  }
+
+  function clearResume(wallpaperId, file) {
+    try { localStorage.removeItem(resumeKey(wallpaperId, file)); } catch { /* ignore */ }
+  }
+
+  async function jsonRequest(url, options) {
+    const response = await fetch(url, {
+      ...options,
+      headers: { 'x-folia-client': 'admin', ...(options?.headers || {}) },
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok || !payload?.ok) {
+      const error = new Error(payload?.error?.message || `请求失败（${response.status}）`);
+      error.status = response.status;
+      error.details = payload?.error?.details ?? null;
+      throw error;
+    }
+    return payload.data;
+  }
+
+  /**
+   * 分片上传：init → 逐片 PUT（失败重试 3 次）→ complete。
+   * localStorage 记录 {uploadId,key,doneParts}，刷新/断网后选同一个文件可以接着传。
+   */
+  async function putAssetChunked(wallpaperId, file, onProgress) {
+    let state = loadResume(wallpaperId, file);
+    if (!state) {
+      const info = await jsonRequest('/api/admin/uploads/init', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ fileName: file.name, size: file.size, contentType: file.type }),
+      });
+      state = { uploadId: info.uploadId, key: info.key, partSize: info.partSize, done: [] };
+      saveResume(wallpaperId, file, state);
+    }
+
+    const partSize = state.partSize || 8 * 1024 * 1024;
+    const totalParts = Math.max(1, Math.ceil(file.size / partSize));
+    const doneMap = new Map((state.done || []).map((item) => [item.partNumber, item.etag]));
+    let sentBytes = Math.min(file.size, doneMap.size * partSize);
+    if (onProgress) onProgress(sentBytes / file.size);
+
+    const uploadPart = async (partNumber, attempt = 1) => {
+      const start = (partNumber - 1) * partSize;
+      const blob = file.slice(start, Math.min(file.size, start + partSize));
+      try {
+        const response = await fetch(
+          `/api/admin/uploads/part?uploadId=${encodeURIComponent(state.uploadId)}&part=${partNumber}&key=${encodeURIComponent(state.key)}`,
+          { method: 'PUT', headers: { 'x-folia-client': 'admin', 'content-type': 'application/octet-stream' }, body: blob },
+        );
+        const payload = await response.json().catch(() => null);
+        if (!response.ok || !payload?.ok) {
+          const error = new Error(payload?.error?.message || `分片 ${partNumber} 上传失败（${response.status}）`);
+          error.status = response.status;
+          throw error;
+        }
+        return payload.data.etag;
+      } catch (error) {
+        // 上传会话失效（服务端重启/过期）⇒ 重新 init 再来
+        if (error.status === 404 || error.status === 400) throw error;
+        if (attempt >= 3) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
+        return uploadPart(partNumber, attempt + 1);
+      }
+    };
+
+    for (let partNumber = 1; partNumber <= totalParts; partNumber += 1) {
+      if (doneMap.has(partNumber)) continue;
+      const etag = await uploadPart(partNumber);
+      doneMap.set(partNumber, etag);
+      state.done = [...doneMap.entries()].map(([num, tag]) => ({ partNumber: num, etag: tag }));
+      saveResume(wallpaperId, file, state);
+      sentBytes += Math.min(partSize, file.size - (partNumber - 1) * partSize);
+      if (onProgress) onProgress(Math.min(1, sentBytes / file.size));
+    }
+
+    const parts = [...doneMap.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([partNumber, etag]) => ({ partNumber, etag }));
+    try {
+      const result = await jsonRequest('/api/admin/uploads/complete', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ uploadId: state.uploadId, key: state.key, parts, meta: { wallpaperId, size: file.size } }),
+      });
+      clearResume(wallpaperId, file);
+      return result;
+    } catch (error) {
+      // etag 对不上/合并失败：清掉会话，下次从头来
+      if (error.status && error.status < 500) clearResume(wallpaperId, file);
+      throw error;
+    }
   }
 
   // ------------------------------------------------------------------ 提示
@@ -1335,7 +1456,7 @@
         ${editing ? '' : `
           <div class="dropzone" id="wp-drop">
             <strong>拖入文件，或点击选择</strong>
-            <span class="small">图片 PNG/JPG/WebP/AVIF ≤ 20MB；视频 mp4/webm ≤ 60MB；开机动画包 zip ≤ 80MB</span>
+            <span class="small">图片 PNG/JPG/WebP/AVIF ≤ 20MB；视频 mp4/webm ≤ 60MB（超过 55MB 自动分片，最大 2GB）；开机动画包 zip ≤ 64MB</span>
             <div class="small" id="wp-file-name" style="margin-top:6px"></div>
           </div>`}
         <p class="hint" id="wp-progress"></p>

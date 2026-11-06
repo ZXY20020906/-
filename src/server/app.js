@@ -12,6 +12,7 @@ import * as authRoutes from './routes/auth.js';
 import * as publicRoutes from './routes/public.js';
 import * as publicV1Routes from './routes/public-v1.js';
 import * as wallpaperRoutes from './routes/wallpapers.js';
+import * as uploadRoutes from './routes/uploads.js';
 import * as categoryRoutes from './routes/categories.js';
 import * as tagRoutes from './routes/tags.js';
 import * as likeRoutes from './routes/likes.js';
@@ -64,6 +65,12 @@ const DEFINITIONS = [
   { method: 'PATCH', path: '/api/admin/wallpapers/:id', handler: wallpaperRoutes.update, auth: 'session' },
   { method: 'PUT', path: '/api/admin/wallpapers/:id/asset', handler: wallpaperRoutes.upload, auth: 'session' },
   { method: 'PUT', path: '/api/admin/wallpapers/:id/thumb', handler: wallpaperRoutes.uploadThumb, auth: 'session' },
+  // 大文件分片上传（R2 multipart）
+  { method: 'POST', path: '/api/admin/uploads/init', handler: uploadRoutes.init, auth: 'session' },
+  { method: 'PUT', path: '/api/admin/uploads/part', handler: uploadRoutes.part, auth: 'session' },
+  { method: 'POST', path: '/api/admin/uploads/complete', handler: uploadRoutes.complete, auth: 'session' },
+  { method: 'POST', path: '/api/admin/uploads/abort', handler: uploadRoutes.abort, auth: 'session' },
+  { method: 'POST', path: '/api/admin/uploads/cleanup', handler: uploadRoutes.cleanup, auth: 'session' },
   { method: 'DELETE', path: '/api/admin/wallpapers/:id', handler: wallpaperRoutes.remove, auth: 'session' },
 
   // 分类
