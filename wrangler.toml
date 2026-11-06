@@ -18,7 +18,7 @@ bucket_name = "folia-wallpapers"
 # 线上站点来源，用于校验管理接口的 Origin
 PUBLIC_ORIGIN = "https://folia-5ve.pages.dev"
 # 仅用于验证「发布失败⇒变体回滚」，生产必须为 0
-FOLIA_FAIL_PUBLISH = "1"
+FOLIA_FAIL_PUBLISH = "0"
 # 可选：给 R2 绑自定义域名后填在这里，媒体直链就会走它（省 Worker 请求）。
 # 留空则回落到 /media/<key>，由 Worker 从 R2 出图。
 # MEDIA_BASE = "https://img.example.com"
