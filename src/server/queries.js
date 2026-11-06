@@ -294,6 +294,19 @@ export const Q = {
    * （插件的 resolveMediaExpectation 靠它给变体设内容判据）。
    */
   updateWallpaperVariants: `UPDATE wallpapers SET variants = ?, updated_at = ? WHERE id = ?`,
+  /** 阶段二：入库即排队待转码（draft + needs_variant + 原因） */
+  setWallpaperVariantQueue: `UPDATE wallpapers SET needs_variant = ?, variant_reason = ?, status = ?, updated_at = ? WHERE id = ?`,
+  /** 变体补齐后发布，同时清掉队列标记 */
+  publishWallpaperClearQueue: `UPDATE wallpapers SET status = 'published', needs_variant = 0, variant_reason = NULL,
+      published_at = COALESCE(published_at, ?), updated_at = ? WHERE id = ?`,
+  /** 待转码列表（后台 ?needsVariant=1） */
+  listNeedsVariant: `SELECT w.*, c.slug AS category_slug, c.name AS category_name, u.email AS creator_email
+    FROM wallpapers w
+    LEFT JOIN categories c ON c.id = w.category_id
+    LEFT JOIN users u ON u.id = w.created_by
+    WHERE w.needs_variant = 1
+    ORDER BY w.updated_at DESC
+    LIMIT ?`,
   /** 批量导入时「直接发布」：媒体已落盘并回读通过才允许走到这（见 ingest.js） */
   publishWallpaper: `UPDATE wallpapers SET status = 'published', published_at = ?, updated_at = ? WHERE id = ?`,
   /** 上传回读成功后记账：verified_at + 编码信息 */

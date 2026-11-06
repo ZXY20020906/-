@@ -147,6 +147,8 @@ export function wallpaperDto(row, { admin = false, mediaBase = '' } = {}) {
     ...base,
     status: row.status,
     reviewStatus: row.review_status ?? 'pending',
+    needsVariant: Number(row.needs_variant ?? 0) === 1,
+    variantReason: row.variant_reason ?? null,
     hasAsset: Boolean(row.storage_key),
     sortOrder: Number(row.sort_order ?? 0),
     createdBy: row.created_by ?? null,

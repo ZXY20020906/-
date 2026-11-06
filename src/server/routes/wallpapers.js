@@ -100,6 +100,14 @@ async function ensureCategory(env, categoryId) {
 
 export async function list({ env, actor, url }) {
   assertCan(actor, ACTION.WALLPAPER_READ);
+  // 阶段二：待转码队列（needs_variant=1），后台专用
+  if (url.searchParams.get('needsVariant') === '1') {
+    const rows = await all(env, Q.listNeedsVariant, 200);
+    return json({
+      items: rows.map((row) => wallpaperDto(row, { admin: true, mediaBase: mediaBaseFor(env) })),
+      total: rows.length,
+    });
+  }
   const params = url.searchParams;
   const status = params.get('status') ? cleanEnum(params.get('status'), 'status', STATUSES) : null;
   const kind = params.get('kind') ? cleanEnum(params.get('kind'), 'kind', KINDS) : null;
@@ -435,6 +443,64 @@ export async function approveAll({ env, actor }) {
     detail: '批量通过审核（已发布未审核）',
   });
   return json({ approved: true });
+}
+
+
+/** 阶段二：登记一个变体（元数据；文件由 uploadVariant 落盘） */
+export async function addVariant({ env, actor, request, params }) {
+  assertCan(actor, ACTION.WALLPAPER_UPDATE);
+  const row = await loadWallpaper(env, params.id);
+  const body = await readJson(request);
+  const label = String(body.label ?? '').trim().slice(0, 24);
+  if (!label) throw badRequest('缺少变体 label');
+  const variants = await attachVariant(env, actor, row, {
+    label,
+    width: Number(body.width) || null,
+    height: Number(body.height) || null,
+    fps: Number(body.fps) || null,
+    codec: body.codec ?? 'h264',
+    bytes: Number(body.bytes) || 0,
+    sha256: body.sha256 ?? null,
+    key: typeof body.key === 'string' ? body.key : null,
+    url: body.url ?? null,
+  });
+  const fresh = await first(env, Q.wallpaperById, row.id);
+  return json({
+    variants,
+    wallpaper: wallpaperDto(fresh, { admin: true, mediaBase: mediaBaseFor(env) }),
+  });
+}
+
+/** 阶段二：上传变体文件（走 ingest.js 落 R2 + 写 variants 列） */
+export async function uploadVariant({ env, actor, request, params, url }) {
+  assertCan(actor, ACTION.WALLPAPER_UPDATE);
+  const row = await loadWallpaper(env, params.id);
+  const label = String(url.searchParams.get('label') ?? '1080p').trim().slice(0, 24) || '1080p';
+  const fps = Number(url.searchParams.get('fps') ?? 0) || null;
+  const declared = Number(request.headers.get('content-length') ?? 0);
+  if (declared > MAX_UPLOAD_BYTES) throw payloadTooLarge('变体文件过大');
+  const bytes = new Uint8Array(await request.arrayBuffer());
+  if (!bytes.byteLength) throw badRequest('变体文件为空');
+  if (bytes.byteLength > MAX_UPLOAD_BYTES) throw payloadTooLarge('变体文件过大');
+  const result = await ingestVariantAsset(env, actor, row, { bytes, label, fps });
+  const fresh = await first(env, Q.wallpaperById, row.id);
+  return json({
+    variant: { label, key: result.key },
+    variants: result.variants,
+    wallpaper: wallpaperDto(fresh, { admin: true, mediaBase: mediaBaseFor(env) }),
+  });
+}
+
+/** 阶段二：发布（原片可播 或 已有可播变体），成功后清 needs_variant */
+export async function publish({ env, actor, params }) {
+  assertCan(actor, ACTION.WALLPAPER_UPDATE);
+  const row = await loadWallpaper(env, params.id);
+  const result = await publishWallpaper(env, actor, row);
+  const fresh = await first(env, Q.wallpaperById, row.id);
+  return json({
+    ...result,
+    wallpaper: wallpaperDto(fresh, { admin: true, mediaBase: mediaBaseFor(env) }),
+  });
 }
 
 export async function reorder({ env, actor, request }) {

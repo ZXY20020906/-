@@ -52,6 +52,7 @@ import {
   UPLOAD_DAILY_BYTES, VARIANT_MAX_WIDTH,
 } from '../core/media-limits.js';
 import { VARIANT_KIND, labelForVariant, needsVariant, variantKind } from '../core/variant-label.js';
+import { isPlayable, variantReasonFor } from '../core/variant-reason.js';
 import { nextSortOrder } from '../core/ordering.js';
 import { uniqueSlug } from '../core/slug.js';
 import { AUDIT_ACTION, writeAudit } from './audit.js';
@@ -356,13 +357,22 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
     }
   }
 
+  let softReason = null;
   if (compliance && !compliance.ok) {
-    throw mediaNonCompliant(complianceMessage(compliance), {
-      ...complianceInput(meta.mime, meta, bytes, videoInfo),
-      violations: compliance.violations,
-      warnings: compliance.warnings,
-      hint: COMPLIANCE_HINT,
+    softReason = variantReasonFor(compliance.violations);
+    if (!softReason) {
+      throw mediaNonCompliant(complianceMessage(compliance), {
+        ...complianceInput(meta.mime, meta, bytes, videoInfo),
+        violations: compliance.violations,
+        warnings: compliance.warnings,
+        hint: COMPLIANCE_HINT,
+      });
+    }
+    warnings.push({
+      code: IMPORT_WARNING.COMPLIANCE,
+      message: `软违规，先入库为待转码草稿（${softReason}）：${complianceMessage(compliance)}`,
     });
+    compliance = { ok: true, violations: [], warnings: compliance.warnings, soft: true };
   }
 
   const mime = meta.mime;
@@ -461,6 +471,9 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
     updatedAt: now,
   });
   await run(env, Q.markWallpaperVerified, now, videoInfo.codec, videoInfo.faststart, row.id);
+  if (softReason) {
+    await run(env, Q.setWallpaperVariantQueue, 1, softReason, 'draft', now, row.id);
+  }
 
   // ⑧b schema/016 技术元数据（fps / pix_fmt / has_audio）。
   //     纯 JS 探测：fps/codec 由 readVideoInfo 给，hasAudio 由 readVideoAudio 给；
@@ -711,7 +724,9 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
     variants: variants.length,
     tags: safeJsonParse(row.tags, []),
     review_status: row.review_status ?? 'pending',
-    status: row.status ?? 'draft',
+    status: softReason ? 'draft' : (row.status ?? 'draft'),
+    needsVariant: Boolean(softReason),
+    variantReason: softReason,
     mime,
   };
 
@@ -785,17 +800,22 @@ export async function ingestStreamedAsset(env, actor, row, source) {
   const fps = isVideoMime(mime) ? (readVideoFps(head, mime) ?? videoInfo.fps ?? null) : null;
 
   let compliance = null;
+  let softReason = null;
   if (isVideoMime(mime)) {
     compliance = checkVideoCompliance({
       mime, width: meta.width, height: meta.height, fps, codec: videoInfo.codec, faststart, bytes: size,
     });
     if (!compliance.ok) {
-      throw mediaNonCompliant(complianceMessage(compliance), {
-        ...complianceInput(mime, meta, { byteLength: size }, { ...videoInfo, fps, faststart }),
-        violations: compliance.violations,
-        warnings: compliance.warnings,
-        hint: COMPLIANCE_HINT,
-      });
+      softReason = variantReasonFor(compliance.violations);
+      if (!softReason) {
+        throw mediaNonCompliant(complianceMessage(compliance), {
+          ...complianceInput(mime, meta, { byteLength: size }, { ...videoInfo, fps, faststart }),
+          violations: compliance.violations,
+          warnings: compliance.warnings,
+          hint: COMPLIANCE_HINT,
+        });
+      }
+      compliance = { ok: true, violations: [], warnings: compliance.warnings, soft: true };
     }
   }
 
@@ -836,6 +856,9 @@ export async function ingestStreamedAsset(env, actor, row, source) {
     updatedAt: now,
   });
   await run(env, Q.markWallpaperVerified, now, videoInfo.codec ?? null, faststart ?? null, row.id);
+  if (softReason) {
+    await run(env, Q.setWallpaperVariantQueue, 1, softReason, 'draft', now, row.id);
+  }
 
   if (await supportsFingerprintColumn(env)) {
     try {
@@ -878,12 +901,95 @@ export async function ingestStreamedAsset(env, actor, row, source) {
     fingerprintMode: 'sampled',
     kind: nextKind,
     category: row.category_id,
-    status: row.status ?? 'draft',
+    status: softReason ? 'draft' : (row.status ?? 'draft'),
+    needsVariant: Boolean(softReason),
+    variantReason: softReason,
     compliance: compliance ? { warnings: compliance.warnings } : null,
     fixes: [],
     warnings,
     autoFixes: [],
   };
+}
+
+
+/** 变体记录追加/替换（同一 label 覆盖）。只写 D1 的 variants 列。 */
+export async function attachVariant(env, actor, row, variant, { now = nowMs() } = {}) {
+  if (!variant || !variant.label) throw badRequest('缺少变体 label');
+  const list = safeJsonParse(row.variants, []).filter((item) => item && item.label !== variant.label);
+  list.push({
+    label: String(variant.label),
+    width: Number(variant.width) || null,
+    height: Number(variant.height) || null,
+    fps: Number(variant.fps) || null,
+    codec: variant.codec ?? 'h264',
+    bytes: Number(variant.bytes) || 0,
+    sha256: variant.sha256 ?? null,
+    key: variant.key ?? null,
+    url: variant.key ? `/media/${variant.key}` : (variant.url ?? null),
+  });
+  await run(env, Q.updateWallpaperVariants, JSON.stringify(list), now, row.id);
+  await writeAudit(env, {
+    actor,
+    action: AUDIT_ACTION.WALLPAPER_UPDATE,
+    targetType: 'wallpaper',
+    targetId: row.id,
+    detail: `变体 ${variant.label}`,
+  });
+  return list;
+}
+
+/** 上传变体文件（走 ingest.js 写 R2，路由不直接碰存储） */
+export async function ingestVariantAsset(env, actor, row, { bytes, label, fps }, { now = nowMs() } = {}) {
+  if (!bytes || !bytes.byteLength) throw badRequest('变体文件为空');
+  const meta = readMediaMeta(bytes);
+  if (!meta.mime) throw unsupportedMedia(meta.error ?? '无法识别的变体文件');
+  const mime = meta.mime;
+  const sha = await sha256Bytes(bytes);
+  const key = variantKey(row.id, sha, { label }, mime);
+  await putAsset(env, key, bytes, mime);
+  const check = await verifyAsset(env, key, bytes.byteLength);
+  if (!check.ok) {
+    await deleteAsset(env, key);
+    throw storageVerifyFailed('变体写入校验失败，请重试');
+  }
+  const info = readVideoInfo(bytes, mime);
+  const list = await attachVariant(env, actor, row, {
+    label,
+    width: meta.width,
+    height: meta.height,
+    fps: Number(fps) || info.fps || null,
+    codec: info.codec ?? 'h264',
+    bytes: check.size,
+    sha256: sha,
+    key,
+  }, { now });
+  return { key, variants: list };
+}
+
+/** 发布：原片可播 或 已有可播变体；成功后清 needs_variant */
+export async function publishWallpaper(env, actor, row, { now = nowMs() } = {}) {
+  const variants = safeJsonParse(row.variants, []);
+  const variantPlayable = variants.some((item) => isPlayable({
+    fps: item?.fps, width: item?.width, height: item?.height, codec: item?.codec ?? 'h264',
+  }));
+  const originalPlayable = isPlayable({
+    fps: row.fps, width: row.width, height: row.height, codec: row.codec,
+  });
+  if (!originalPlayable && !variantPlayable) {
+    throw conflict('没有可播放的版本：原片与变体都超过 fps/分辨率/编码限制', {
+      needsVariant: true,
+      variants: variants.map((item) => item.label),
+    });
+  }
+  await run(env, Q.publishWallpaperClearQueue, now, now, row.id);
+  await writeAudit(env, {
+    actor,
+    action: AUDIT_ACTION.WALLPAPER_UPDATE,
+    targetType: 'wallpaper',
+    targetId: row.id,
+    detail: originalPlayable ? '发布（原片可播）' : '发布（用变体）',
+  });
+  return { published: true, via: originalPlayable ? 'original' : 'variant' };
 }
 
 /**

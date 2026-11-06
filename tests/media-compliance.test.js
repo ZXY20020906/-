@@ -363,46 +363,35 @@ async function call(env, request) {
 
 const WP_ROW = { id: 'wp_c1', slug: 'compliance-1', title: '合规用例', kind: 'dynamic' };
 
-test('路由：5916×2530 的视频 422，且 R2 / D1 一个字节都没写', { skip }, async () => {
+test('路由：5916×2530 的视频 ⇒ 入库为待转码草稿（软违规不再 422）', { skip }, async () => {
   reset(`upload:${USER.id}`);
   const { db, env, puts } = await routeEnv([WP_ROW]);
   const video = makeMp4({ width: 5916, height: 2530, fps: 30 });
 
   const res = await call(env, uploadRequest(video));
 
-  assert.equal(res.status, 422, '违规必须 422（不是 400/415）');
-  assert.equal(res.body.ok, false);
-  assert.equal(res.body.error.code, 'media_non_compliant');
-  const details = res.body.error.details;
-  const got = details.violations.map((item) => item.code);
-  assert.ok(got.includes(VIOLATION.TOO_WIDE));
-  assert.ok(got.includes(VIOLATION.TOO_MANY_PIXELS));
-  assert.equal(details.width, 5916);
-  assert.ok(details.hint.includes('tools/prepare-upload.mjs'), 'details.hint 要指向本地工具');
-  assert.ok(res.body.error.message.includes('tools/prepare-upload.mjs'), 'message 里也要有处理建议');
-
-  // —— 不写库 / 不落盘 ——
-  assert.equal(puts.length, 0, '违规时不允许写 R2');
-  const row = db.prepare('SELECT storage_key, mime, bytes, verified_at, sha256 FROM wallpapers WHERE id = ?').get(WP_ROW.id);
-  assert.equal(row.storage_key, null);
-  assert.equal(row.mime, null);
-  assert.equal(Number(row.bytes), 0);
-  assert.equal(row.verified_at, null);
-  assert.equal(row.sha256, null);
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM media_audit WHERE wallpaper_id = ?').get(WP_ROW.id).n, 0, '媒体审计不应有行');
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM audit_log WHERE target_id = ?').get(WP_ROW.id).n, 0, '审计日志不应有行');
+  assert.equal(res.status, 200, '软违规应入库，不是 422');
+  const row = db.prepare('SELECT status, needs_variant, variant_reason, storage_key, verified_at FROM wallpapers WHERE id = ?').get(WP_ROW.id);
+  assert.equal(row.status, 'draft');
+  assert.equal(Number(row.needs_variant), 1);
+  assert.equal(row.variant_reason, 'oversize');
+  assert.ok(row.storage_key, '软违规也要落盘');
+  assert.ok(row.verified_at);
+  assert.equal(puts.length, 1);
   db.close();
 });
 
-test('路由：60fps 1080p 视频 422（帧率超限）', { skip }, async () => {
+test('路由：60fps 1080p 视频 ⇒ 入库为待转码草稿，reason=fps-60', { skip }, async () => {
   reset(`upload:${USER.id}`);
   const { db, env, puts } = await routeEnv([WP_ROW]);
   const res = await call(env, uploadRequest(makeMp4({ width: 1920, height: 1080, fps: 60 })));
 
-  assert.equal(res.status, 422);
-  assert.deepEqual(res.body.error.details.violations.map((item) => item.code), [VIOLATION.FPS_TOO_HIGH]);
-  assert.equal(puts.length, 0);
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM audit_log').get().n, 0);
+  assert.equal(res.status, 200);
+  const row = db.prepare('SELECT status, needs_variant, variant_reason FROM wallpapers WHERE id = ?').get(WP_ROW.id);
+  assert.equal(row.status, 'draft');
+  assert.equal(Number(row.needs_variant), 1);
+  assert.equal(row.variant_reason, 'fps-60');
+  assert.equal(puts.length, 1);
   db.close();
 });
 

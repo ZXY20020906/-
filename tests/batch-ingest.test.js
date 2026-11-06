@@ -231,7 +231,7 @@ test('A 路径：4K@60 ⇒ 自动降帧到 4K@30 + 生成 1080p 变体，记录�
   db.close();
 });
 
-test('A 路径：没有转码器时 4K@60 拒绝入库，并给出可执行的原因（不静默）', { skip }, async () => {
+test('A 路径：4K@60 入库为待转码草稿（软违规，不再拒绝）', { skip }, async () => {
   const { db, env } = makeEnv(); // 不注入 MEDIA_TOOLS：等价于线上 Worker（没有 ffmpeg）
   reset(`import:${ACTOR.id}`);
   const data = await runImport(env, {
@@ -240,11 +240,11 @@ test('A 路径：没有转码器时 4K@60 拒绝入库，并给出可执行的�
     kind: 'dynamic',
   });
 
-  assert.equal(data.item.status, 'failed');
-  assert.equal(data.item.code, 'media_non_compliant');
-  assert.match(data.item.reason, /帧率|fps/);
-  assert.match(JSON.stringify(data.item.details?.violations ?? []), /fps-too-high/);
-  assert.equal(countWallpapers(db), 0, '失败的条目绝不能留下空草稿');
+  assert.equal(data.item.status, 'imported', data.item.reason ?? '');
+  const row = rowOf(db, data.item.wallpaperId);
+  assert.equal(row.status, 'draft');
+  assert.equal(Number(row.needs_variant), 1);
+  assert.equal(row.variant_reason, 'fps-60');
   db.close();
 });
 
@@ -308,9 +308,9 @@ test('探测失败（图片读不出宽高）⇒ 进失败报告，不入库', {
   db.close();
 });
 
-test('违规（HEVC）⇒ 进失败报告，不入库', { skip }, async () => {
+test('HEVC 入库为待转码草稿，reason=codec（编码软违规）', { skip }, async () => {
   const { db, env } = makeEnv();
-  env.MEDIA_TOOLS = MEDIA_TOOLS; // 就算有转码器，HEVC 也不在「自动降帧」的修正范围里
+  env.MEDIA_TOOLS = MEDIA_TOOLS;
   reset(`import:${ACTOR.id}`);
   const data = await runImport(env, {
     fileName: 'hevc.mp4',
@@ -318,10 +318,11 @@ test('违规（HEVC）⇒ 进失败报告，不入库', { skip }, async () => {
     kind: 'dynamic',
   });
 
-  assert.equal(data.item.status, 'failed');
-  assert.equal(data.item.code, 'media_non_compliant');
-  assert.match(JSON.stringify(data.item.details.violations), /codec-unsupported/);
-  assert.equal(countWallpapers(db), 0);
+  assert.equal(data.item.status, 'imported', data.item.reason ?? '');
+  const row = rowOf(db, data.item.wallpaperId);
+  assert.equal(row.status, 'draft');
+  assert.equal(Number(row.needs_variant), 1);
+  assert.equal(row.variant_reason, 'codec');
   db.close();
 });
 

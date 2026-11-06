@@ -214,3 +214,8 @@ node tools/build-public-snapshot.mjs --sqlite build/d1-export.sqlite --commit $(
 - 没有做软删除/回收站。删除是真的删（R2 + D1），前端有二次确认。
 - 没有做邮件（邀请、找回密码）。成员密码由管理员设置、本人登录后自改。
 - 后台界面没做 i18n，中文写死。
+
+## 例行维护
+
+- 每周跑一次 `FOLIA_PASSWORD=... node tools/cleanup-orphan-uploads.mjs`：清理 `_tmp/` 下超过 24 小时的残留分片。
+- 有 60fps / 超规格原片入库后：`node tools/make-variants.mjs --all-draft` 本机转 30fps 并自动发布。

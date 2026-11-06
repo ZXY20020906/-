@@ -63,6 +63,10 @@ const DEFINITIONS = [
   { method: 'PATCH', path: '/api/admin/subtags/:id', handler: subtagRoutes.update, auth: 'session' },
   { method: 'DELETE', path: '/api/admin/subtags/:id', handler: subtagRoutes.remove, auth: 'session' },
   { method: 'PATCH', path: '/api/admin/wallpapers/:id', handler: wallpaperRoutes.update, auth: 'session' },
+  // 阶段二：待转码队列 / 变体 / 发布
+  { method: 'POST', path: '/api/admin/wallpapers/:id/variants', handler: wallpaperRoutes.addVariant, auth: 'session' },
+  { method: 'PUT', path: '/api/admin/wallpapers/:id/variant', handler: wallpaperRoutes.uploadVariant, auth: 'session' },
+  { method: 'POST', path: '/api/admin/wallpapers/:id/publish', handler: wallpaperRoutes.publish, auth: 'session' },
   { method: 'PUT', path: '/api/admin/wallpapers/:id/asset', handler: wallpaperRoutes.upload, auth: 'session' },
   { method: 'PUT', path: '/api/admin/wallpapers/:id/thumb', handler: wallpaperRoutes.uploadThumb, auth: 'session' },
   // 大文件分片上传（R2 multipart）
