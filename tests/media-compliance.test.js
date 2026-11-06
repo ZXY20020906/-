@@ -338,6 +338,9 @@ async function routeEnv(wallpapers = []) {
       async delete() {},
     },
     PUBLIC_ORIGIN: 'https://example.test',
+    // 阶段三：这些用例数的是「入库写了几个 R2 对象」，快照重建不在断言范围内。
+    // （真桶会多写 snapshots/… + current.json 三个对象，会把 puts.length 打乱。）
+    SNAPSHOT_AUTO: '0',
   };
   return { db, env, puts };
 }

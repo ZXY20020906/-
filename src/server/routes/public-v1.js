@@ -8,9 +8,11 @@
  * 匿名可读：`gate-middleware.js` 的 PUBLIC_READ_PREFIXES 放行 `/api/v1/public/`
  * （只认 GET/HEAD/OPTIONS）。详情接口必须公开，否则素材网客户端拿不到单条元数据。
  */
-import { json } from '../http.js';
+import { failure, json } from '../http.js';
+import { notFound } from '../../core/errors.js';
 import { sha256Hex } from '../util.js';
 import { etagMatches, normalizeEtag } from '../../core/etag.js';
+import { CURRENT_CACHE_CONTROL, readCurrent } from '../snapshot.js';
 import {
   categoriesPayload, subtagsPayload, tagsPayload, wallpapersPayload, wallpaperPayload, manifestPayload,
 } from '../public-api.js';
@@ -54,6 +56,42 @@ export async function etagJson(payload, request, { status = 200 } = {}) {
 
 export async function listCategories({ env }) {
   return json(await categoriesPayload(env));
+}
+
+/**
+ * `GET /api/v1/public/current.json` —— **当前快照指针**（阶段三）。
+ *
+ * 返回 R2 根上的 `current.json` 内容：`{version, generatedAt}`。
+ * `version` 形如 `20261106T131500Z-1a2b3c4d`（UTC 时间 + 内容哈希前 8 位），
+ * 客户端/运维据此判断「线上这份快照是哪一版」，也用来做回滚对账。
+ *
+ * 缓存头按裁决：`current.json` → `public, max-age=300`（可变指针，短缓存）；
+ * 快照对象本身在 R2 上带 `max-age=31536000, immutable`（版本号里已含内容哈希）。
+ *
+ * 没有快照时返回 404 + `no-store`：这不是错误，只是「还没构建过」，
+ * 但绝不能被缓存住 5 分钟（否则首次构建完成后客户端还在看 404）。
+ */
+export async function currentJson({ env, request }) {
+  const current = await readCurrent(env);
+  if (!current) {
+    const missing = failure(notFound('还没有可用的公开快照（current.json 缺失），公开读暂时回退 D1'));
+    const headers = new Headers(missing.headers);
+    headers.set('cache-control', 'no-store');
+    return new Response(missing.body, { status: 404, headers });
+  }
+  const body = JSON.stringify({ version: current.version, generatedAt: current.generatedAt });
+  const etag = `"${(await sha256Hex(body)).slice(0, 24)}"`;
+  const headers = {
+    'content-type': 'application/json; charset=utf-8',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'same-origin',
+    etag,
+    'cache-control': CURRENT_CACHE_CONTROL,
+  };
+  if (etagMatches(request?.headers?.get('if-none-match'), etag)) {
+    return new Response(null, { status: 304, headers });
+  }
+  return new Response(body, { status: 200, headers });
 }
 
 export async function listTags({ env, url }) {

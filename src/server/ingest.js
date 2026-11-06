@@ -56,6 +56,7 @@ import { isPlayable, variantReasonFor } from '../core/variant-reason.js';
 import { nextSortOrder } from '../core/ordering.js';
 import { uniqueSlug } from '../core/slug.js';
 import { AUDIT_ACTION, writeAudit } from './audit.js';
+import { rebuildSnapshotQuietly } from './snapshot.js';
 
 /**
  * 大文件跳过完整 sha256 的阈值（40MB，见 core/media-limits.js）；
@@ -743,6 +744,11 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
     });
   }
 
+  // ---- 阶段三触发点 ①：上传完成 ---------------------------------------------------
+  // ingestAsset() 是「单条上传 / 换文件 / 批量导入」唯一的写路径，所以这一处就覆盖了
+  // 所有「素材落盘」的入口。失败只记日志，不影响这次上传的返回值（见 snapshot.js）。
+  await rebuildSnapshotQuietly(env, '上传完成');
+
   return {
     ...fields,
     key,
@@ -886,6 +892,10 @@ export async function ingestStreamedAsset(env, actor, row, source) {
     warnings.push({ code: IMPORT_WARNING.COMPLIANCE, message: describeWarnings(compliance.warnings) });
   }
 
+  // ---- 阶段三触发点 ②：大文件流式入库完成 -----------------------------------------
+  // 分片上传（>48MB）走这条路，和 ingestAsset 是同一套规则、同一份快照触发。
+  await rebuildSnapshotQuietly(env, '流式入库完成');
+
   return {
     key,
     storageKey: key,
@@ -935,6 +945,9 @@ export async function attachVariant(env, actor, row, variant, { now = nowMs() } 
     targetId: row.id,
     detail: `变体 ${variant.label}`,
   });
+  // ---- 阶段三触发点 ③：变体写入 ---------------------------------------------------
+  // 变体会改变列表/详情里的 `variants` 与 `playable` 判定，公开快照必须跟着换。
+  await rebuildSnapshotQuietly(env, `变体 ${variant.label}`);
   return list;
 }
 
@@ -1050,6 +1063,9 @@ export async function publishWallpaper(env, actor, row, { now = nowMs() } = {}) 
     targetId: row.id,
     detail: originalPlayable ? '发布（原片可播）' : '发布（用变体）',
   });
+  // ---- 阶段三触发点 ④：发布 -------------------------------------------------------
+  // 发布是「条目第一次出现在公开接口」的时刻，早于下一次定时重建就晚了 —— 必须同步重建。
+  await rebuildSnapshotQuietly(env, '发布');
   return { published: true, via: originalPlayable ? 'original' : 'variant' };
 }
 

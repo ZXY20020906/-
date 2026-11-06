@@ -6,112 +6,62 @@
  * 改一处忘另一处立刻分叉。现在：
  *
  *   routes/public-v1.js  ──┐
- *   routes/public.js（旧） ──┴──► public-api.js（本文件，真正的 SQL / DTO / 分页）
+ *   routes/public.js（旧） ──┴──► public-api.js（本文件：读取链 + SQL / DTO / 分页）
  *
  * 于是兼容性验证可以退化成一条断言：同一请求分别打旧路径与 v1，响应体逐字节相同
  * （tests/api-v1.test.js 的「旧路径 == v1」用例）。
  *
- * 公开可见性门槛在 queries.js 的 PUBLIC_VISIBLE（已发布 + 有文件 + 已验证 + 已审核），
- * 清单 / 计数 / facets 三处同源，不在本文件里另算一遍。
+ * 公开可见性门槛在 queries.js 的 PUBLIC_VISIBLE + PUBLIC_CATEGORY（已发布 + 有文件 +
+ * 已验证 + 已审核 + 分类公开），清单 / 计数 / facets 三处同源，不在本文件里另算一遍。
+ *
+ * ---------------------------------------------------------------------------
+ * 阶段三（2026-11）：公开读静态化。读取顺序变成三层：
+ *
+ *   ① R2 动态快照   `snapshot.js` 的 readSnapshot()，**0 次 D1 行读**
+ *        └ 命中：参数在内存里筛（`public-filter.js`，与 SQL 逐条等价）
+ *   ② D1 实时查询   上线的老路径，原样保留；响应带 `degraded: true`
+ *        └ 快照缺失 / 损坏 / 读失败时走这里
+ *   ③ 仓库内嵌快照   `public-snapshot.js`（181KB 只读 JSON，2026-11-05 D1 额度事故的产物）
+ *        └ D1 也报了可识别的错（额度耗尽 / 缺表 / 绑定失效）时兜底，带 degraded 标记
+ *
+ * 三条路径的字段、分页、排序、facets 必须完全一致 —— 对拍见
+ * `tests/snapshot-parity.test.js`（16 块），逐条对照见 `docs/PHASE3-PARITY-MAP.md`。
  */
 import { all, first, isD1QuotaError, isD1Unavailable } from './db.js';
 import { PUBLIC_FACETS, PUBLIC_LIST_BY_SORT, PUBLIC_SUBTAGS, Q } from './queries.js';
-import { cursorForSort, decodeCursor, encodeCursor, normalizeCursor } from '../core/pagination.js';
+import { cursorForSort, decodeCursor, normalizeCursor } from '../core/pagination.js';
 import { cleanEnum, parseLimit, parsePage, parseSort } from '../core/validate.js';
 import { KINDS } from '../core/validate.js';
-import { ASPECT_TOLERANCE, ASPECTS, parseAspect } from '../core/aspects.js';
+import { parseAspect, ASPECTS } from '../core/aspects.js';
 import { badRequest, notFound } from '../core/errors.js';
-import { normalizeTag } from '../core/tag-vocabulary.js';
-import { mediaBaseFor, publicUrl } from './storage.js';
-import { safeJsonArray } from './util.js';
-import { categoryDto, variantsDto, wallpaperDto } from './dto.js';
+import { mediaBaseFor } from './storage.js';
+import { categoryDto, manifestItemDto, wallpaperDto } from './dto.js';
 import { SNAPSHOT } from './public-snapshot.js';
-
-/** 搜索词只保留普通字符，避免 % _ 被当成通配符。 */
-export function likePattern(raw) {
-  if (!raw) return null;
-  const cleaned = String(raw).replace(/[%_\\]/g, '').replace(/\s+/g, ' ').trim().slice(0, 60);
-  return cleaned ? `%${cleaned}%` : null;
-}
-
-/** 标签筛选：单个标签名最长 30 字；一次最多 20 个（再多就不像人点的了）。 */
-export const TAG_VALUE_MAX = 30;
-export const TAG_MAX_VALUES = 20;
-
-/** facets 里 tags / subtags 最多给多少个（按 count 降序）。 */
-export const FACET_LIMIT = 50;
-
-/**
- * 解析 `tag` 参数：逗号分隔的多值，语义是 **OR**（命中任意一个标签即算匹配）。
- *
- * 第二期起每个值先过 `normalizeTag()`：`anime` → `动漫`，于是「筛 anime」和
- * 「筛 动漫」返回同一批（SQL 那边再把库里的 alias 值映射到 canonical）。
- *
- * 库里的 `wallpapers.tags` 是 JSON 数组文本，所以这里转成 JSON 数组字符串交给
- * `json_each`（见 queries.js 的 tagMatch），一个占位符搞定多值。
- * 单值输入与旧版完全一致：清洗规则（剔掉 `% _ \ "`）、长度上限、`filters.tag` 输出都不变。
- */
-export function parseTagFilter(raw) {
-  const text = String(raw ?? '').replace(/[%_\\"]/g, '').trim();
-  if (!text) return { values: [], json: null };
-  const values = [];
-  for (const part of text.split(',')) {
-    const value = part.trim();
-    if (!value) continue;
-    // 与旧版一致：单个标签过长是 400，而不是悄悄截断
-    if (value.length > TAG_VALUE_MAX) throw badRequest('tag 参数过长');
-    const canonical = normalizeTag(value);
-    if (!values.includes(canonical)) values.push(canonical);
-  }
-  if (values.length > TAG_MAX_VALUES) throw badRequest(`tag 参数过多（最多 ${TAG_MAX_VALUES} 个）`);
-  return { values, json: values.length ? JSON.stringify(values) : null };
-}
-
-/**
- * 许可证筛选：对外统一小写标识（`cc0` / `cc-by` / `personal` …）。
- * 空串/缺省 = 不过滤；格式非法是 400（而不是静默返回空列表）。
- */
-export function parseLicense(raw) {
-  const value = String(raw ?? '').trim().toLowerCase();
-  if (!value) return null;
-  if (value.length > 40 || !/^[a-z0-9][a-z0-9._-]*$/.test(value)) {
-    throw badRequest('license 参数不合法（小写字母、数字、点、下划线、短横线，≤40 字）');
-  }
-  return value;
-}
-
-/** 数值筛选参数：缺省 → null；非整数/越界 → 400（不静默忽略）。 */
-export function parseOptionalInt(raw, name, { min = 0, max = 1e12 } = {}) {
-  if (raw === null || raw === undefined || raw === '') return null;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || !Number.isInteger(n) || n < min || n > max) {
-    throw badRequest(`${name} 必须是 ${min}~${max} 之间的整数`);
-  }
-  return n;
-}
-
-/** `playable` 的两种档位语义见 queries.js 的 extraFilters 注释。 */
-export const PLAYABLE = Object.freeze(['1080p30', 'original']);
-
-/** `audio=true|false`（也接受 1/0）→ 1/0/null；其它值 400。 */
-export function parseAudio(raw) {
-  if (raw === null || raw === undefined || raw === '') return null;
-  const value = String(raw).trim().toLowerCase();
-  if (value === 'true' || value === '1') return 1;
-  if (value === 'false' || value === '0') return 0;
-  throw badRequest('audio 只能是 true / false');
-}
-
-/** `playable` 参数校验。 */
-export function parsePlayable(raw) {
-  if (raw === null || raw === undefined || raw === '') return null;
-  const value = String(raw).trim();
-  if (!PLAYABLE.includes(value)) throw badRequest(`playable 只能是 ${PLAYABLE.join(' / ')}`);
-  return value;
-}
+import {
+  FACET_LIMIT, PLAYABLE, TAG_MAX_VALUES, TAG_VALUE_MAX,
+  buildCategoriesPayload, buildSubtagsPayload, buildTagsPayload, buildWallpapersPayload,
+  findSnapshotItem, likePattern, parseAudio, parseLicense, parseOptionalInt, parsePlayable,
+  parseTagFilter,
+} from './public-filter.js';
+import { readSnapshotSafe, scheduleSnapshotBootstrap, snapshotAutoEnabled } from './snapshot.js';
 
 /* ------------------------------------------------------------------------- *
- * 快照回落（D1 不可用时）
+ * 参数解析的 re-export
+ *
+ * 这些函数在第三期搬到了 `public-filter.js`（快照路径与 SQL 路径共用同一份解析，
+ * 才能保证「什么算非法、什么算缺省」两边一致）。文件位置变了，导出名一个没变，
+ * 老引用（含 tools/ 里的脚本）不需要改。
+ * ------------------------------------------------------------------------- */
+export {
+  FACET_LIMIT, PLAYABLE, TAG_MAX_VALUES, TAG_VALUE_MAX,
+  likePattern, parseAudio, parseLicense, parseOptionalInt, parsePlayable, parseTagFilter,
+};
+
+/** manifest 条目构造器（第三期搬到 dto.js，供快照构建复用；导出名保持不变）。 */
+export const manifestItem = manifestItemDto;
+
+/* ------------------------------------------------------------------------- *
+ * 第三层：内嵌快照回落（D1 不可用时）
  *
  * 2026-11-05 线上事故：D1 免费额度（每天 5,000,000 行读取）耗尽后，所有公开
  * 接口的第一条 SQL 都返回错误码 7500，app.js 统一转成 500，插件因此看不到
@@ -123,13 +73,13 @@ export function parsePlayable(raw) {
  * 被快照掩盖。响应里带 `degraded: true` 与 `snapshotGeneratedAt`，客户端和
  * 冒烟脚本能明确知道「这是降级副本，不是刚查的库」。
  *
- * 为什么不用 R2 存快照：多一次 R2 读、多一个可能坏的绑定；公开数据本来就在
- * 仓库里，静态导入最简单，也最容易在 CI 里校验。
+ * 阶段三之后它是**第三层**（第一层是 R2 动态快照，第二层是 D1）。保留不改不删：
+ * 它救过一次线上，而且「R2 也读不到」这种情况并非不可能。
  * ------------------------------------------------------------------------- */
 
 let lastSnapshotLogAt = 0;
 
-/** 快照是否可用（测试里可显式设 PUBLIC_SNAPSHOT_FALLBACK=0 关掉，避免掩盖 SQL bug）。 */
+/** 内嵌快照是否可用（测试里可显式设 PUBLIC_SNAPSHOT_FALLBACK=0 关掉，避免掩盖 SQL bug）。 */
 export function snapshotFallbackEnabled(env) {
   return env?.PUBLIC_SNAPSHOT_FALLBACK !== '0'
     && Array.isArray(SNAPSHOT?.items)
@@ -152,326 +102,56 @@ function noteSnapshotFallback(error) {
   );
 }
 
+/** 内嵌快照的降级标记（与 R2 快照的 `degraded` 区分：这个还带快照生成时间）。 */
 function snapshotMeta() {
   return { degraded: true, snapshotGeneratedAt: Number(SNAPSHOT?.generatedAt ?? 0) };
 }
 
-function canonicalSnapshotTag(tag) {
-  return SNAPSHOT?.aliases?.[tag] ?? tag;
+/**
+ * 走 D1 时给响应打 `degraded: true`。
+ *
+ * 语义是「这次回答没有走静态快照」。生产环境永远应该走快照，所以出现这个标记就
+ * 说明快照缺失/损坏 —— 冒烟脚本据此报警（`--allow-degraded` 才放行）。
+ * 单测环境 `SNAPSHOT_AUTO=0`（没打算用快照）时不打这个标记，免得每个用例都被它污染。
+ */
+function withDegraded(payload, env) {
+  if (!snapshotAutoEnabled(env)) return payload;
+  if (payload && payload.ok === true && payload.data) {
+    return { ...payload, data: { ...payload.data, degraded: true } };
+  }
+  return { ...payload, degraded: true };
 }
 
-function snapshotItemTags(item) {
-  return Array.isArray(item?.tags) ? item.tags : [];
+function fallbackOrThrow(error, env, build) {
+  if (!shouldFallback(error, env)) throw error;
+  noteSnapshotFallback(error);
+  return build();
 }
 
-function parseSnapshotFilters(url) {
-  const params = url.searchParams;
-  const sort = parseSort(params.get('sort'));
-  const limit = parseLimit(params.get('limit'), { def: 24, max: 100 });
-  const kind = params.get('kind') ? cleanEnum(params.get('kind'), 'kind', KINDS) : null;
-  const category = params.get('category')?.trim() || null;
-  if (category && category.length > 80) throw badRequest('category 参数过长');
-  const featuredOnly = params.get('featured') === '1' || params.get('featured') === 'true';
-  const like = likePattern(params.get('q'));
-  const tagRaw = params.get('tag')?.trim().replace(/[%_\\"]/g, '') ?? '';
-  const tagFilter = parseTagFilter(tagRaw);
-  const aspect = parseAspect(params.get('aspect'));
-  const license = parseLicense(params.get('license'));
-  const subtag = String(params.get('subtag') ?? '').replace(/[%_\\]/g, '').trim().slice(0, 40) || null;
-  const range = (name, extra = {}) => parseOptionalInt(params.get(name), name, extra);
-  const pageParam = params.get('page');
-  const paged = pageParam !== null && pageParam !== '';
-  const page = paged ? parsePage(pageParam) : 1;
-  return {
-    params,
-    sort,
-    limit,
-    kind,
-    category,
-    featuredOnly,
-    like,
-    tagRaw,
-    tagFilter,
-    aspect,
-    license,
-    subtag,
-    paged,
-    page,
-    offset: paged ? (page - 1) * limit : 0,
-    cursor: paged ? null : normalizeCursor(decodeCursor(params.get('cursor')), sort),
-    minWidth: range('minWidth', { max: 100000 }),
-    maxWidth: range('maxWidth', { max: 100000 }),
-    minHeight: range('minHeight', { max: 100000 }),
-    maxHeight: range('maxHeight', { max: 100000 }),
-    minDurationMs: range('minDurationMs', { max: 86400000 }),
-    maxDurationMs: range('maxDurationMs', { max: 86400000 }),
-    minBytes: range('minBytes', { max: Number.MAX_SAFE_INTEGER }),
-    maxBytes: range('maxBytes', { max: Number.MAX_SAFE_INTEGER }),
-    fpsMax: parseOptionalInt(params.get('fpsMax'), 'fpsMax', { min: 1, max: 1000 }),
-    playable: parsePlayable(params.get('playable')),
-    audio: parseAudio(params.get('audio')),
-  };
+/** 内嵌快照的四个内存响应（参数、排序、facets 全部复用同一份实现）。 */
+function embeddedWallpapersPayload({ url }) {
+  return buildWallpapersPayload({ url, data: SNAPSHOT, meta: snapshotMeta() });
 }
 
-/** 原画本身是否在 1920×1080@30 内（与原 SQL 的 original 分支同义）。 */
-function snapshotOriginalPlayable(item) {
-  const width = Number(item?.width);
-  const height = Number(item?.height);
-  const fps = Number(item?.fps);
-  return Number.isFinite(width) && Number.isFinite(height)
-    && item?.fps !== null && item?.fps !== undefined
-    && Number.isFinite(fps)
-    && width <= 1920 && height <= 1080 && fps <= 30;
+function embeddedCategoriesPayload() {
+  return buildCategoriesPayload({ data: SNAPSHOT, meta: snapshotMeta() });
 }
 
-function snapshotPlayable(item, mode) {
-  if (snapshotOriginalPlayable(item)) return true;
-  if (mode !== '1080p30') return false;
-  const variants = Array.isArray(item?.variants) ? item.variants : [];
-  return variants.some((variant) => {
-    const width = Number(variant?.width);
-    const height = Number(variant?.height);
-    if (!Number.isFinite(width) || !Number.isFinite(height)) return false;
-    if (width > 1920 || height > 1080) return false;
-    return variant?.fps === null || variant?.fps === undefined || Number(variant.fps) <= 30;
-  });
+function embeddedTagsPayload({ url }) {
+  return buildTagsPayload({ url, data: SNAPSHOT, meta: snapshotMeta() });
 }
 
-function snapshotItemMatches(item, filters) {
-  if (filters.category && item?.category?.slug !== filters.category) return false;
-  if (filters.kind && item?.kind !== filters.kind) return false;
-  if (filters.featuredOnly && item?.featured !== true) return false;
-
-  if (filters.like) {
-    const needle = String(filters.like).slice(1, -1).toLowerCase();
-    if (!String(item?.title ?? '').toLowerCase().includes(needle)) return false;
-  }
-
-  if (filters.tagFilter.values.length) {
-    const tags = snapshotItemTags(item).map(canonicalSnapshotTag);
-    if (!filters.tagFilter.values.some((value) => tags.includes(value))) return false;
-  }
-
-  if (filters.subtag && item?.subtag !== filters.subtag) return false;
-
-  if (filters.aspect !== null) {
-    const width = Number(item?.width);
-    const height = Number(item?.height);
-    if (!(width > 0 && height > 0)) return false;
-    if (Math.abs(width / height - filters.aspect) >= ASPECT_TOLERANCE) return false;
-  }
-
-  if (filters.license && String(item?.license ?? '').toLowerCase() !== filters.license) return false;
-
-  // 数值筛选：列值为 NULL 的条目不匹配（与 SQL `w.width >= ?` 的 NULL 语义一致）。
-  const within = (value, min, max) => {
-    if (value === null || value === undefined) return false;
-    const n = Number(value);
-    if (!Number.isFinite(n)) return false;
-    if (min !== null && n < min) return false;
-    if (max !== null && n > max) return false;
-    return true;
-  };
-  if (filters.minWidth !== null && !within(item?.width, filters.minWidth, null)) return false;
-  if (filters.maxWidth !== null && !within(item?.width, null, filters.maxWidth)) return false;
-  if (filters.minHeight !== null && !within(item?.height, filters.minHeight, null)) return false;
-  if (filters.maxHeight !== null && !within(item?.height, null, filters.maxHeight)) return false;
-  if (filters.minDurationMs !== null && !within(item?.durationMs, filters.minDurationMs, null)) return false;
-  if (filters.maxDurationMs !== null && !within(item?.durationMs, null, filters.maxDurationMs)) return false;
-  if (filters.minBytes !== null && !within(item?.bytes, filters.minBytes, null)) return false;
-  if (filters.maxBytes !== null && !within(item?.bytes, null, filters.maxBytes)) return false;
-  if (filters.fpsMax !== null) {
-    if (item?.fps === null || item?.fps === undefined) return false;
-    if (!Number.isFinite(Number(item.fps)) || Number(item.fps) > filters.fpsMax) return false;
-  }
-  if (filters.audio !== null && item?.hasAudio !== (filters.audio === 1)) return false;
-  if (filters.playable && !snapshotPlayable(item, filters.playable)) return false;
-
-  return true;
+function embeddedSubtagsPayload({ url }) {
+  return buildSubtagsPayload({ url, data: SNAPSHOT, meta: snapshotMeta() });
 }
 
-function snapshotCursorKey(sort, item) {
-  switch (sort) {
-    case 'name':
-      return String(item?.title ?? '');
-    case 'size':
-      return Number(item?.bytes ?? 0);
-    case 'resolution':
-      return Number(item?.width ?? 0) * Number(item?.height ?? 0);
-    case 'oldest':
-    case 'recent':
-    default:
-      return Number(item?.publishedAt ?? item?.createdAt ?? 0);
-  }
-}
-
-function snapshotCompare(a, b, sort) {
-  const aId = String(a?.id ?? '');
-  const bId = String(b?.id ?? '');
-  const byIdAsc = aId < bId ? -1 : aId > bId ? 1 : 0;
-  const byIdDesc = -byIdAsc;
-  if (sort === 'name') {
-    const an = String(a?.title ?? '').toLowerCase();
-    const bn = String(b?.title ?? '').toLowerCase();
-    return an < bn ? -1 : an > bn ? 1 : byIdAsc;
-  }
-  if (sort === 'oldest') {
-    const delta = snapshotCursorKey(sort, a) - snapshotCursorKey(sort, b);
-    return delta || byIdAsc;
-  }
-  if (sort === 'size') {
-    const delta = Number(b?.bytes ?? 0) - Number(a?.bytes ?? 0);
-    return delta || byIdDesc;
-  }
-  if (sort === 'resolution') {
-    const delta = snapshotCursorKey(sort, b) - snapshotCursorKey(sort, a);
-    return delta || byIdDesc;
-  }
-  const delta = snapshotCursorKey('recent', b) - snapshotCursorKey('recent', a);
-  return delta || byIdDesc;
-}
-
-function snapshotAfterCursor(item, sort, cursor) {
-  const key = snapshotCursorKey(sort, item);
-  if (sort === 'name') {
-    const a = String(key).toLowerCase();
-    const b = String(cursor.key ?? '').toLowerCase();
-    return a > b || (a === b && String(item.id) > cursor.id);
-  }
-  if (sort === 'oldest') return key > cursor.key || (key === cursor.key && String(item.id) > cursor.id);
-  return key < cursor.key || (key === cursor.key && String(item.id) < cursor.id);
-}
-
-function snapshotFacets(items) {
-  const categories = new Map();
-  const tags = new Map();
-  const subtags = new Map();
-  for (const item of items) {
-    if (item?.category?.id) {
-      const current = categories.get(item.category.id) ?? {
-        id: item.category.id,
-        slug: item.category.slug ?? null,
-        name: item.category.name ?? null,
-        count: 0,
-      };
-      current.count += 1;
-      categories.set(item.category.id, current);
-    }
-    for (const raw of snapshotItemTags(item)) {
-      const name = canonicalSnapshotTag(raw);
-      if (typeof name === 'string' && name) tags.set(name, (tags.get(name) ?? 0) + 1);
-    }
-    if (typeof item?.subtag === 'string' && item.subtag) {
-      subtags.set(item.subtag, (subtags.get(item.subtag) ?? 0) + 1);
-    }
-  }
-  const byName = (a, b) => (String(a.name) < String(b.name) ? -1 : String(a.name) > String(b.name) ? 1 : 0);
-  const byCount = (a, b) => b.count - a.count || byName(a, b);
-  return {
-    categories: [...categories.values()].sort((a, b) => b.count - a.count || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
-    tags: [...tags].map(([name, count]) => ({ name, count })).sort(byCount).slice(0, FACET_LIMIT),
-    subtags: [...subtags].map(([name, count]) => ({ name, count })).sort(byCount).slice(0, FACET_LIMIT),
-  };
-}
-
-function snapshotWallpapersPayload({ url }) {
-  const filters = parseSnapshotFilters(url);
-  const filtered = SNAPSHOT.items.filter((item) => snapshotItemMatches(item, filters));
-  const total = filtered.length;
-  const facets = snapshotFacets(filtered);
-  const sorted = [...filtered].sort((a, b) => snapshotCompare(a, b, filters.sort));
-
-  let items;
-  let hasMore;
-  let nextCursor = null;
-  if (filters.paged) {
-    items = sorted.slice(filters.offset, filters.offset + filters.limit);
-    hasMore = filters.offset + items.length < total;
-  } else {
-    const remaining = filters.cursor ? sorted.filter((item) => snapshotAfterCursor(item, filters.sort, filters.cursor)) : sorted;
-    items = remaining.slice(0, filters.limit);
-    hasMore = remaining.length > filters.limit;
-    if (items.length && hasMore) {
-      const last = items[items.length - 1];
-      nextCursor = encodeCursor({ t: snapshotCursorKey(filters.sort, last), i: last.id });
-    }
-  }
-
-  return {
-    ok: true,
-    data: {
-      items,
-      total,
-      hasMore,
-      nextCursor,
-      page: filters.paged ? filters.page : null,
-      pageSize: filters.limit,
-      pageCount: Math.max(1, Math.ceil(total / filters.limit)),
-      offset: filters.offset,
-      sort: filters.sort,
-      filters: {
-        category: filters.category,
-        kind: filters.kind,
-        tag: filters.tagRaw || null,
-        aspect: filters.params.get('aspect') ?? null,
-      },
-      facets,
-      ...snapshotMeta(),
-    },
-  };
-}
-
-function snapshotCategoriesPayload() {
-  return { categories: SNAPSHOT.categories, ...snapshotMeta() };
-}
-
-function snapshotTagsPayload({ url }) {
-  const slug = String(url.searchParams.get('category') ?? '').trim().slice(0, 80);
-  let tags = SNAPSHOT.tags?.tags ?? [];
-  if (slug) {
-    const category = (SNAPSHOT.categories ?? []).find((item) => item.slug === slug);
-    tags = category ? tags.filter((item) => item.categoryId === null || item.categoryId === undefined || item.categoryId === category.id) : [];
-  }
-  return {
-    tags,
-    aspects: SNAPSHOT.tags?.aspects ?? ASPECTS.map((item) => item.key),
-    kinds: SNAPSHOT.tags?.kinds ?? KINDS,
-    ...snapshotMeta(),
-  };
-}
-
-function snapshotSubtagsPayload({ url }) {
-  const category = String(url.searchParams.get('category') ?? '').trim() || null;
-  const tagFilter = parseTagFilter(String(url.searchParams.get('tag') ?? ''));
-  // 无筛选时直接给 D1 导出的原始结果（含「已发布 + 有文件」的 118 条口径）；
-  // 带筛选时才按快照条目重算，保证不把别的分类/标签的子标签混进来。
-  if (!category && !tagFilter.values.length) {
-    return { subtags: SNAPSHOT.subtags ?? [], ...snapshotMeta() };
-  }
-  const filtered = SNAPSHOT.items.filter((item) => {
-    if (category && item?.category?.slug !== category) return false;
-    if (tagFilter.values.length) {
-      const tags = snapshotItemTags(item).map(canonicalSnapshotTag);
-      if (!tagFilter.values.some((value) => tags.includes(value))) return false;
-    }
-    return true;
-  });
-  const counts = new Map();
-  for (const item of filtered) {
-    if (typeof item?.subtag === 'string' && item.subtag) counts.set(item.subtag, (counts.get(item.subtag) ?? 0) + 1);
-  }
-  const subtags = [...counts].map(([name, count]) => ({ name, count }))
-    .sort((a, b) => b.count - a.count || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  return { subtags, ...snapshotMeta() };
-}
-
-function snapshotWallpaperPayload({ params }) {
-  const item = (SNAPSHOT.items ?? []).find((row) => row.slug === params.slug);
+function embeddedWallpaperPayload({ params }) {
+  const item = findSnapshotItem(SNAPSHOT, params.slug);
   if (!item) throw notFound('壁纸不存在或尚未发布');
   return { wallpaper: item, ...snapshotMeta() };
 }
 
-function snapshotManifestPayload() {
+function embeddedManifestPayload() {
   return { ...SNAPSHOT.manifest, ...snapshotMeta() };
 }
 
@@ -506,21 +186,19 @@ export function snapshotPluginFeed({ url }) {
   return {
     version: 1,
     count: items.length,
+    items,
     counts: {
       video: items.filter((item) => item.type === 'video').length,
       image: items.filter((item) => item.type === 'image').length,
       bundle: items.filter((item) => item.type === 'bundle').length,
     },
-    items,
     ...snapshotMeta(),
   };
 }
 
-function fallbackOrThrow(error, env, build) {
-  if (!shouldFallback(error, env)) throw error;
-  noteSnapshotFallback(error);
-  return build();
-}
+/* ------------------------------------------------------------------------- *
+ * facets（SQL 路径）
+ * ------------------------------------------------------------------------- */
 
 /**
  * 聚合行 → facets。
@@ -557,18 +235,28 @@ export function facetsFromRows(rows) {
   };
 }
 
+/* ------------------------------------------------------------------------- *
+ * 分类
+ * ------------------------------------------------------------------------- */
+
 async function liveCategoriesPayload(env) {
   const rows = await all(env, Q.listPublicCategories);
   return { categories: rows.map(categoryDto) };
 }
 
 export async function categoriesPayload(env) {
+  const snapshot = await readSnapshotSafe(env);
+  if (snapshot) return buildCategoriesPayload({ data: snapshot.wallpapers });
   try {
-    return await liveCategoriesPayload(env);
+    return withDegraded(await liveCategoriesPayload(env), env);
   } catch (error) {
-    return fallbackOrThrow(error, env, snapshotCategoriesPayload);
+    return fallbackOrThrow(error, env, embeddedCategoriesPayload);
   }
 }
+
+/* ------------------------------------------------------------------------- *
+ * 清单
+ * ------------------------------------------------------------------------- */
 
 /**
  * 公开清单（v1 与旧路径共用）。
@@ -666,13 +354,26 @@ async function liveWallpapersPayload({ env, url }) {
   };
 }
 
+/**
+ * 清单：快照优先 → D1 → 内嵌快照。
+ *
+ * 快照命中时 0 次 D1 行读；只有快照缺失/损坏才回 D1（带 `degraded: true`），
+ * 顺手用 `ctx.waitUntil` 在后台补一份快照（自愈，节流 60s）。
+ */
 export async function wallpapersPayload(ctx) {
+  const snapshot = await readSnapshotSafe(ctx.env);
+  if (snapshot) return buildWallpapersPayload({ url: ctx.url, data: snapshot.wallpapers });
+  scheduleSnapshotBootstrap(ctx.env, ctx.waitUntil);
   try {
-    return await liveWallpapersPayload(ctx);
+    return withDegraded(await liveWallpapersPayload(ctx), ctx.env);
   } catch (error) {
-    return fallbackOrThrow(error, ctx.env, () => snapshotWallpapersPayload(ctx));
+    return fallbackOrThrow(error, ctx.env, () => embeddedWallpapersPayload(ctx));
   }
 }
+
+/* ------------------------------------------------------------------------- *
+ * 子标签 / 标签
+ * ------------------------------------------------------------------------- */
 
 async function liveSubtagsPayload({ env, url }) {
   const category = url.searchParams.get('category')?.trim() || null;
@@ -682,10 +383,12 @@ async function liveSubtagsPayload({ env, url }) {
 }
 
 export async function subtagsPayload(ctx) {
+  const snapshot = await readSnapshotSafe(ctx.env);
+  if (snapshot) return buildSubtagsPayload({ url: ctx.url, data: snapshot.wallpapers });
   try {
-    return await liveSubtagsPayload(ctx);
+    return withDegraded(await liveSubtagsPayload(ctx), ctx.env);
   } catch (error) {
-    return fallbackOrThrow(error, ctx.env, () => snapshotSubtagsPayload(ctx));
+    return fallbackOrThrow(error, ctx.env, () => embeddedSubtagsPayload(ctx));
   }
 }
 
@@ -716,12 +419,18 @@ async function liveTagsPayload({ env, url }) {
 }
 
 export async function tagsPayload(ctx) {
+  const snapshot = await readSnapshotSafe(ctx.env);
+  if (snapshot) return buildTagsPayload({ url: ctx.url, data: snapshot.wallpapers });
   try {
-    return await liveTagsPayload(ctx);
+    return withDegraded(await liveTagsPayload(ctx), ctx.env);
   } catch (error) {
-    return fallbackOrThrow(error, ctx.env, () => snapshotTagsPayload(ctx));
+    return fallbackOrThrow(error, ctx.env, () => embeddedTagsPayload(ctx));
   }
 }
+
+/* ------------------------------------------------------------------------- *
+ * 详情
+ * ------------------------------------------------------------------------- */
 
 async function liveWallpaperPayload({ env, params }) {
   const row = await first(env, Q.publicBySlug, params.slug);
@@ -729,38 +438,28 @@ async function liveWallpaperPayload({ env, params }) {
   return { wallpaper: wallpaperDto(row, { mediaBase: mediaBaseFor(env) }) };
 }
 
+/**
+ * 详情：快照内按 slug 查；未命中才查 D1；都没有 ⇒ 404 not_found。
+ *
+ * 注意 D1 这条分支同时承担两件事：快照里没有但库里有的条目（快照还没重建），
+ * 以及真的不存在的 slug（`publicBySlug` 返回空 ⇒ notFound ⇒ 不触发内嵌快照兜底）。
+ */
 export async function wallpaperPayload(ctx) {
+  const snapshot = await readSnapshotSafe(ctx.env);
+  if (snapshot) {
+    const item = findSnapshotItem(snapshot.wallpapers, ctx.params.slug);
+    if (item) return { wallpaper: item };
+  }
   try {
-    return await liveWallpaperPayload(ctx);
+    return withDegraded(await liveWallpaperPayload(ctx), ctx.env);
   } catch (error) {
-    return fallbackOrThrow(error, ctx.env, () => snapshotWallpaperPayload(ctx));
+    return fallbackOrThrow(error, ctx.env, () => embeddedWallpaperPayload(ctx));
   }
 }
 
-/**
- * manifest 条目：只放「客户端同步 + 校验」需要的字段。
- *
- * `variants` 复用公开 DTO 的 `variantsDto()`（同样的 label/width/fps/排序规则），
- * 所以同一档位在列表、详情、manifest 三处的描述永远一致。
- */
-export function manifestItem(row, mediaBase = '') {
-  return {
-    id: row.id,
-    slug: row.slug,
-    kind: row.kind,
-    url: publicUrl(row.storage_key, mediaBase),
-    bytes: Number(row.bytes ?? 0),
-    sha256: row.sha256 ?? null,
-    width: row.width ?? null,
-    height: row.height ?? null,
-    fps: row.fps === null || row.fps === undefined || row.fps === '' ? null : Number(row.fps),
-    variants: variantsDto(row, mediaBase),
-    posterUrl: publicUrl(row.poster_key, mediaBase),
-    tags: safeJsonArray(row.tags, []),
-    license: row.license ?? null,
-    updatedAt: Number(row.updated_at ?? 0),
-  };
-}
+/* ------------------------------------------------------------------------- *
+ * manifest
+ * ------------------------------------------------------------------------- */
 
 /**
  * manifest 快照的数据部分（HTTP 层负责 ETag/304，见 routes/public-v1.js）。
@@ -776,7 +475,7 @@ async function liveManifestPayload(env) {
   const rows = await all(env, Q.publicManifest);
   const maxUpdated = Number((await first(env, Q.publicMaxUpdatedAt))?.n ?? 0);
   const mediaBase = mediaBaseFor(env);
-  const items = rows.map((row) => manifestItem(row, mediaBase));
+  const items = rows.map((row) => manifestItemDto(row, mediaBase));
   const fromRows = rows.reduce((max, row) => Math.max(max, Number(row.updated_at ?? 0)), 0);
   // 兜底：查询没给值（老库/假环境）时退回这批 items 的最大值，绝不返回 NaN
   const generatedAt = maxUpdated > 0 ? maxUpdated : fromRows;
@@ -784,9 +483,11 @@ async function liveManifestPayload(env) {
 }
 
 export async function manifestPayload(env) {
+  const snapshot = await readSnapshotSafe(env);
+  if (snapshot?.manifest) return snapshot.manifest;
   try {
-    return await liveManifestPayload(env);
+    return withDegraded(await liveManifestPayload(env), env);
   } catch (error) {
-    return fallbackOrThrow(error, env, snapshotManifestPayload);
+    return fallbackOrThrow(error, env, embeddedManifestPayload);
   }
 }

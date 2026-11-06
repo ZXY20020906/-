@@ -2,7 +2,7 @@
  * 输出给前端的形状。DB 行 → DTO。
  * storage_key 是内部字段不暴露；sha256 对外输出（插件用它做增量下载判断）。
  */
-import { safeJsonParse } from './util.js';
+import { safeJsonArray, safeJsonParse } from './util.js';
 import { publicUrl } from './storage.js';
 import { capabilitiesFor, ROLE_LABELS } from '../core/permissions.js';
 import { labelForVariant } from '../core/variant-label.js';
@@ -156,6 +156,34 @@ export function wallpaperDto(row, { admin = false, mediaBase = '' } = {}) {
     sortOrder: Number(row.sort_order ?? 0),
     createdBy: row.created_by ?? null,
     creatorEmail: row.creator_email ?? null,
+    updatedAt: Number(row.updated_at ?? 0),
+  };
+}
+
+/**
+ * manifest 条目：只放「客户端同步 + 校验」需要的字段。
+ *
+ * `variants` 复用公开 DTO 的 `variantsDto()`（同样的 label/width/fps/排序规则），
+ * 所以同一档位在列表、详情、manifest 三处的描述永远一致。
+ *
+ * 放在 dto.js 而不是 public-api.js：阶段三的快照构建（`snapshot.js`）也要用它，
+ * 而 `snapshot.js` 又被 `public-api.js` import —— 放这里才不会形成 import 环。
+ */
+export function manifestItemDto(row, mediaBase = '') {
+  return {
+    id: row.id,
+    slug: row.slug,
+    kind: row.kind,
+    url: publicUrl(row.storage_key, mediaBase),
+    bytes: Number(row.bytes ?? 0),
+    sha256: row.sha256 ?? null,
+    width: row.width ?? null,
+    height: row.height ?? null,
+    fps: row.fps === null || row.fps === undefined || row.fps === '' ? null : Number(row.fps),
+    variants: variantsDto(row, mediaBase),
+    posterUrl: publicUrl(row.poster_key, mediaBase),
+    tags: safeJsonArray(row.tags, []),
+    license: row.license ?? null,
     updatedAt: Number(row.updated_at ?? 0),
   };
 }

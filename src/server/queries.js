@@ -29,7 +29,21 @@ const PUBLIC_VISIBLE = `w.status = 'published' AND w.storage_key IS NOT NULL
   AND w.verified_at IS NOT NULL
   AND w.review_status = 'approved'`;
 
+/**
+ * 公开可见的**分类口径**（A 方案，2026-11 阶段三裁决）。
+ *
+ * 「公开」= 作品已发布，**且**它所属的分类是公开的。不给 `wallpapers` 加列：
+ * 运维把分类设成隐藏之后，重建一次公开快照就生效（`categories.is_public`）。
+ * 未分类（`category_id IS NULL`）保持既有行为：仍然公开（历史上允许存在孤儿条目）。
+ *
+ * 为什么必须写进 SQL 而不是只在快照构建时过滤：阶段三之后同一份数据有两条读路径
+ * （R2 快照 / D1），只在一边加条件会让切换当天 total 悄悄变掉。
+ * 详见 docs/PHASE3-PARITY-MAP.md。
+ */
+const PUBLIC_CATEGORY = `(w.category_id IS NULL OR c.is_public = 1)`;
+
 const PUBLIC_FILTERS = `${PUBLIC_VISIBLE}
+  AND ${PUBLIC_CATEGORY}
   AND (?1 IS NULL OR c.slug = ?1)
   AND (?2 IS NULL OR w.kind = ?2)
   AND (?3 IS NULL OR w.title LIKE ?3)
@@ -133,6 +147,7 @@ const PUBLIC_COUNT_EXTRA = extraFilters({
 export const PUBLIC_SUBTAGS = `SELECT w.subtag AS name, COUNT(*) AS n FROM wallpapers w
   LEFT JOIN categories c ON c.id = w.category_id
   WHERE w.status = 'published' AND w.storage_key IS NOT NULL
+    AND ${PUBLIC_CATEGORY}
     AND w.subtag IS NOT NULL AND w.subtag <> ''
     AND (?1 IS NULL OR c.slug = ?1)
     AND (?2 IS NULL OR ${tagMatch('?2')})
@@ -427,6 +442,14 @@ export const Q = {
   /** 使用时间回写（agent 侧做了 60s 节流，见 src/server/api-keys.js） */
   touchApiKey: `UPDATE api_keys SET last_used_at = ? WHERE id = ?`,
 
+  /**
+   * 标签别名表（schema/017）：alias → canonical。
+   *
+   * 阶段三的内存筛选需要与 `tagMatch()` 的 `LEFT JOIN tag_aliases` **完全相同**的映射，
+   * 不能另抄一份词表（`core/tag-vocabulary.js` 是写入侧的归一表，两处必须一致但不该合并）。
+   */
+  listTagAliases: `SELECT alias, canonical FROM tag_aliases ORDER BY alias`,
+
   // ------------------------------------------------------------------ tags
   listTags: `SELECT * FROM tags ORDER BY sort_order, name`,
   /** 某个分类下能用的标签：全局标签（category_id 为空） + 该分类专属标签 */
@@ -461,6 +484,7 @@ export const Q = {
    */
   publicManifest: `SELECT ${PUBLIC_COLUMNS} FROM wallpapers w LEFT JOIN categories c ON c.id = w.category_id
     WHERE ${PUBLIC_VISIBLE}
+      AND ${PUBLIC_CATEGORY}
     ORDER BY COALESCE(w.published_at, w.created_at) DESC, w.id DESC
     LIMIT 1000`,
 

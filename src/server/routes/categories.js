@@ -23,6 +23,7 @@ import { categoryDto } from '../dto.js';
 import { buildReorderPlan, nextSortOrder } from '../../core/ordering.js';
 import { AUDIT_ACTION, writeAudit } from '../audit.js';
 import { newId } from '../util.js';
+import { rebuildSnapshotQuietly } from '../snapshot.js';
 
 async function loadCategory(env, id) {
   const row = await first(env, Q.categoryById, cleanId(id, 'id'));
@@ -117,6 +118,9 @@ export async function update({ env, actor, request, params }) {
   });
 
   const fresh = await first(env, Q.categoryById, row.id);
+  // 阶段三：`is_public` 是公开快照的准入条件（A 方案）。改公开/隐藏、改名、改排序
+  // 都会改变公开接口的输出，所以要重建快照 —— 否则「隐藏分类」要等下一次定时重建才生效。
+  await rebuildSnapshotQuietly(env, '编辑分类');
   return json({ category: categoryDto(fresh) });
 }
 

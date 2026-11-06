@@ -137,6 +137,8 @@ function makeSite(rows = BASE_ROWS) {
     DB: makeD1(db, queries),
     BUCKET: FAKE_BUCKET,
     PUBLIC_ORIGIN: 'https://example.test',
+    // 阶段三：这些用例验的是 SQL 路径，显式关掉快照（FAKE_BUCKET 里本来也没有快照）。
+    SNAPSHOT_AUTO: '0',
   };
   return {
     env,

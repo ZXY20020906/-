@@ -52,16 +52,46 @@ function makeD1(db) {
   };
 }
 
-function makeBucket() {
+/**
+ * 测试用假桶。
+ *
+ * 阶段三之后它还要能存 **JSON 快照**，所以 `get()` 返回的对象必须同时具备
+ * `text()` / `json()` / `arrayBuffer()` 三种读法（真实 R2 对象就是这样）。
+ * `put()` 既接受字符串（快照），也接受 Uint8Array（素材字节）。
+ */
+export function makeBucket() {
   const objects = new Map();
+  const puts = [];
+  const toBytes = (value) => {
+    if (typeof value === 'string') return new TextEncoder().encode(value);
+    if (value instanceof Uint8Array) return value;
+    if (value instanceof ArrayBuffer) return new Uint8Array(value);
+    return new TextEncoder().encode(String(value));
+  };
+  const view = (key, bytes) => ({
+    key,
+    size: bytes.byteLength,
+    body: bytes,
+    async text() { return new TextDecoder().decode(bytes); },
+    async json() { return JSON.parse(new TextDecoder().decode(bytes)); },
+    async arrayBuffer() { return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength); },
+  });
   return {
     objects,
-    async put(key, bytes) { objects.set(key, new Uint8Array(bytes)); },
-    async get(key) { return objects.has(key) ? { body: objects.get(key) } : null; },
+    puts,
+    async put(key, value, options) {
+      const bytes = toBytes(value);
+      objects.set(key, bytes);
+      puts.push({ key, options: options ?? null, size: bytes.byteLength });
+      return { key, size: bytes.byteLength };
+    },
+    async get(key) { return objects.has(key) ? view(key, objects.get(key)) : null; },
     async head(key) {
       return objects.has(key) ? { size: objects.get(key).byteLength, httpEtag: `"${key}"` } : null;
     },
     async delete(key) { objects.delete(key); },
+    /** 只列出对象 key（快照断言用）。 */
+    keys() { return [...objects.keys()].sort(); },
   };
 }
 
@@ -133,7 +163,15 @@ export function openSite(rows = []) {
   }
   const bucket = makeBucket();
   // 单测默认关快照回落，避免 D1 报错被生产快照掩盖；快照用例单独打开。
-  const env = { DB: makeD1(db), BUCKET: bucket, PUBLIC_ORIGIN: 'https://example.test', PUBLIC_SNAPSHOT_FALLBACK: '0' };
+  // SNAPSHOT_AUTO=0：默认不自动重建公开快照（否则每个写用例都会去打 R2）。
+  // 快照相关的用例用 `snapshotEnv()` 显式打开。
+  const env = {
+    DB: makeD1(db),
+    BUCKET: bucket,
+    PUBLIC_ORIGIN: 'https://example.test',
+    PUBLIC_SNAPSHOT_FALLBACK: '0',
+    SNAPSHOT_AUTO: '0',
+  };
   return {
     db,
     bucket,
@@ -145,6 +183,14 @@ export function openSite(rows = []) {
     },
     close() { db.close(); },
   };
+}
+
+/**
+ * 阶段三用：同一个库 + 同一个桶，但**打开**快照路径。
+ * @param {{DB: object, BUCKET: object}} base 通常是 `openSite().env`
+ */
+export function snapshotEnv(base, overrides = {}) {
+  return { ...base, SNAPSHOT_AUTO: '1', ...overrides };
 }
 
 /** 走真实路由（不带 gate），返回 status/headers/body/text。 */

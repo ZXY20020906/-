@@ -43,6 +43,7 @@ import {
   assertDailyQuota, attachVariant, buildImportReport, createWallpaperRow, importMedia, ingestAsset,
   ingestVariantAsset, ingestVariantFromObject, publishWallpaper, recordDailyUsage, removeVariant,
 } from '../ingest.js';
+import { rebuildSnapshotQuietly } from '../snapshot.js';
 
 /** 大文件跳过完整 sha256 的阈值（真正的实现在 ingest.js，这里 re-export 供测试/工具引用）。 */
 export { HASH_LIMIT, THUMB_WIDTH, DEFAULT_MEDIA_TOOLS, AUTO_FIX, IMPORT_WARNING } from '../ingest.js';
@@ -230,6 +231,9 @@ export async function update({ env, actor, request, params }) {
   });
 
   const fresh = await first(env, Q.wallpaperById, row.id);
+  // 阶段三触发点：编辑标题/标签/分类/置顶/上下架都会改变公开字段（或让它从公开集合里
+  // 进/出），必须重建快照，否则线上会停在旧版本。失败只记日志，不影响这次保存。
+  await rebuildSnapshotQuietly(env, '编辑作品');
   return json({ wallpaper: wallpaperDto(fresh, { admin: true, mediaBase: mediaBaseFor(env) }) });
 }
 
@@ -425,6 +429,8 @@ export async function remove({ env, actor, params }) {
     targetId: row.id,
     detail: row.title,
   });
+  // 阶段三触发点：删除/软删同样要让条目从公开快照里消失。
+  await rebuildSnapshotQuietly(env, '删除作品');
   return json({ deleted: true, id: row.id });
 }
 
@@ -513,6 +519,8 @@ export async function deleteVariant({ env, actor, params, url }) {
   const label = String(url.searchParams.get('label') ?? '').trim();
   if (!label) throw badRequest('缺少变体 label');
   const variants = await removeVariant(env, actor, row, label);
+  // 删变体会改变详情里的 variants 与 playable 判定
+  await rebuildSnapshotQuietly(env, `删除变体 ${label}`);
   return json({ variants });
 }
 

@@ -34,6 +34,8 @@ const DEFINITIONS = [
   { method: 'GET', path: '/api/v1/public/categories', handler: publicV1Routes.listCategories, auth: 'none', cors: true },
   { method: 'GET', path: '/api/v1/public/tags', handler: publicV1Routes.listTags, auth: 'none', cors: true },
   { method: 'GET', path: '/api/v1/public/subtags', handler: publicV1Routes.listSubtags, auth: 'none', cors: true },
+  // 阶段三：当前快照指针（{version, generatedAt}），缓存 5 分钟
+  { method: 'GET', path: '/api/v1/public/current.json', handler: publicV1Routes.currentJson, auth: 'none', cors: true },
   { method: 'GET', path: '/api/v1/public/manifest.json', handler: publicV1Routes.manifest, auth: 'none', cors: true },
   { method: 'GET', path: '/api/v1/public/wallpapers', handler: publicV1Routes.listWallpapers, auth: 'none', cors: true },
   { method: 'GET', path: '/api/v1/public/wallpapers/:slug', handler: publicV1Routes.getWallpaper, auth: 'none', cors: true },
@@ -199,11 +201,17 @@ function withCors(response, env) {
 
 /**
  * Pages Functions 入口。
+ *
  * @param {Request} request
  * @param {{DB: D1Database, BUCKET: R2Bucket, BOOTSTRAP_TOKEN?: string, PUBLIC_ORIGIN?: string}} env
+ * @param {{waitUntil?: (promise: Promise<any>) => void}} [context] Pages/Worker 执行上下文。
+ *   `waitUntil` 只有它会给：阶段三的「快照缺失时后台自愈」必须有它才不会随响应结束被回收。
  */
-export async function handle(request, env) {
+export async function handle(request, env, context) {
   const url = new URL(request.url);
+  const waitUntil = typeof context?.waitUntil === 'function'
+    ? (promise) => context.waitUntil(promise)
+    : null;
 
   try {
     if (!url.pathname.startsWith('/api/')) throw notFound('接口不存在');
@@ -307,7 +315,7 @@ export async function handle(request, env) {
       handlerRequest = new Request(request.url, { method: request.method, headers });
     }
 
-    const response = await route.handler({ request: handlerRequest, env, url, params, actor });
+    const response = await route.handler({ request: handlerRequest, env, url, params, actor, waitUntil });
     const final = route.cors ? withCors(response, env) : response;
 
     // 只缓存 GET 的完整实体：HEAD 没有 body，若把 HEAD 的响应写进 GET 的 key，

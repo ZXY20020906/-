@@ -134,6 +134,9 @@ export function createEnv(handlers, { bucket } = {}) {
       // 单测默认关掉快照回落：未注册的查询 / 真实 SQL 错误必须当场炸出来，
       // 不能被生产快照「兜」成 200。快照行为由 public-snapshot.test.js 显式打开。
       PUBLIC_SNAPSHOT_FALLBACK: '0',
+      // 阶段三：默认不自动重建公开快照（假桶存不了快照，真 SQL 也没注册）。
+      // 需要快照路径的用例显式设 SNAPSHOT_AUTO: '1'。
+      SNAPSHOT_AUTO: '0',
     },
     calls,
     puts,
