@@ -334,6 +334,22 @@ test('附加：--force 等价路径 —— 内容没变也换一个版本，旧�
  * 兜底链的最后一层仍然在：R2 快照缺失 + D1 报可识别错误 ⇒ 内嵌 `public-snapshot.js`。
  * （第三期没有动它，这条用例守的是「别在重构里把它弄丢」。）
  */
+test('附加：快照对象被删 ⇒ 重建会补回来（内容没变也要重写）', { skip: sqliteSkip }, async (t) => {
+  if (!realSqlite(t)) return;
+  const { site, env, result } = await publishedSite(t);
+
+  // 模拟「手删一个快照对象」：current.json 还在，但 wallpapers.json 没了
+  await site.bucket.delete(`${SNAPSHOT_PREFIX}/${result.version}/wallpapers.json`);
+  assert.equal(await readSnapshot(env), null, '缺文件必须判定为「没有快照」，回退 D1');
+
+  const repaired = await publishSnapshot(env);
+  assert.equal(repaired.wrote, true, '对象缺失时即使内容没变也必须重写');
+  assert.equal(repaired.version, result.version, '修复现场沿用原版本号，不制造新版本');
+  const snapshot = await readSnapshot(env);
+  assert.ok(snapshot, '补写之后快照又能读到了');
+  assert.equal(snapshot.wallpapers.total, PUBLIC_COUNT);
+});
+
 test('附加：兜底链 —— 无快照 + D1 不可用 ⇒ 内嵌快照（degraded + snapshotGeneratedAt）', async () => {
   const env = {
     DB: { prepare() { throw new Error('D1_ERROR: no such table: wallpapers'); } },

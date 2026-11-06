@@ -206,6 +206,27 @@ export async function buildSnapshot(env) {
 }
 
 /**
+ * 当前版本的两个对象是否都还在。
+ *
+ * 为什么「内容没变」还要多查两个 HEAD：`current.json` 只是指针，对象可能被人手删、
+ * 被生命周期规则清掉、或者上一轮只写成功了一半。如果只看内容哈希就短路，
+ * 线上会**永远**停在 D1 分支（每轮重建都判定「没变化」，于是永远不补）。
+ * 两个 HEAD 只在「内容没变」时才发生，成本可以忽略。
+ *
+ * 假桶没有 `head` 时按「存在」处理（测试环境不模拟对象丢失）。
+ */
+async function snapshotObjectsExist(env, version) {
+  const bucket = bucketOf(env);
+  if (!bucket || typeof bucket.head !== 'function') return true;
+  const base = `${SNAPSHOT_PREFIX}/${version}`;
+  const [manifest, wallpapers] = await Promise.all([
+    bucket.head(`${base}/manifest.json`),
+    bucket.head(`${base}/wallpapers.json`),
+  ]);
+  return Boolean(manifest && wallpapers);
+}
+
+/**
  * 构建 + 发布：写 `snapshots/<version>/{manifest,wallpapers}.json`，最后覆盖 `current.json`。
  *
  * **失败语义**：任何一步抛错，`current.json` 都不会被改写 —— 线上继续读上一版完整快照。
@@ -219,7 +240,11 @@ export async function publishSnapshot(env, { force = false } = {}) {
   const startedAt = Date.now();
   const snapshot = await buildSnapshot(env);
   const current = await readCurrent(env);
-  const unchanged = Boolean(current && current.version === snapshot.version);
+  let unchanged = Boolean(current && current.version === snapshot.version);
+  if (unchanged && !(await snapshotObjectsExist(env, snapshot.version))) {
+    // 指针还在、对象没了：按「需要重写」处理（版本号不变，修复现场）
+    unchanged = false;
+  }
 
   if (unchanged && !force) {
     return { version: snapshot.version, wrote: false, ms: Date.now() - startedAt, total: snapshot.core.total };
