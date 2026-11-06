@@ -1542,8 +1542,16 @@
             const id = data.wallpaper.id;
             if (chosenFile) {
               submit.textContent = '上传中…';
+              const startedAt = Date.now();
+              const totalBytes = chosenFile.size;
               await putAssetWithThumb(id, chosenFile, (ratio) => {
-                $('#wp-progress', dialog).textContent = `已上传 ${Math.round(ratio * 100)}%`;
+                const done = Math.min(1, ratio) * totalBytes;
+                const elapsed = Math.max(0.001, (Date.now() - startedAt) / 1000);
+                const speed = done / elapsed;
+                const remain = speed > 0 ? Math.max(0, (totalBytes - done) / speed) : 0;
+                $('#wp-progress', dialog).textContent = ratio >= 0.999
+                  ? '已完成'
+                  : `已上传 ${Math.round(ratio * 100)}%（${(done / 1048576).toFixed(1)}/${(totalBytes / 1048576).toFixed(1)} MB · 剩余 ${Math.ceil(remain)} 秒）`;
               });
             }
             closeDialog();

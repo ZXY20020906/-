@@ -1025,6 +1025,10 @@ export async function ingestVariantFromObject(env, actor, row, { key, size, labe
 
 /** 发布：原片可播 或 已有可播变体；成功后清 needs_variant */
 export async function publishWallpaper(env, actor, row, { now = nowMs() } = {}) {
+  // 测试开关：验证「发布失败 ⇒ 变体回滚」链路，默认关闭；上线环境保持 0
+  if (String(env.FOLIA_FAIL_PUBLISH ?? '') === '1') {
+    throw conflict('发布被测试开关 FOLIA_FAIL_PUBLISH 拦下（用于验证回滚）');
+  }
   const variants = safeJsonParse(row.variants, []);
   const variantPlayable = variants.some((item) => isPlayable({
     fps: item?.fps, width: item?.width, height: item?.height, codec: item?.codec ?? 'h264',

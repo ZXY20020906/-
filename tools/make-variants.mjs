@@ -22,6 +22,7 @@ const BASE = process.env.FOLIA_BASE || 'https://folia-5ve.pages.dev';
 const EMAIL = process.env.FOLIA_EMAIL || 'admin@folia.local';
 const PASSWORD = process.env.FOLIA_PASSWORD || '';
 const FFMPEG = process.env.FOLIA_FFMPEG || 'ffmpeg';
+const CRF = process.env.FOLIA_VARIANT_CRF || '23';
 const args = process.argv.slice(2);
 const DRY = args.includes('--dry-run');
 const ALL = args.includes('--all-draft');
@@ -95,7 +96,7 @@ async function main() {
       const height = Number(item.height) || 1080;
       const scale = width > 1920 ? "fps=30,scale='min(1920,iw)':-2" : 'fps=30';
       execFileSync(FFMPEG, [
-        '-y', '-i', src, '-vf', scale, '-c:v', 'libx264', '-crf', '23', '-preset', 'veryfast',
+        '-y', '-i', src, '-vf', scale, '-c:v', 'libx264', '-crf', CRF, '-preset', 'veryfast',
         '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an', out,
       ], { stdio: 'inherit', timeout: 10 * 60 * 1000 });
       const produced = readFileSync(out);
