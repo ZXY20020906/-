@@ -1,6 +1,9 @@
 # 阶段三交接（公开读静态化）
 
-> 状态：**未实现**。本文只固化裁决与实施清单，供新会话直接开工。
+> 状态：**已完成并线上验收（2026-11-06，commit `6d44af03` / `3b946955`）**。
+> 本文保留为实施清单与裁决存档；实际结果、①–⑦ 证据见 `docs/PHASE-PROGRESS.md`，
+> 运维手册见 `docs/OPS.md`，参数对照表见 `docs/PHASE3-PARITY-MAP.md`。
+> ~~本文只固化裁决与实施清单，供新会话直接开工。~~
 > 开工第一件事：`git pull --rebase origin main`，再读 `docs/PHASE3-EXECUTION.md`。
 
 ## 已裁决（不要再问）
