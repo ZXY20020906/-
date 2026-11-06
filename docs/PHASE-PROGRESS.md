@@ -9,8 +9,8 @@
 | 阶段一 | 分片上传（≤2GB，multipart + 断点续传 + 清理工具） | ✅ 已完成并线上验收 | `4668895b` / `91b0bfc3` / `e2c8fa6d` |
 | 阶段二 | 60fps/超限原片先入库后转码（needs_variant + make-variants） | ✅ 已完成并线上验收 | `8fdb3319` / `ee50739a` / `b35b1f1b` / `fd25009` |
 | 阶段三 | 公开读静态化（snapshot.js + current.json + parity） | ✅ 已完成并线上验收 | `6d44af03` / `3b946955` |
-| 阶段四 | 后台分页 + 短缓存 + TTL 文档 | ✅ 已完成并线上验收 | `1fa27774` |
-| 阶段六 | 运维三件套（inspect-assets / d1-usage / export-d1） | ⬜ 未开始 | — |
+| 阶段四 | 后台分页 + 短缓存 + TTL 文档 | ✅ 已完成并线上验收 | `1fa27774` / `56f3478a` |
+| 阶段六 | 运维三件套（inspect-assets / d1-usage / export-d1） | ✅ 已完成并线上验收 | `2aac2db3` |
 | 阶段五 | 管理端效率（批量上传 / 重试 / 去重 / 批量改标签） | ⬜ 未开始 | — |
 
 ---
@@ -120,15 +120,64 @@ node tools/build-snapshot.mjs --force      # 内容没变也写新版本（排�
 
 ---
 
+## 阶段六：运维三件套（已完成，2026-11-06）
+
+### 做了什么
+
+| 文件 | 作用 |
+|---|---|
+| `tools/lib/cloudflare.mjs`（新） | D1 / R2 REST 适配层，三个脚本共用；token 只从环境变量来（不接受命令行，避免进 shell history） |
+| `tools/inspect-assets.mjs`（新） | 资产对账：对象缺失 / 大小不符 / `--sha N` 抽样验内容哈希 / `--orphans` 反查无记录对象 / `_tmp/` 残留 / `needs_variant` 堆积 / 超 7 天草稿；`--json` 给 CI |
+| `tools/d1-usage.mjs`（阶段四已落地） | 按 `date` 维度出今日与近 N 天行读/行写；>80% 退 2 |
+| `tools/export-d1.mjs`（新） | 导出 6 张表到 `backups/d1-YYYYMMDD-HHmm.json`，写完立刻回读自检 |
+| `tools/build-snapshot.mjs` | 改用共用适配层（删掉重复的 REST 实现），`--status` / `--dry-run` / publish 均已复验 |
+| `tests/ops-tools.test.js`（新） | 7 条纯逻辑用例：判定 / 退出码 / 阈值 / 导出条数自检 / api_keys 不含 key_hash |
+| `docs/OPS.md` | 运维三件套用法、定时任务、部署与回滚（代码 / 快照 / 数据）、故障速查补充 |
+
+### 两个设计取舍（都写进 OPS）
+
+1. **`inspect` 默认只查 `status != 'hidden'`**：站点有 110 条对象已丢失的历史条目，
+   处置方式就是置为 hidden。算进异常的话健康站点也会永远 exit 1，巡检就没人看了。
+   报告里单列一行「hidden 中缺对象（归档）= 110」——这个数字变大才需要处理。
+2. **不是逐条 HEAD**：R2 的 REST API **不支持 HEAD**（返回 405）。脚本改成整桶列一次目录、
+   建 key→size 索引，235 条记录也只要 1–2 次往返。
+
+### 测试基线
+
+`npm test`：**374 pass / 0 fail**（阶段四基线 367，新增 7 条）。
+`check-sql` 111 条 0 失败；`check-syntax` 57 模块；`check-ui` 通过。
+
+### 线上验收（2026-11-06）
+
+| 项 | 证据 |
+|---|---|
+| ① 全量对生产跑一遍 | 125 条在用条目 / 118 条有文件 / **118 条对象全部一致** / 0 缺失 / 0 大小不符 / 0 缩略图与海报缺失 / 0 `_tmp/` 残留 / 0 `needs_variant` / 4 条超 7 天草稿 / hidden 中缺对象 110（归档） ⇒ **exit 0** |
+| ② 造「DB 有记录但对象缺失」⇒ exit 1 | 插入一条 draft（`storage_key=wallpapers/wp_inspect_probe/000000000000.mp4`）⇒ `[missing] wp_inspect_probe …`，**exit 1**；删除后回到 **exit 0**（探针行已清理，库里 235 行不变） |
+| ③ d1-usage >80% ⇒ exit 2 | 实际 14.3%（715,720 / 5,000,000）；`--warn-at 0.1` 复现该分支：打印 `⚠ 使用率已超 10.0%` 并 **exit 2**；默认阈值下 exit 0 |
+| ④ export 可 JSON.parse | 6 张表 / 268 行 / 340.9KB：`wallpapers 235 · categories 4 · tags 4 · subtags 2 · tag_aliases 20 · api_keys 3`；`JSON.parse` 通过；`api_keys` 列只有 `id,label,rpm,active,created_at,last_used_at`（无 `key_hash`）；`wallpapers` 首行含 `variants` |
+| ⑤ 三个脚本都能本地跑通 | 上面三条 + `build-snapshot --status/--dry-run/publish` 全部 0 退出 |
+
+### 阶段四复验（本轮重跑，未改代码）
+
+| 项 | 证据 |
+|---|---|
+| 后台连点 10 次 ⇒ 列表增量 ≤ 20 | 09:09 与 09:22 两次测量一致：A 组 9 次缓存命中列表 = **36 行**，B 组 9 次 `/api/auth/me`（纯会话鉴权）= **36 行** ⇒ **列表本身 A−B = 0 行**；冷启动一次 1174 行 |
+| 公开连点 10 次 ⇒ ≈0 | 10/10 走快照（`degraded` 为空、`x-folia-edge: MISS`），该窗口 D1 analytics 无分片 |
+
+> 注：第二次测量时脚本内置的轮询（12 分钟）没等到 analytics 落盘（按秒分片延迟 2–13 分钟不定），
+> 事后用 `cf-usage-window.mjs` 按窗口复核，逐秒 8/8/8/4/8 与对照组 12/12/12 与首次测量一致。
+
+---
+
 ## 缺失文档
 
-派单里提到的 `docs/SITE-CHARTER.md` 在仓库中**不存在**（`docs/PHASE-PROGRESS.md` 即本文件）。
+派单里提到的 `docs/SITE-CHARTER.md` 在仓库中**不存在**（阶段三、四、六三轮都确认过；
+`docs/PHASE-PROGRESS.md` 即本文件）。
 
 ## 下一步（按派单顺序）
 
-1. 阶段六：运维三件套（`inspect-assets` / `d1-usage` ✅ / `export-d1`）——`d1-usage` 已在阶段四落地
-2. 阶段五：管理端效率（批量上传 / 重试 / 去重 / 批量改标签 / 前端分页）
-   每阶段独立验收后再进下一阶段。
+1. 阶段五：管理端效率（批量上传 / 重试 / 去重 / 批量改标签 / 前端分页 UI）
+   后端能力已就位：后台列表支持 `page`、批量入口走 `importMedia`、公开快照在写后自动重建。
 
 ## 已知风险
 
