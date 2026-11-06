@@ -38,6 +38,8 @@ const DEFINITIONS = [
   { method: 'GET', path: '/api/v1/public/subtags', handler: publicV1Routes.listSubtags, auth: 'none', cors: true },
   // 阶段三：当前快照指针（{version, generatedAt}），缓存 5 分钟
   { method: 'GET', path: '/api/v1/public/current.json', handler: publicV1Routes.currentJson, auth: 'none', cors: true },
+  // 阶段三/验收 C2：快照对象本身（immutable），只放行 wallpapers.json / manifest.json
+  { method: 'GET', path: '/api/v1/public/snapshots/:version/:file', handler: publicV1Routes.snapshotObject, auth: 'none', cors: true },
   { method: 'GET', path: '/api/v1/public/manifest.json', handler: publicV1Routes.manifest, auth: 'none', cors: true },
   { method: 'GET', path: '/api/v1/public/wallpapers', handler: publicV1Routes.listWallpapers, auth: 'none', cors: true },
   { method: 'GET', path: '/api/v1/public/wallpapers/:slug', handler: publicV1Routes.getWallpaper, auth: 'none', cors: true },

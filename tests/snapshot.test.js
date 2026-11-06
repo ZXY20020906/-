@@ -350,6 +350,32 @@ test('附加：快照对象被删 ⇒ 重建会补回来（内容没变也要重
   assert.equal(snapshot.wallpapers.total, PUBLIC_COUNT);
 });
 
+test('附加：快照对象本身可公开读取（immutable），其余路径一律 404', { skip: sqliteSkip }, async (t) => {
+  if (!realSqlite(t)) return;
+  const { env, result } = await publishedSite(t);
+
+  // ① 当前版本的两个文件都能直接 GET（CDN 上 immutable 的那两个对象）
+  for (const file of ['wallpapers.json', 'manifest.json']) {
+    const res = await call(env, `/api/v1/public/snapshots/${result.version}/${file}`);
+    assert.equal(res.status, 200, `${file} 应可直接读取`);
+    assert.match(res.headers.get('cache-control'), /max-age=31536000, immutable/);
+    const body = JSON.parse(res.text);
+    assert.equal(body.total, PUBLIC_COUNT);
+  }
+
+  // ② 白名单之外的东西一律 404（不能拿它当 R2 读取器）
+  const cases = [
+    `/api/v1/public/snapshots/${result.version}/secret.txt`,
+    `/api/v1/public/snapshots/${result.version}/..%2Fcurrent.json`,
+    '/api/v1/public/snapshots/not-a-version/wallpapers.json',
+    '/api/v1/public/snapshots/20260101T000000Z-deadbeef/wallpapers.json',
+  ];
+  for (const path of cases) {
+    const res = await call(env, path);
+    assert.equal(res.status, 404, `${path} 必须 404`);
+  }
+});
+
 test('附加：兜底链 —— 无快照 + D1 不可用 ⇒ 内嵌快照（degraded + snapshotGeneratedAt）', async () => {
   const env = {
     DB: { prepare() { throw new Error('D1_ERROR: no such table: wallpapers'); } },

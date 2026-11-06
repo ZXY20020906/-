@@ -2,17 +2,23 @@
  * 清理分片上传的遗留临时对象（`_tmp/uploads/` 下超过 24 小时的）。
  *
  *   FOLIA_PASSWORD=... node tools/cleanup-orphan-uploads.mjs [--dry-run]
+ *   FOLIA_SESSION_COOKIE='folia_session=…; folia_device=…' node tools/cleanup-orphan-uploads.mjs --dry-run
  *
- * Worker 里没法跑定时任务，所以由本脚本或 CI 定时调用
- * `POST /api/admin/uploads/cleanup`（服务端按 uploaded 时间过滤）。
+ * `--dry-run` 现在会**真的列一遍**会被删掉的对象（服务端 `?dryRun=1`），而不是只做个登录检查 ——
+ * 「先看清楚再删」才是预演的意义。
+ *
+ * 两种认证方式：
+ *   · FOLIA_PASSWORD：脚本自己走 `/__gate` + `/api/auth/login`（日常用这个）；
+ *   · FOLIA_SESSION_COOKIE：直接给一枚已登录的 Cookie（CI / 临时会话用，免去在机器上存密码）。
  */
 const BASE = process.env.FOLIA_BASE || 'https://folia-5ve.pages.dev';
 const EMAIL = process.env.FOLIA_EMAIL || 'admin@folia.local';
 const PASSWORD = process.env.FOLIA_PASSWORD || '';
+const SESSION_COOKIE = process.env.FOLIA_SESSION_COOKIE || '';
 const DRY_RUN = process.argv.includes('--dry-run');
 
-if (!PASSWORD) {
-  console.error('缺少 FOLIA_PASSWORD（管理员密码）');
+if (!PASSWORD && !SESSION_COOKIE) {
+  console.error('缺少 FOLIA_PASSWORD（管理员密码）或 FOLIA_SESSION_COOKIE（已登录 Cookie）');
   process.exit(1);
 }
 
@@ -36,13 +42,10 @@ async function login() {
   return cookie;
 }
 
-const cookie = await login();
-if (DRY_RUN) {
-  console.log('dry-run：只做登录检查，不调用清理接口');
-  process.exit(0);
-}
+const cookie = SESSION_COOKIE || await login();
 
-const res = await fetch(`${BASE}/api/admin/uploads/cleanup`, {
+// 预演：`?dryRun=1` 让服务端只列不删
+const res = await fetch(`${BASE}/api/admin/uploads/cleanup${DRY_RUN ? '?dryRun=1' : ''}`, {
   method: 'POST',
   headers: { ...HEAD, cookie },
 });
@@ -51,7 +54,14 @@ if (!res.ok || !payload?.ok) {
   console.error('清理失败：', res.status, JSON.stringify(payload).slice(0, 300));
   process.exit(1);
 }
-console.log(`扫描 ${payload.data.scanned} 个临时对象，删除 ${payload.data.deleted} 个`);
-if (payload.data.failed?.length) {
-  console.warn('部分删除失败：', payload.data.failed.slice(0, 5));
+const data = payload.data;
+if (DRY_RUN) {
+  console.log(`dry-run：扫描 ${data.scanned} 个临时对象，**会删除** ${data.wouldDelete?.length ?? 0} 个（本次未删任何对象）`);
+  for (const item of (data.wouldDelete ?? []).slice(0, 20)) console.log(`  - ${item.key}（上传于 ${item.uploaded ?? '未知'}）`);
+  if ((data.wouldDelete?.length ?? 0) > 20) console.log(`  …还有 ${data.wouldDelete.length - 20} 个`);
+  process.exit(0);
+}
+console.log(`扫描 ${data.scanned} 个临时对象，删除 ${data.deleted} 个`);
+if (data.failed?.length) {
+  console.warn('部分删除失败：', data.failed.slice(0, 5));
 }

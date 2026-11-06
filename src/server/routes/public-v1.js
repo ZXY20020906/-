@@ -12,7 +12,7 @@ import { failure, json } from '../http.js';
 import { notFound } from '../../core/errors.js';
 import { sha256Hex } from '../util.js';
 import { etagMatches, normalizeEtag } from '../../core/etag.js';
-import { CURRENT_CACHE_CONTROL, readCurrent } from '../snapshot.js';
+import { CURRENT_CACHE_CONTROL, SNAPSHOT_CACHE_CONTROL, SNAPSHOT_PREFIX, readCurrent } from '../snapshot.js';
 import {
   categoriesPayload, subtagsPayload, tagsPayload, wallpapersPayload, wallpaperPayload, manifestPayload,
 } from '../public-api.js';
@@ -125,6 +125,42 @@ export async function currentJson({ env, request }) {
 
 export async function listTags({ env, url }) {
   return publicJson(await tagsPayload({ env, url }));
+}
+
+/** 快照对象只允许这两个文件名：别的键一律 404，绝不把它当 R2 读取器。 */
+export const SNAPSHOT_FILES = Object.freeze(['wallpapers.json', 'manifest.json']);
+/** 版本号形状：`20261106T131500Z-1a2b3c4d`。形状不对直接 404（连 R2 都不查）。 */
+const VERSION_RE = /^\d{8}T\d{6}Z-[0-9a-f]{8}$/;
+
+/**
+ * `GET /api/v1/public/snapshots/<version>/<file>` —— 直接把快照对象吐出去（阶段三的
+ * 裁决里就写了 `snapshots/** → public, max-age=31536000, immutable`，但此前对象只在 R2 里，
+ * 没有 HTTP 出口；验收 C2 要求它可被直接 GET，所以补上这个只读出口）。
+ *
+ * 三条约束：
+ *   · 只认 `SNAPSHOT_FILES` 里的两个文件名 + 合法版本号形状 ⇒ 不能拿它探测 R2；
+ *   · 不查 D1、不查 current.json ⇒ 与公开读一样是 0 次数据库行读；
+ *   · 对象不存在就 404（不是 500），调用方自己决定要不要回落。
+ */
+export async function snapshotObject({ env, params }) {
+  const version = String(params.version ?? '');
+  const file = String(params.file ?? '');
+  if (!VERSION_RE.test(version) || !SNAPSHOT_FILES.includes(file)) throw notFound('快照对象不存在');
+  const key = `${SNAPSHOT_PREFIX}/${version}/${file}`;
+  const object = await env?.BUCKET?.get?.(key);
+  if (!object) throw notFound('快照对象不存在');
+  const body = typeof object.text === 'function'
+    ? await object.text()
+    : new TextDecoder().decode(new Uint8Array(await object.arrayBuffer()));
+  const etag = `"${(await sha256Hex(body)).slice(0, 24)}"`;
+  const headers = {
+    'content-type': 'application/json; charset=utf-8',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'same-origin',
+    'cache-control': SNAPSHOT_CACHE_CONTROL,
+    etag,
+  };
+  return new Response(body, { status: 200, headers });
 }
 
 export async function listSubtags({ env, url }) {

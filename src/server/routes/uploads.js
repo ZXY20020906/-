@@ -221,13 +221,17 @@ export async function abort({ request, env, actor }) {
  * 清理 `_tmp/` 下超过 24 小时的遗留对象（中断的上传）。
  * 由 tools/cleanup-orphan-uploads.mjs 定时调用。
  */
-export async function cleanup({ env, actor }) {
+export async function cleanup({ env, actor, url }) {
   assertCan(actor, ACTION.WALLPAPER_UPDATE);
+  // `?dryRun=1`：只列出「会被删掉的东西」，一个对象都不动。
+  // 验收 E4 要的就是这个语义（先看清楚再删），也给运维一个安全的预演开关。
+  const dryRun = url?.searchParams?.get('dryRun') === '1';
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
   let cursor;
   let scanned = 0;
   let deleted = 0;
   const failed = [];
+  const wouldDelete = [];
 
   for (let page = 0; page < 100; page += 1) {
     const listed = await env.BUCKET.list({ prefix: TMP_PREFIX, limit: 1000, cursor });
@@ -235,6 +239,10 @@ export async function cleanup({ env, actor }) {
       scanned += 1;
       const uploaded = object.uploaded ? new Date(object.uploaded).getTime() : 0;
       if (uploaded && uploaded > cutoff) continue;
+      if (dryRun) {
+        wouldDelete.push({ key: object.key, uploaded: object.uploaded ?? null });
+        continue;
+      }
       try {
         await env.BUCKET.delete(object.key);
         deleted += 1;
@@ -246,5 +254,6 @@ export async function cleanup({ env, actor }) {
     cursor = listed.cursor;
   }
 
+  if (dryRun) return json({ scanned, deleted: 0, failed, dryRun: true, wouldDelete });
   return json({ scanned, deleted, failed });
 }
