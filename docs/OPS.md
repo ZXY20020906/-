@@ -113,38 +113,103 @@ node tools/build-snapshot.mjs --status
 
 | 症状 | 先看什么 |
 |---|---|
-| 公开接口 500 | `/api/meta` 是否 500；D1 额度（`d1_usage`）；`PUBLIC_SNAPSHOT_FALLBACK` 是否被设成 `0` |
+| 公开接口 500 | `/api/meta` 是否 500；D1 额度（`node tools/d1-usage.mjs`）；`PUBLIC_SNAPSHOT_FALLBACK` 是否被设成 `0` |
 | 公开接口全部 `degraded:true` 且 `snapshotGeneratedAt` 有值 | D1 挂了，正在用仓库内嵌快照 |
 | 新素材发布后线上看不到 | `current.json` 的 version 有没有变；`SNAPSHOT_AUTO` 是否为 `0`；触发点日志 |
 | 列表 total 与 facets 合计对不上 | 跑对拍：`node tools/run-tests.mjs`（`tests/snapshot-parity.test.js` 会红） |
 | 详情有、列表没有 | 条目所在分类被设成私有（A 方案），或快照没重建 |
+| 用户点下载 404 | `node tools/inspect-assets.mjs --sample 50` 看对象在不在；missing 就换文件重传 |
+| 后台列表改完不刷新 | 60s 进程内缓存；确认写接口返回 2xx（2xx 才会清缓存），或等 60s |
 
-## 7. 定时兜底（建议）
+## 7. 运维三件套（阶段六）
 
-GitHub Actions（每小时）：
+三个脚本都只要 `CF_API_TOKEN`（D1 读 + R2 读）+ `CF_ACCOUNT_ID`；
+database_id / 桶名从 `wrangler.toml` 读，也可用 `--database` / `--bucket` 覆盖。
+
+```bash
+# ① 资产对账：DB 里每条记录的 R2 对象在不在、大小对不对、抽样验 sha256
+node tools/inspect-assets.mjs                    # 默认只查「在用条目」（status != hidden）
+node tools/inspect-assets.mjs --sample 50        # 冒烟
+node tools/inspect-assets.mjs --sha 3            # 额外抽 3 条下载验内容哈希
+node tools/inspect-assets.mjs --scope all        # 连 hidden 一起查（考古/清理用）
+node tools/inspect-assets.mjs --orphans wallpapers/   # 反查「R2 有对象、DB 没记录」
+node tools/inspect-assets.mjs --json             # 给 CI / 告警用
+# 退出码：0 一致；1 有异常（对象缺失/大小不符/sha 不符/显式阈值被突破）；3 缺凭据
+
+# ② D1 用量：今日与近 N 天行读/行写，>80% 退 2
+node tools/d1-usage.mjs --days 7
+
+# ③ 导出备份：默认落在 backups/d1-YYYYMMDD-HHmm.json（已 gitignore）
+node tools/export-d1.mjs
+node tools/export-d1.mjs --verify                # 只做条数自检，不写文件
+node tools/export-d1.mjs --include likes --include audit_log
+```
+
+**为什么 `inspect` 默认跳过 `hidden`**：站点有一批对象已丢失的历史条目（`deploy/broken-summary.json`
+那批），处置方式就是置为 `hidden`。把它们算进异常，健康站点也会永远退出 1，巡检就没人看了。
+报告里仍会单列一行「hidden 中缺对象（归档）」——数字变了说明历史包袱又多了。
+
+**为什么 `inspect` 不是逐条 HEAD**：R2 的 REST API 不支持 `HEAD`（405）。脚本改成
+「整桶列一次目录，再用 key→size 建索引」，235 条记录也只要 1–2 次往返。
+
+## 8. 定时兜底（建议）
+
+GitHub Actions（每小时快照 + 每天巡检）：
 
 ```yaml
-name: snapshot
+name: ops
 on:
-  schedule: [{ cron: '17 * * * *' }]
+  schedule:
+    - cron: '17 * * * *'   # 每小时重建快照
+    - cron: '23 1 * * *'   # 每天 01:23 UTC 巡检 + 备份
   workflow_dispatch:
 jobs:
-  build:
+  snapshot:
+    if: github.event.schedule != '23 1 * * *'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: '22' }
       - run: node tools/build-snapshot.mjs
-        env:
-          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        env: { CF_API_TOKEN: '${{ secrets.CF_API_TOKEN }}', CF_ACCOUNT_ID: '${{ secrets.CF_ACCOUNT_ID }}' }
+  audit:
+    if: github.event.schedule == '23 1 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: node tools/inspect-assets.mjs --json
+        env: { CF_API_TOKEN: '${{ secrets.CF_API_TOKEN }}', CF_ACCOUNT_ID: '${{ secrets.CF_ACCOUNT_ID }}' }
+      - run: node tools/d1-usage.mjs --days 7
+        env: { CF_API_TOKEN: '${{ secrets.CF_API_TOKEN }}', CF_ACCOUNT_ID: '${{ secrets.CF_ACCOUNT_ID }}' }
+      - run: node tools/export-d1.mjs --out backups/d1-latest.json
+        env: { CF_API_TOKEN: '${{ secrets.CF_API_TOKEN }}', CF_ACCOUNT_ID: '${{ secrets.CF_ACCOUNT_ID }}' }
+      - uses: actions/upload-artifact@v4
+        with: { name: d1-backup, path: backups/, retention-days: 30 }
 ```
 
 > 注意：仓库里 `.github/` 目前是空的（上一阶段删掉过一个越权的 workflow）。
-> 要启用就按上面这份重建，并确认 Secrets 只给 D1 读 + R2 写。
+> 要启用就按上面这份重建，并确认 Secrets 只给 D1 读 + R2 读（快照任务额外要 R2 写）。
 
-## 8. 改媒体域名时
+## 9. 部署与回滚
+
+**部署**：push 到 `main` ⇒ Cloudflare Pages 自动构建（`functions/` + `src/` + `public/`）。
+没有手动步骤；`wrangler pages deploy ./deploy` 只在必须绕开 git 时用（那条路要先 `node tools/sync-deploy.mjs`）。
+
+**回滚（代码）**：`git revert <sha>` 再 push，等 Pages 重新部署。不要 force push。
+
+**回滚（数据/快照）**：
+
+1. 冻结自动重建：Pages 环境变量 `SNAPSHOT_AUTO=0`；
+2. 把 `current.json` 指回上一版（见 §4）；
+3. 恢复完把 `SNAPSHOT_AUTO` 删掉（恢复默认开）。
+
+**回滚（D1 数据）**：先 `node tools/export-d1.mjs` 留一份现场，再从 `backups/` 里挑合适的一份恢复。
+恢复脚本没有内置（避免误操作直接写生产），用 `wrangler d1 execute --file` 手工执行。
+
+## 10. 改媒体域名时
 
 快照里存的是**构建时**的绝对 URL（`MEDIA_BASE` / `PUBLIC_ORIGIN`）。换域名后必须重建：
 

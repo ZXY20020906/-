@@ -22,6 +22,7 @@
  * 退出码：0 成功；1 失败（构建失败会保留旧 current.json，线上读不受影响）。
  */
 import { existsSync, readFileSync } from 'node:fs';
+import { makeD1 as restD1, makeR2 as restR2, readWranglerConfig } from './lib/cloudflare.mjs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -65,113 +66,13 @@ function parseArgs(argv) {
   return out;
 }
 
-/** 从 wrangler.toml 读 D1 的 database_id 与 R2 的 bucket_name（就是部署用的那份配置）。 */
-function readWranglerConfig() {
-  const file = resolve(repoRoot, 'wrangler.toml');
-  if (!existsSync(file)) return { databaseId: '', bucket: '', origin: '' };
-  const text = readFileSync(file, 'utf8');
-  const pick = (re) => text.match(re)?.[1] ?? '';
-  return {
-    databaseId: pick(/database_id\s*=\s*"([^"]+)"/),
-    bucket: pick(/bucket_name\s*=\s*"([^"]+)"/),
-    origin: pick(/PUBLIC_ORIGIN\s*=\s*"([^"]+)"/),
-  };
-}
-
 function log(options, ...args) {
   if (!options.quiet) console.log(...args);
 }
 
-/* ------------------------------------------------------------------ D1 (REST) */
-
-const D1_ENDPOINT = (accountId, databaseId) =>
-  `https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database/${databaseId}/query`;
-
-/**
- * 把 Cloudflare 的 D1 REST 接口包成 Worker 的 `env.DB` 形状（只读）。
- * 一次 prepare 一次往返——构建总共 6 条查询，可以接受。
- */
-function restD1({ accountId, databaseId, token }) {
-  const clean = (args) => args.map((value) => (value === undefined ? null : value));
-  async function query(sql, params) {
-    const response = await fetch(D1_ENDPOINT(accountId, databaseId), {
-      method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ sql, params: clean(params) }),
-    });
-    const text = await response.text();
-    let body;
-    try {
-      body = JSON.parse(text);
-    } catch {
-      throw new Error(`D1 查询返回非 JSON（HTTP ${response.status}）：${text.slice(0, 200)}`);
-    }
-    if (!response.ok || body.success === false) {
-      const detail = body.errors?.map((item) => item.message).join('; ') ?? text.slice(0, 200);
-      throw new Error(`D1 查询失败（HTTP ${response.status}）：${detail}`);
-    }
-    return body.result?.[0]?.results ?? [];
-  }
-  return {
-    prepare(sql) {
-      const state = { args: [] };
-      const api = {
-        bind(...args) { state.args = args; return api; },
-        async all() { return { results: await query(sql, state.args) }; },
-        async first() { return (await query(sql, state.args))[0] ?? null; },
-        async run() { throw new Error('build-snapshot 只读：不允许写 D1'); },
-      };
-      return api;
-    },
-    async batch() { throw new Error('build-snapshot 只读：不允许写 D1'); },
-  };
-}
-
-/* ------------------------------------------------------------------ R2 (REST) */
-
-const R2_OBJECT = (accountId, bucket, key) =>
-  `https://api.cloudflare.com/client/v4/accounts/${accountId}/r2/buckets/${bucket}/objects/${key.split('/').map(encodeURIComponent).join('/')}`;
-
-function restR2({ accountId, bucket, token }) {
-  return {
-    async put(key, body, { httpMetadata } = {}) {
-      const headers = {
-        authorization: `Bearer ${token}`,
-        'content-type': httpMetadata?.contentType ?? 'application/octet-stream',
-      };
-      if (httpMetadata?.cacheControl) headers['cache-control'] = httpMetadata.cacheControl;
-      const response = await fetch(R2_OBJECT(accountId, bucket, key), { method: 'PUT', headers, body });
-      if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`R2 写入失败 ${key}（HTTP ${response.status}）：${text.slice(0, 200)}`);
-      }
-    },
-    async get(key) {
-      const response = await fetch(R2_OBJECT(accountId, bucket, key), {
-        headers: { authorization: `Bearer ${token}` },
-      });
-      if (response.status === 404) return null;
-      if (!response.ok) throw new Error(`R2 读取失败 ${key}（HTTP ${response.status}）`);
-      const text = await response.text();
-      return { text: async () => text, json: async () => JSON.parse(text), body: new TextEncoder().encode(text) };
-    },
-    async head(key) {
-      const object = await this.get(key);
-      return object ? { size: (await object.text()).length } : null;
-    },
-    async delete(key) {
-      const response = await fetch(R2_OBJECT(accountId, bucket, key), {
-        method: 'DELETE',
-        headers: { authorization: `Bearer ${token}` },
-      });
-      if (!response.ok && response.status !== 404) throw new Error(`R2 删除失败 ${key}（HTTP ${response.status}）`);
-    },
-  };
-}
-
 /* ------------------------------------------------------------------ 本地 sqlite */
 
-function makeD1(db) {
+function d1FromSqlite(db) {
   const bind = (args) => args.map((value) => {
     if (value === undefined) return null;
     if (value === true) return 1;
@@ -225,7 +126,7 @@ async function makeEnv() {
     if (options.sqlite.toLowerCase().endsWith('.sql')) db.exec(readFileSync(options.sqlite, 'utf8'));
     return {
       env: {
-        DB: makeD1(db),
+        DB: d1FromSqlite(db),
         BUCKET: memoryBucket(),
         PUBLIC_ORIGIN: options.origin || wrangler.origin || 'https://folia-5ve.pages.dev',
       },
