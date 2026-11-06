@@ -15,7 +15,6 @@ binding = "BUCKET"
 bucket_name = "folia-wallpapers"
 
 [vars]
-DEBUG_API = "1"
 # 线上站点来源，用于校验管理接口的 Origin
 PUBLIC_ORIGIN = "https://folia-5ve.pages.dev"
 # 可选：给 R2 绑自定义域名后填在这里，媒体直链就会走它（省 Worker 请求）。

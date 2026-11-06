@@ -40,8 +40,8 @@ import { hit } from '../rate-limit.js';
 import { clientIp } from '../session.js';
 import { readMediaMeta } from '../../core/image-meta.js';
 import {
-  assertDailyQuota, buildImportReport, createWallpaperRow, importMedia, ingestAsset,
-  recordDailyUsage,
+  assertDailyQuota, attachVariant, buildImportReport, createWallpaperRow, importMedia, ingestAsset,
+  ingestVariantAsset, publishWallpaper, recordDailyUsage,
 } from '../ingest.js';
 
 /** 大文件跳过完整 sha256 的阈值（真正的实现在 ingest.js，这里 re-export 供测试/工具引用）。 */
