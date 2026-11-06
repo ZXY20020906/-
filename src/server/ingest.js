@@ -32,8 +32,8 @@
 import { all, first, nowMs, run } from './db.js';
 import { Q } from './queries.js';
 import {
-  ALLOWED_MIME, MAX_UPLOAD_BYTES, isBundleMime, isVideoMime, limitForMime,
-  readDurationMs, readMediaMeta, readVideoAudio, readVideoInfo,
+  ALLOWED_MIME, MAX_UPLOAD_BYTES, detectFaststart, isBundleMime, isVideoMime, limitForMime,
+  readDurationMs, readMediaMeta, readVideoAudio, readVideoFps, readVideoInfo,
 } from '../core/image-meta.js';
 import {
   COMPLIANCE_HINT, checkVideoCompliance, complianceMessage, describeWarnings,
@@ -741,6 +741,148 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
     fixes,
     warnings,
     autoFixes: [...new Set(fixes.map((item) => item.code))],
+  };
+}
+
+/**
+ * 分片上传超过内存阈值时的**流式入库**。
+ *
+ * 和 ingestAsset 同一套规则（探测/合规/指纹/HEAD 回读/媒体三值成对写/配额），
+ * 唯一区别是不把整文件读进内存：只读首尾各 4MB 做探测与采样指纹，
+ * 再用 `BUCKET.put(finalKey, source.body)` 流复制。
+ *
+ * 这样「写 R2 / 写 D1」仍然只发生在 ingest.js 里，路由层不直接碰存储。
+ */
+export const MULTIPART_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+const STREAM_PROBE_BYTES = 4 * 1024 * 1024;
+
+async function readRangeBytes(env, key, offset, length) {
+  const object = await env.BUCKET.get(key, { range: { offset, length } });
+  if (!object) return null;
+  return new Uint8Array(await object.arrayBuffer());
+}
+
+export async function ingestStreamedAsset(env, actor, row, source) {
+  if (!row || !row.id) throw badRequest('缺少壁纸记录');
+  if (!source || !source.key) throw badRequest('缺少临时对象');
+  const size = Number(source.size ?? 0);
+  if (!(size > 0)) throw badRequest('临时对象为空');
+  if (size > MULTIPART_MAX_BYTES) throw payloadTooLarge('文件不能超过 2GB');
+
+  const head = await readRangeBytes(env, source.key, 0, Math.min(STREAM_PROBE_BYTES, size));
+  if (!head) throw badRequest('临时对象不存在');
+  const tail = size > STREAM_PROBE_BYTES
+    ? await readRangeBytes(env, source.key, Math.max(0, size - STREAM_PROBE_BYTES), Math.min(STREAM_PROBE_BYTES, size))
+    : new Uint8Array(0);
+
+  const meta = readMediaMeta(head);
+  if (!meta.mime) throw unsupportedMedia(meta.error ?? '无法识别的文件类型');
+  if (!ALLOWED_MIME.includes(meta.mime)) throw unsupportedMedia(`不支持的类型：${meta.mime}`);
+  const mime = meta.mime;
+
+  const videoInfo = isVideoMime(mime) ? readVideoInfo(head, mime) : { fps: null, codec: null, faststart: null };
+  const faststart = isVideoMime(mime) && mime === 'video/mp4' ? detectFaststart(head) : videoInfo.faststart;
+  const fps = isVideoMime(mime) ? (readVideoFps(head, mime) ?? videoInfo.fps ?? null) : null;
+
+  let compliance = null;
+  if (isVideoMime(mime)) {
+    compliance = checkVideoCompliance({
+      mime, width: meta.width, height: meta.height, fps, codec: videoInfo.codec, faststart, bytes: size,
+    });
+    if (!compliance.ok) {
+      throw mediaNonCompliant(complianceMessage(compliance), {
+        ...complianceInput(mime, meta, { byteLength: size }, { ...videoInfo, fps, faststart }),
+        violations: compliance.violations,
+        warnings: compliance.warnings,
+        hint: COMPLIANCE_HINT,
+      });
+    }
+  }
+
+  await assertDailyQuota(env, actor, size);
+
+  const merged = new Uint8Array(head.byteLength + tail.byteLength);
+  merged.set(head, 0);
+  merged.set(tail, head.byteLength);
+  const fingerprint = await sampleFingerprint(merged);
+
+  const key = assetKey(row.id, fingerprint, mime);
+  const sourceObject = await env.BUCKET.get(source.key);
+  if (!sourceObject) throw badRequest('临时对象不存在');
+  await env.BUCKET.put(key, sourceObject.body, {
+    httpMetadata: { contentType: mime, cacheControl: 'public, max-age=31536000, immutable' },
+  });
+  const check = await verifyAsset(env, key, size);
+  if (!check.ok) {
+    await deleteAsset(env, key);
+    throw storageVerifyFailed('流式写入校验失败（对象缺失或大小不符），请重试');
+  }
+  if (row.storage_key && row.storage_key !== key) await deleteAsset(env, row.storage_key);
+
+  const durationMs = isVideoMime(mime) ? readDurationMs(head, mime) : null;
+  const nextKind = isVideoMime(mime) ? 'dynamic' : mime.startsWith('image/') ? 'static' : row.kind;
+  const now = nowMs();
+
+  await setMediaIdentity(env, row.id, {
+    storageKey: key,
+    mime,
+    bytes: check.size,
+    width: meta.width ?? null,
+    height: meta.height ?? null,
+    durationMs,
+    sha256: null,
+    kind: nextKind,
+    actor: row.storage_key ? MEDIA_ACTOR.REPLACE : MEDIA_ACTOR.UPLOAD,
+    updatedAt: now,
+  });
+  await run(env, Q.markWallpaperVerified, now, videoInfo.codec ?? null, faststart ?? null, row.id);
+
+  if (await supportsFingerprintColumn(env)) {
+    try {
+      await run(env, Q.updateWallpaperFingerprint, fingerprint, now, row.id);
+    } catch (error) {
+      console.warn('[ingest] 流式入库写 content_fingerprint 失败', error?.message ?? error);
+    }
+  }
+  if (isVideoMime(mime) && await supportsTechColumns(env)) {
+    const hasAudio = readVideoAudio(head, mime);
+    try {
+      await run(env, Q.updateWallpaperTech, fps, null, hasAudio === null ? null : (hasAudio ? 1 : 0), row.id);
+    } catch (error) {
+      console.warn('[ingest] 流式入库写技术元数据失败', error?.message ?? error);
+    }
+  }
+
+  await recordDailyUsage(env, actor, check.size);
+
+  const warnings = [{
+    code: IMPORT_WARNING.THUMB_MISSING,
+    message: '大文件流式入库：未生成缩略图/海报；可用后台「换文件」补，或跑 tools/backfill-metadata.mjs',
+  }];
+  if (compliance && compliance.warnings.length) {
+    warnings.push({ code: IMPORT_WARNING.COMPLIANCE, message: describeWarnings(compliance.warnings) });
+  }
+
+  return {
+    key,
+    storageKey: key,
+    mime,
+    bytes: check.size,
+    width: meta.width ?? null,
+    height: meta.height ?? null,
+    durationMs,
+    fps,
+    codec: videoInfo.codec ?? null,
+    faststart,
+    fingerprint,
+    fingerprintMode: 'sampled',
+    kind: nextKind,
+    category: row.category_id,
+    status: row.status ?? 'draft',
+    compliance: compliance ? { warnings: compliance.warnings } : null,
+    fixes: [],
+    warnings,
+    autoFixes: [],
   };
 }
 

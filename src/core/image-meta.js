@@ -336,6 +336,24 @@ export function readMediaMeta(bytes) {
  *
  * mvhd 布局（type 之后）：version+flags(4) → 时间戳(4 或 8) → timescale(4) → duration(4 或 8)
  */
+
+/**
+ * 扫 mp4 顶层 box 判断 faststart：先遇到 moov ⇒ true；先遇到 mdat ⇒ false；读不到 ⇒ null。
+ * moov 很小（几 MB 内），所以只需要文件头部。
+ */
+export function detectFaststart(bytes) {
+  if (!bytes || bytes.length < 16) return null;
+  let offset = 0;
+  for (let guard = 0; guard < 64 && offset + 8 <= bytes.length; guard += 1) {
+    const size = ((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0;
+    const type = String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
+    if (type === 'moov') return true;
+    if (type === 'mdat') return false;
+    if (!size || size < 8) break;
+    offset += size;
+  }
+  return null;
+}
 export function readDurationMs(bytes, mime) {
   if (mime === 'video/webm') {
     if (!bytes || bytes.length < 24) return null;
