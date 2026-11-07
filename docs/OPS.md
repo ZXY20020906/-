@@ -216,3 +216,18 @@ jobs:
 ```bash
 node tools/build-snapshot.mjs --force
 ```
+
+## 首帧海报（posterUrl）缺失时怎么办
+
+新上传的视频如果没有客户端抓帧、而运行环境又没有解码器（Cloudflare Workers 没有 ffmpeg），
+入库时会带一条 `thumb-missing` 警告，`posterUrl` 保持 `null`（列表里客户端回落到 `thumbUrl`）。
+补法：
+
+```bash
+node tools/backfill-metadata.mjs --only=<slug> --limit=1      # 只补一条
+node tools/backfill-metadata.mjs --posters=missing --limit=50  # 批量补缺的
+node tools/backfill-metadata.mjs --posters=all                 # 连已有的也重算
+```
+
+工具会 ffmpeg 抽第 1 帧 → 1280 宽 WebP → 按内容哈希写 R2 → 回填 `poster_key`。
+`--posters=missing` 是默认值，重复跑不会重复写（同内容同 key）。
