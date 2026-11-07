@@ -416,9 +416,40 @@ export function buildWallpapersPayload({ url, data, meta = null }) {
   };
 }
 
+/**
+ * 分类计数补齐「未分类」桶。
+ *
+ * 公开列表允许 `category_id IS NULL`（见 queries.js 的 PUBLIC_CATEGORY），
+ * 这类条目不属于任何分类。如果分类列表不加这一桶，就会出现
+ * 「各分类计数之和 < 列表 total」——正是线上那个 122 vs 113 的错觉来源之一。
+ *
+ * 只有在差额 > 0 时才追加，分类覆盖完整时输出与以前逐字节相同。
+ */
+export function mergeUncategorized(categories, total) {
+  const list = Array.isArray(categories) ? categories : [];
+  const countOf = (item) => Number(item?.publishedCount ?? item?.count ?? 0);
+  const sum = list.reduce((acc, item) => acc + countOf(item), 0);
+  const gap = Number(total) - sum;
+  if (!Number.isFinite(gap) || gap <= 0) return list;
+  // 形状与 categoryDto 一致（客户端不用为这一项写特例）
+  return [...list, {
+    id: null,
+    slug: 'uncategorized',
+    name: '未分类',
+    description: '没有归到任何公开分类的条目',
+    sortOrder: 9999,
+    isPublic: true,
+    wallpaperCount: gap,
+    publishedCount: gap,
+    createdAt: 0,
+    updatedAt: 0,
+  }];
+}
+
 /** 快照里的分类列表（`categoriesPayload` 的内存版）。 */
 export function buildCategoriesPayload({ data, meta = null }) {
-  return { categories: data?.categories ?? [], ...(meta ?? {}) };
+  const categories = mergeUncategorized(data?.categories, data?.total);
+  return { categories, ...(meta ?? {}) };
 }
 
 /**

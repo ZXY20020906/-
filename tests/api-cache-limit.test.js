@@ -52,6 +52,7 @@ function publicEnv(rows = []) {
     [Q.publicRecent]: () => rows,
     [Q.publicCount]: () => [{ n: rows.length }],
     [Q.listPublicCategories]: () => [],
+    [Q.countPublicVisible]: () => [{ n: 0 }],
   });
 }
 

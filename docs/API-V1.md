@@ -22,7 +22,7 @@
 |---|---|---|
 | `GET` | `/api/v1/public/wallpapers` | 列表（分页 / 筛选 / facets） |
 | `GET` | `/api/v1/public/wallpapers/:slug` | 详情（公开可读） |
-| `GET` | `/api/v1/public/categories` | 公开分类（带已发布计数） |
+| `GET` | `/api/v1/public/categories` | 公开分类（`publishedCount` 与列表 `total` 同口径） |
 | `GET` | `/api/v1/public/tags` | 标签（可按 `category` 收窄；计数按 canonical 合并） |
 | `GET` | `/api/v1/public/subtags` | 子标签（可按 `category` / `tag` 收窄） |
 | `GET` | `/api/v1/public/manifest.json` | 全量快照（客户端同步用，ETag/304） |
@@ -36,7 +36,7 @@
 | 参数 | 类型 | 说明 |
 |---|---|---|
 | `category` | string | 分类 slug（不是 id） |
-| `kind` | `static` \| `dynamic` | 素材类型 |
+| `kind` | `static` \| `dynamic` \| `pet` | 素材类型（`pet` = 桌宠包，门 1 新增） |
 | `q` | string | 标题模糊搜索（≤60 字，`%` `_` 会被剔除） |
 | `tag` | string | 标签精确匹配；逗号分隔多值 = OR；单值 ≤30 字、一次 ≤20 个；**alias 先归一**（`anime` → `动漫`） |
 | `subtag` | string | 子标签精确匹配 |
@@ -72,7 +72,7 @@
 |---|---|---|
 | `id` / `slug` / `title` | string | 稳定 id / URL slug / 标题 |
 | `description` / `subtag` | string | 描述 / 子标签 |
-| `kind` | `static`/`dynamic` | 静态（图片）或动态（视频/资源包） |
+| `kind` | `static`/`dynamic`/`pet` | 静态（图片）、动态（视频）、桌宠包（zip + pet.json，门 1 新增） |
 | `mime` | string\|null | `image/png`、`video/mp4`、`application/zip` … |
 | `bytes` | int | 文件体积 |
 | `width` / `height` | int\|null | 原画尺寸 |
@@ -146,6 +146,24 @@
 | `pet.previewUrl` | `previews/` 第一张（与 `thumbUrl` 同址） |
 
 客户端按 `pet.id` 决定安装目录，`previewUrl` 当封面，`tracks` 决定能播哪些动作。
+`kind` 只新增了 `pet` 这个取值，`static` / `dynamic` 的语义没变。
+
+**筛选**：`?kind=pet` 只返回桌宠包（2026-11-07 起可用；此前该值会 400）。
+`?kind=static` / `?kind=dynamic` **不会**把桌宠包混进来——库里桌宠仍存 `kind='static'`，
+对外按 `pet` 归类。传其它值仍然 400。
+
+### 分类计数的口径
+
+`/api/v1/public/categories` 的每个 `publishedCount` 与列表 `total` 用**同一条谓词**
+（`published` + 有文件 + 已验证 + 已审核 + 分类公开），因此：
+
+```
+sum(categories[].publishedCount) + 未分类 == /api/v1/public/wallpapers 的 total
+```
+
+没有归到任何公开分类的条目会在 `categories` 末尾单列一项
+`{ id: null, slug: "uncategorized", name: "未分类", publishedCount: N }`，
+只有 N > 0 时才出现（分类覆盖完整时响应与旧版逐字节相同）。
 `kind` 只新增了 `pet` 这个取值，`static` / `dynamic` 的语义没变。
 
 ## 5. manifest.json

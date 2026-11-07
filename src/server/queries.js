@@ -45,7 +45,11 @@ const PUBLIC_CATEGORY = `(w.category_id IS NULL OR c.is_public = 1)`;
 const PUBLIC_FILTERS = `${PUBLIC_VISIBLE}
   AND ${PUBLIC_CATEGORY}
   AND (?1 IS NULL OR c.slug = ?1)
-  AND (?2 IS NULL OR w.kind = ?2)
+  AND (?2 IS NULL
+    OR (?2 = 'pet' AND EXISTS (SELECT 1 FROM json_each(w.variants) v
+          WHERE json_extract(v.value, '$.kind') = 'pet'))
+    OR (?2 <> 'pet' AND w.kind = ?2 AND NOT EXISTS (SELECT 1 FROM json_each(w.variants) v
+          WHERE json_extract(v.value, '$.kind') = 'pet')))
   AND (?3 IS NULL OR w.title LIKE ?3)
   AND (?4 = 0 OR w.featured = 1)`;
 
@@ -250,15 +254,31 @@ export const Q = {
   deleteUserSessions: `DELETE FROM sessions WHERE user_id = ?`,
 
   // ------------------------------------------------------------- categories
+  /**
+   * 后台分类列表。
+   *
+   * `published_count` 用 `PUBLIC_VISIBLE`（不是 `status='published'`）：
+   * 后台拿它跟公开列表对账，口径一旦不同就会出现「面板 58、列表 49」的自相矛盾。
+   */
   listCategories: `SELECT c.id, c.slug, c.name, c.description, c.sort_order, c.is_public, c.created_at, c.updated_at,
       (SELECT COUNT(*) FROM wallpapers w WHERE w.category_id = c.id) AS wallpaper_count,
-      (SELECT COUNT(*) FROM wallpapers w WHERE w.category_id = c.id AND w.status = 'published') AS published_count
+      (SELECT COUNT(*) FROM wallpapers w WHERE w.category_id = c.id AND ${PUBLIC_VISIBLE}) AS published_count
     FROM categories c ORDER BY c.sort_order, c.name`,
+  /**
+   * 公开分类列表（列表页的标签页 + 快照里的 categories）。
+   *
+   * `count` 与公开列表同源（`PUBLIC_VISIBLE`），所以 `sum(count) + 未分类 == total`。
+   * 早先这里只判 `status='published' AND storage_key IS NOT NULL`，
+   * 于是「已发布但没审核 / 没验证」的 9 条被算了进去，分类合计比列表 total 多 9。
+   */
   listPublicCategories: `SELECT c.id, c.slug, c.name, c.description, c.sort_order,
       c.is_public, c.created_at, c.updated_at,
-      (SELECT COUNT(*) FROM wallpapers w WHERE w.category_id = c.id
-        AND w.status = 'published' AND w.storage_key IS NOT NULL) AS count
+      (SELECT COUNT(*) FROM wallpapers w WHERE w.category_id = c.id AND ${PUBLIC_VISIBLE}) AS count
     FROM categories c WHERE c.is_public = 1 ORDER BY c.sort_order, c.name`,
+  /** 公开条目总数（含未分类）：分类计数对不上时用它补「未分类」桶。 */
+  countPublicVisible: `SELECT COUNT(*) AS n FROM wallpapers w
+      LEFT JOIN categories c ON c.id = w.category_id
+      WHERE ${PUBLIC_VISIBLE} AND ${PUBLIC_CATEGORY}`,
   categoryById: `SELECT * FROM categories WHERE id = ? LIMIT 1`,
   categoryBySlug: `SELECT * FROM categories WHERE slug = ? LIMIT 1`,
   categoryByName: `SELECT id, name FROM categories WHERE name = ? LIMIT 1`,

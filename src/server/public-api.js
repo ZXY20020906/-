@@ -39,7 +39,7 @@ import { categoryDto, manifestItemDto, wallpaperDto } from './dto.js';
 import { SNAPSHOT } from './public-snapshot.js';
 import {
   FACET_LIMIT, PLAYABLE, TAG_MAX_VALUES, TAG_VALUE_MAX,
-  buildCategoriesPayload, buildSubtagsPayload, buildTagsPayload, buildWallpapersPayload,
+  buildCategoriesPayload, buildSubtagsPayload, buildTagsPayload, buildWallpapersPayload, mergeUncategorized,
   findSnapshotItem, likePattern, parseAudio, parseLicense, parseOptionalInt, parsePlayable,
   parseTagFilter,
 } from './public-filter.js';
@@ -241,7 +241,9 @@ export function facetsFromRows(rows) {
 
 async function liveCategoriesPayload(env) {
   const rows = await all(env, Q.listPublicCategories);
-  return { categories: rows.map(categoryDto) };
+  // 与公开列表同源的 total：分类计数对不上时用它补「未分类」桶（见 mergeUncategorized）
+  const total = Number((await first(env, Q.countPublicVisible))?.n ?? 0);
+  return { categories: mergeUncategorized(rows.map(categoryDto), total) };
 }
 
 export async function categoriesPayload(env) {

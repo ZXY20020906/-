@@ -22,7 +22,9 @@ export const LIMITS = Object.freeze({
 
 export const STATUSES = Object.freeze(['draft', 'published', 'hidden']);
 export const REVIEW_STATUSES = Object.freeze(['pending', 'approved']);
-export const KINDS = Object.freeze(['static', 'dynamic']);
+// 'pet' 是桌宠包（zip 内含 pet.json）的对外取值；库里仍存 kind='static'，
+// 由 DTO 派生（见 src/server/dto.js 的 petDto），所以放开白名单不影响任何已有数据。
+export const KINDS = Object.freeze(['static', 'dynamic', 'pet']);
 export const SORTS = Object.freeze(['recent', 'oldest', 'name', 'size', 'resolution']);
 
 export const has = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);

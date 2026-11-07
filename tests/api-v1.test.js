@@ -41,6 +41,7 @@ function makeSite() {
     [Q.listPublicCategories]: () => ([
       { id: 'cat_wallpaper', slug: 'wallpaper', name: '壁纸', description: '', sort_order: 10, is_public: 1, created_at: 1, updated_at: 1, count: 1 },
     ]),
+    [Q.countPublicVisible]: () => [{ n: 1 }],
     [Q.listTags]: () => ([{ id: 'tag_anime', name: '动漫', sort_order: 10, category_id: null }]),
     [Q.listTagsForCategory]: () => ([{ id: 'tag_anime', name: '动漫', sort_order: 10, category_id: null }]),
     [Q.categoryBySlug]: () => ([{ id: 'cat_wallpaper', slug: 'wallpaper', name: '壁纸' }]),

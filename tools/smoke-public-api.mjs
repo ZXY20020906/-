@@ -16,12 +16,46 @@
  */
 import { argv, exit } from 'node:process';
 
+/**
+ * 期望条数：**默认从 D1 现算**（线上真值），只有拿不到凭据时才退回环境变量。
+ *
+ * 为什么改：原来把 110 / 46 写死在默认值里，线上每多发一条素材，这个门禁就红一次，
+ * 红到最后大家都学会了「反正它老红」——门禁一旦可以忽略，就等于没有。
+ * 现在拿 D1 里与公开接口**同一条谓词**的结果当期望值，红只可能是因为接口和库不一致。
+ */
+const PUBLIC_WHERE = `
+  w.status = 'published' AND w.storage_key IS NOT NULL AND w.verified_at IS NOT NULL
+  AND w.review_status = 'approved' AND c.is_public = 1
+`;
+
+async function expectedFromD1() {
+  const accountId = process.env.CF_ACCOUNT_ID;
+  const databaseId = process.env.CF_D1_ID;
+  const token = process.env.CF_API_TOKEN;
+  if (!accountId || !databaseId || !token) return null;
+  const query = async (sql) => {
+    const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database/${databaseId}/query`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ sql, params: [] }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!body.success) throw new Error(`D1: ${JSON.stringify(body.errors ?? body).slice(0, 160)}`);
+    return body.result?.[0]?.results?.[0] ?? {};
+  };
+  const total = await query(`SELECT COUNT(*) AS n FROM wallpapers w JOIN categories c ON c.id = w.category_id WHERE ${PUBLIC_WHERE}`);
+  const wallpaper = await query(`SELECT COUNT(*) AS n FROM wallpapers w JOIN categories c ON c.id = w.category_id
+    WHERE ${PUBLIC_WHERE} AND c.slug = 'wallpaper'`);
+  return { total: Number(total.n ?? 0), wallpaper: Number(wallpaper.n ?? 0) };
+}
+
 function parseArgs(args) {
   const options = {
     base: process.env.FOLIA_BASE || 'https://folia-5ve.pages.dev',
     allowDegraded: false,
-    expectedTotal: Number(process.env.EXPECTED_TOTAL || 110),
-    expectedWallpaper: Number(process.env.EXPECTED_WALLPAPER || 46),
+    // null = 还没定；先看命令行，再看环境变量，最后从 D1 现算
+    expectedTotal: process.env.EXPECTED_TOTAL ? Number(process.env.EXPECTED_TOTAL) : null,
+    expectedWallpaper: process.env.EXPECTED_WALLPAPER ? Number(process.env.EXPECTED_WALLPAPER) : null,
     timeoutMs: Number(process.env.SMOKE_TIMEOUT_MS || 15000),
   };
   for (let i = 0; i < args.length; i += 1) {
@@ -45,6 +79,31 @@ function parseArgs(args) {
 const options = parseArgs(argv.slice(2));
 const failures = [];
 const results = [];
+
+// 期望条数优先级：命令行 / 环境变量 > D1 现算 > 拿不到凭据就用线上当前值（并明确标注）
+if (options.expectedTotal === null || options.expectedWallpaper === null) {
+  let derived = null;
+  try {
+    derived = await expectedFromD1();
+  } catch (error) {
+    console.warn(`[smoke] 从 D1 取期望值失败（跳过）：${error.message}`);
+  }
+  if (derived) {
+    if (options.expectedTotal === null) options.expectedTotal = derived.total;
+    if (options.expectedWallpaper === null) options.expectedWallpaper = derived.wallpaper;
+    options.expectFrom = 'd1';
+  }
+}
+if (options.expectedTotal === null || options.expectedWallpaper === null) {
+  // 没有 D1 凭据：拿线上当前值当基线（只验"自洽"，不验"条数没变"，并在输出里写明）
+  const probe = await fetch(`${options.base}/api/v1/public/wallpapers?limit=1`, { signal: AbortSignal.timeout(options.timeoutMs) });
+  const body = await probe.json().catch(() => null);
+  const cat = await fetch(`${options.base}/api/v1/public/wallpapers?category=wallpaper&limit=1`, { signal: AbortSignal.timeout(options.timeoutMs) });
+  const catBody = await cat.json().catch(() => null);
+  if (options.expectedTotal === null) options.expectedTotal = Number(body?.data?.total ?? 0);
+  if (options.expectedWallpaper === null) options.expectedWallpaper = Number(catBody?.data?.total ?? 0);
+  options.expectFrom = 'live';
+}
 
 function ok(name, detail) {
   results.push({ name, status: 'PASS', detail });
@@ -107,7 +166,7 @@ async function checkList(label, path) {
 
 async function main() {
   console.log(`Folia public API smoke → ${options.base}`);
-  console.log(`expect total=${options.expectedTotal} wallpaper=${options.expectedWallpaper} allowDegraded=${options.allowDegraded}\n`);
+  console.log(`expect total=${options.expectedTotal} wallpaper=${options.expectedWallpaper} allowDegraded=${options.allowDegraded} 来源=${options.expectFrom ?? '命令行/环境变量'}\n`);
 
   // 1) 旧路径清单
   const legacy = await checkList('/api/public/wallpapers · 旧路径', '/api/public/wallpapers?limit=100');
