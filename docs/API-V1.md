@@ -110,6 +110,44 @@
 （同分辨率降帧）/ `4K30` / `2K30` / `<height>p`（信息不足回落）。`width`、`fps` 是第一期新增，
 老数据为 `null`。
 
+### 桌宠包（`kind: "pet"`，门 1 新增）
+
+桌宠包是**普通 zip 素材**，只是包里带一份 `pet.json`（`petManifestVersion: 2`）。
+站点识别后，列表/详情/manifest 里的这条会多出 `kind:"pet"` 与 `pet` 对象；
+**其余字段（url / bytes / thumbUrl / variants / sha256 …）与普通素材完全一致**。
+
+```json
+{
+  "kind": "pet",
+  "mime": "application/zip",
+  "url": "https://…/media/wallpapers/wp_x/9f3c….zip",
+  "sha256": "…",
+  "bytes": 689324,
+  "thumbUrl": "https://…/media/thumbs/wp_x/1a2b….webp",
+  "variants": [],
+  "pet": {
+    "id": "whale-girl",
+    "displayName": "鲸鱼娘",
+    "frames": [8, 8, 8, 8, 8, 8, 8, 8, 8],
+    "columns": 8,
+    "tracks": ["idle", "running-right", "wave"],
+    "previewUrl": "https://…/media/thumbs/wp_x/1a2b….webp"
+  }
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `pet.id` | `pet.json` 里的 `id`（slug 风格） |
+| `pet.displayName` | 展示名 |
+| `pet.frames` | `sprite2d.frames`（每行帧数，长度 = 行数） |
+| `pet.columns` | 雪碧图列数（缺省 8） |
+| `pet.tracks` | 状态名列表；**一定含 `idle`** |
+| `pet.previewUrl` | `previews/` 第一张（与 `thumbUrl` 同址） |
+
+客户端按 `pet.id` 决定安装目录，`previewUrl` 当封面，`tracks` 决定能播哪些动作。
+`kind` 只新增了 `pet` 这个取值，`static` / `dynamic` 的语义没变。
+
 ## 5. manifest.json
 
 ```json

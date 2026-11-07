@@ -40,7 +40,7 @@ import {
 } from './media-compliance.js';
 import {
   badRequest, conflict, HttpError, importIncomplete, mediaNonCompliant, payloadTooLarge,
-  storageVerifyFailed, tooManyRequests, unsupportedMedia,
+  petPackageInvalid, storageVerifyFailed, tooManyRequests, unsupportedMedia,
 } from '../core/errors.js';
 import { ACTION, assertCan } from '../core/permissions.js';
 import { assetKey, deleteAsset, posterKey, putAsset, thumbKey, variantKey, verifyAsset } from './storage.js';
@@ -54,6 +54,7 @@ import {
 import { VARIANT_KIND, labelForVariant, needsVariant, variantKind } from '../core/variant-label.js';
 import { isPlayable, variantReasonFor } from '../core/variant-reason.js';
 import { nextSortOrder } from '../core/ordering.js';
+import { parsePetPackage, petMarker } from './pet-package.js';
 import { uniqueSlug } from '../core/slug.js';
 import { AUDIT_ACTION, writeAudit } from './audit.js';
 import { rebuildSnapshotQuietly } from './snapshot.js';
@@ -407,6 +408,32 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
   // ⑤ 配额（先校验再写盘：超了直接 429，别等 50MB 传完才拒）
   await assertDailyQuota(env, actor, bytes.byteLength);
 
+  /**
+   * ⑤b 桌宠包识别（门 1）。**在写 R2 之前判定**，坏包一个字节都不落盘：
+   *   · 包里没有 pet.json ⇒ 普通 zip 资源包，走原通道；
+   *   · 有 pet.json 但不合法 ⇒ 422 + 具体原因（工单要求"不许静默通过"）。
+   * 元数据不新增数据库列，落进现有 `variants` JSON 列（见 petMarker 的注释）。
+   */
+  let petPackage = null;
+  if (mime === 'application/zip') {
+    petPackage = await parsePetPackage(bytes);
+    if (petPackage.isPet && !petPackage.ok) {
+      throw petPackageInvalid(`桌宠包不合法：${petPackage.reason}`, { reason: petPackage.reason });
+    }
+    // 「缺 pet.json 的 zip ⇒ 422」只在**目标是桌宠分类**时成立：
+    // 普通分类里的 zip 仍然是资源包（助手皮肤 / 开机动画都靠它），不能被这条规则误伤。
+    if (!petPackage.isPet && row.category_id) {
+      // 查分类失败就按"不是桌宠分类"处理：一次 DB 抖动不能把普通 zip 上传变成 422
+      const category = await first(env, Q.categoryById, row.category_id).catch(() => null);
+      if (category?.slug === 'desktop-pet') {
+        throw petPackageInvalid(
+          '桌宠分类下的 zip 必须包含 pet.json（桌宠包）；普通资源包请上传到「助手皮肤」分类',
+          { reason: 'missing-pet-json', category: 'desktop-pet' },
+        );
+      }
+    }
+  }
+
   // ⑥ 内容哈希：≤40MB 算完整 sha256；>40MB 采样指纹（写 content_fingerprint，不伪造 sha256）
   let sha = null;
   let fingerprint = null;
@@ -517,6 +544,12 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
   // ⑨ 缩略图
   let thumbBytes = asset.thumb && asset.thumb.byteLength ? asset.thumb : null;
   let thumbSource = 'client';
+  // 桌宠包：previews/ 第一张就是它的封面（工单：thumbUrl = previews 第一张）。
+  // 走同一条缩略图通道（落 R2 → HEAD 回读 → 写 thumb_key），不额外发明一套存储。
+  if (!thumbBytes && petPackage?.ok) {
+    thumbBytes = petPackage.preview.bytes;
+    thumbSource = 'pet-preview';
+  }
   if (!thumbBytes && typeof tools.extractThumb === 'function') {
     try {
       thumbBytes = await tools.extractThumb(bytes, { width: THUMB_WIDTH, mime, videoInfo });
@@ -742,6 +775,35 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
     throw importIncomplete(`入库后字段自检失败：${postMissing.join(' / ')}`, {
       code: IMPORT_FAILURE.MISSING_FIELD, missing: postMissing, fields,
     });
+  }
+
+  /**
+   * ⑪ 桌宠元数据落库（门 1）。
+   *
+   * 写进 `variants` 列的**保留项**（不是新列，也不是新表）：
+   * `variantsDto()` 只挑「有 key 且 bytes>0」的变体项，所以公开的 `variants` 字段
+   * 一个字节都不会变；`playable` 的 SQL 也只会看 width/height 非空的变体项。
+   * 读取见 `dto.js` 的 `pet` 字段。
+   */
+  let petInfo = null;
+  if (petPackage?.ok) {
+    petInfo = { ...petPackage.pet, previewKey: finalThumbKey };
+    try {
+      const current = await first(env, Q.wallpaperById, row.id);
+      const list = safeJsonParse(current?.variants, [])
+        .filter((item) => !(item && item.kind === 'pet'));
+      list.push(petMarker(petPackage.pet, finalThumbKey));
+      await run(env, Q.updateWallpaperVariants, JSON.stringify(list), now, row.id);
+      fixes.push({
+        code: 'petPackage',
+        message: `桌宠包 ${petPackage.pet.id ?? row.slug}：${petPackage.pet.frames.length} 行 × ${petPackage.pet.columns} 列，`
+          + `${petPackage.pet.tracks.length} 个状态（${petPackage.pet.tracks.join('/')}），预览 ${petPackage.previewCount} 张`,
+      });
+    } catch (error) {
+      // 元数据写不进去不该让整次上传失败：包已经在库里，补一次重建即可
+      console.warn('[ingest] 桌宠元数据写入失败', error?.message ?? error);
+      warnings.push({ code: 'pet-meta-failed', message: '桌宠元数据写入失败，条目已入库但列表缺少 pet 字段' });
+    }
   }
 
   // ---- 阶段三触发点 ①：上传完成 ---------------------------------------------------

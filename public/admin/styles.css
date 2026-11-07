@@ -697,3 +697,6 @@ tr.needs-variant td { background: rgba(251, 191, 36, 0.06); }
   .wep-meta { white-space: normal; }
 }
 .wep-item.failed { border-color: #4a2a2a; background: rgba(248, 113, 113, 0.08); opacity: 1; }
+
+/* 门 1：桌宠包徽标（列表里直接看到「宠物 · 帧数 · 状态数」） */
+.badge.pet { color: #c4b5fd; border-color: #3f3358; background: #1b1630; }

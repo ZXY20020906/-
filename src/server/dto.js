@@ -3,6 +3,7 @@
  * storage_key 是内部字段不暴露；sha256 对外输出（插件用它做增量下载判断）。
  */
 import { safeJsonArray, safeJsonParse } from './util.js';
+import { petFromVariants } from './pet-package.js';
 import { publicUrl } from './storage.js';
 import { capabilitiesFor, ROLE_LABELS } from '../core/permissions.js';
 import { labelForVariant } from '../core/variant-label.js';
@@ -99,6 +100,27 @@ function nullableBool(value) {
   return false;
 }
 
+/**
+ * 桌宠包标记（门 1）。元数据存在 `variants` 列的保留项里（**不新增数据库列**），
+ * 这里取出来拼成契约要求的 `pet` 对象：
+ *   `{ id, displayName, frames, columns, tracks, previewUrl }`
+ *
+ * 只新增 `kind:'pet'` 与 `pet` 两个字段；url / bytes / thumbUrl / variants 的生成方式
+ * 一个字都没改（工单 §2 ④）。previewUrl 与 thumbUrl 指向同一个对象（previews 第一张）。
+ */
+function petDto(row, mediaBase) {
+  const pet = petFromVariants(row?.variants, safeJsonParse);
+  if (!pet) return null;
+  return {
+    id: pet.id ?? null,
+    displayName: pet.displayName ?? null,
+    frames: Array.isArray(pet.frames) ? pet.frames : [],
+    columns: Number(pet.columns) || 8,
+    tracks: Array.isArray(pet.tracks) ? pet.tracks : [],
+    previewUrl: publicUrl(pet.previewKey, mediaBase),
+  };
+}
+
 export function wallpaperDto(row, { admin = false, mediaBase = '' } = {}) {
   const fullUrl = publicUrl(row.storage_key, mediaBase);
   // 没有缩略图时，只有原文件本身是图片才拿它顶替；
@@ -106,13 +128,15 @@ export function wallpaperDto(row, { admin = false, mediaBase = '' } = {}) {
   const assetIsImage = typeof row.mime === 'string' && row.mime.startsWith('image/');
   const thumbUrl = publicUrl(row.thumb_key, mediaBase) ?? (assetIsImage ? fullUrl : null);
   const posterUrl = publicUrl(row.poster_key, mediaBase);
+  const pet = petDto(row, mediaBase);
   const base = {
     id: row.id,
     slug: row.slug,
     title: row.title,
     description: row.description ?? '',
     subtag: row.subtag ?? '',
-    kind: row.kind,
+    // 桌宠包对外 kind='pet'（新值）；其余条目仍是 static/dynamic，取值不变
+    kind: pet ? 'pet' : row.kind,
     mime: row.mime ?? null,
     bytes: Number(row.bytes ?? 0),
     width: row.width ?? null,
@@ -138,6 +162,8 @@ export function wallpaperDto(row, { admin = false, mediaBase = '' } = {}) {
     author: row.author ?? null,
     // 降档变体：没有就是空数组，老客户端读不到也不会崩
     variants: variantsDto(row, mediaBase),
+    // 桌宠包（门 1）：普通条目没有这个键，老客户端读不到也不受影响
+    ...(pet ? { pet } : {}),
     // 给插件做增量同步用：内容哈希 + 更新时间，没变就不用重新下载
     sha256: row.sha256 ?? null,
     updatedAt: Number(row.updated_at ?? 0),

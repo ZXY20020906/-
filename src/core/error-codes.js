@@ -88,6 +88,13 @@ export const ERROR_CODES = Object.freeze([
     hint: 'details.missing 列出缺的字段名；宽高探测不出来时先用本地工具确认文件头。',
   },
   {
+    code: 'pet_package_invalid',
+    status: 422,
+    message: '桌宠包不合法',
+    hint: 'message 里是具体原因：petManifestVersion 必须为 2、renderer 必须为 sprite2d、'
+      + 'sprite2d.spritesheetPath 要指向包内图片、frames 非空、tracks 至少含 idle、previews/ 至少一张图。',
+  },
+  {
     code: 'too_many_requests',
     status: 429,
     message: '尝试过于频繁，请稍后再试',

@@ -1127,6 +1127,7 @@
   async function mountWallpapers() {
     $('#view-actions').innerHTML = `
       <button class="btn" type="button" data-action="import-local">批量导入本地文件</button>
+      <button class="btn" type="button" data-action="import-pet" title="桌宠包（zip 内含 pet.json），放到「桌宠」分类">上传桌宠包</button>
       <button class="btn primary" type="button" data-action="new-wallpaper">＋ 新增作品</button>`;
     $('#view').innerHTML = `
       <div class="import-strip">
@@ -1390,6 +1391,14 @@
       ? `<span class="badge warn" title="原片超过可播门槛，等 make-variants 转码后再发布">待转码${item.variantReason ? ` · ${esc(item.variantReason)}` : ''}</span>`
       : '';
     const variantLabels = (item.variants || []).map((variant) => variant.label).filter(Boolean);
+    // 门 1：桌宠包徽标 —— 宠物名 / 帧数 / 状态数 / 预览（预览就是缩略图那一格）
+    const petBadge = item.kind === 'pet' && item.pet
+      ? `<span class="badge pet" title="桌宠包：${esc(item.pet.id || '')}">宠物 · ${item.pet.frames.length} 行 × ${item.pet.columns} 列`
+        + ` · ${item.pet.tracks.length} 状态</span>`
+      : '';
+    const petLine = item.kind === 'pet' && item.pet
+      ? `<span class="badge">${esc(item.pet.tracks.join(' / ') || '无状态')}</span>`
+      : '';
     const techLine = [
       item.width ? `${item.width}×${item.height}` : '—',
       item.fps ? `${item.fps}fps` : '',
@@ -1410,8 +1419,8 @@
         </td>
         <td class="hide-sm">${catSelect}</td>
         <td class="hide-sm">${tagCell}</td>
-        <td><span class="status-badges"><span class="badge ${esc(item.status)}">${esc(STATUS_LABEL[item.status] || item.status)}</span>${reviewBadge}${item.featured ? '<span class="badge">置顶</span>' : ''}${variantBadge}</span></td>
-        <td class="hide-sm"><span class="badge fmt">${esc(formatLabel(item.mime))}</span> ${techLine}<br><span class="muted small">${formatBytes(item.bytes)}</span>${variantsLine ? `<br>${variantsLine}` : ''}</td>
+        <td><span class="status-badges"><span class="badge ${esc(item.status)}">${esc(STATUS_LABEL[item.status] || item.status)}</span>${reviewBadge}${item.featured ? '<span class="badge">置顶</span>' : ''}${variantBadge}${petBadge}</span></td>
+        <td class="hide-sm"><span class="badge fmt">${esc(formatLabel(item.mime))}</span> ${techLine}<br><span class="muted small">${formatBytes(item.bytes)}</span>${variantsLine ? `<br>${variantsLine}` : ''}${petLine ? `<br>${petLine}` : ''}</td>
         <td class="hide-sm muted small">${esc(item.creatorEmail || '—')}</td>
         <td class="actions">${actions.join('')}</td>
       </tr>`;
@@ -1545,7 +1554,7 @@
   const importCapFor = (file) => (/\.zip$/i.test(file.name) ? MAX_IMPORT_BUNDLE_BYTES : MAX_IMPORT_BYTES);
 
   /** 批量导入本地文件：**拖拽或多选**，2 并发，逐条显示状态，失败可单条/全部重试 */
-  function openLocalImport(initialFiles = null) {
+  function openLocalImport(initialFiles = null, { presetCategorySlug = '' } = {}) {
     openDialog(`
       <form id="loc-form">
         <h3>批量导入本地文件</h3>
@@ -1555,7 +1564,10 @@
         <div class="row">
           <label>放到哪个模块
             <select id="loc-module">
-              ${state.categories.map((c) => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('')}
+              ${state.categories.map((c) => {
+                const selected = presetCategorySlug && c.slug === presetCategorySlug ? ' selected' : '';
+                return `<option value="${esc(c.id)}"${selected}>${esc(c.name)}</option>`;
+              }).join('')}
             </select>
           </label>
           <label>导入后
@@ -2737,6 +2749,9 @@
         break;
       case 'import-local':
         openLocalImport();
+        break;
+      case 'import-pet':
+        openLocalImport(null, { presetCategorySlug: 'desktop-pet' });
         break;
       case 'add-import-dir':
         addImportDir();

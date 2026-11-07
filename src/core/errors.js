@@ -53,3 +53,13 @@ export const storageVerifyFailed = (message = 'R2 写入校验失败（对象缺
  */
 export const importIncomplete = (message = '导入失败：缺少必填字段', details = null) =>
   new HttpError(422, 'import_incomplete', message, details);
+
+/**
+ * 422：桌宠包（zip 内含 pet.json）结构不合法。
+ *
+ * 与 import_incomplete 的区别：那条是「记录不完整」，这条是「桌宠清单本身写错了」——
+ * `message` 直接是具体原因（缺 idle / spritesheetPath 不存在 / previews 为空 …），
+ * 上传的人照着改 pet.json 就能过。**绝不允许静默通过**（工单 §2 ②）。
+ */
+export const petPackageInvalid = (message = '桌宠包不合法', details = null) =>
+  new HttpError(422, 'pet_package_invalid', message, details);
