@@ -87,6 +87,21 @@ test('K1 合规桌宠包：入库后 DTO 带 kind=pet 与完整 pet 对象', { s
   assert.equal(row.mime, 'application/zip');
 });
 
+test('K1b 表单选 static，入库后 kind 列仍是 pet（问题 2）', { skip: sqliteSkip }, async (t) => {
+  if (!realSqlite(t)) return;
+  const site = await makeSite(t);
+  const zip = await makePetZip();
+  // 关键在于表单照样传 static（真实默认值）——服务端必须按包内容覆盖它
+  const res = await uploadZip(site, site.env, { zip, title: '强制归档', kind: 'static' });
+  assert.equal(res.status, 200, res.text.slice(0, 400));
+  const row = site.db.prepare("SELECT kind, mime FROM wallpapers WHERE title = '强制归档'").get();
+  assert.ok(row, '入库了');
+  assert.equal(row.kind, 'pet', 'kind 列必须被强制成 pet（不是 static）');
+  assert.equal(row.mime, 'application/zip');
+  const autoFixes = (res.body.data.item && res.body.data.item.autoFixes) || [];
+  assert.ok(autoFixes.includes('petKind'), '报告里要说明已按桌宠归档');
+});
+
 test('K2 预览图真的写进了 R2（对象存在且是图片）', { skip: sqliteSkip }, async (t) => {
   if (!realSqlite(t)) return;
   const site = await makeSite(t);

@@ -612,8 +612,12 @@ export function limitForMime(mime) {
 /**
  * 静态只收图片；动态收视频或开机动画包。
  * 开机动画包归在「动态」下面，因为它本来就是逐帧动画，只是以 zip 分发。
+ *
+ * `pet`（桌宠包）只接受 zip：它是另一个分发形态（zip 里带 pet.json + 雪碧图），
+ * 既不是图片也不是视频，所以单列一条分支，而不是塞进 dynamic。
  */
 export function kindMatchesMime(kind, mime) {
+  if (kind === 'pet') return isBundleMime(mime);
   const motion = isVideoMime(mime) || isBundleMime(mime);
   return kind === 'dynamic' ? motion : !motion;
 }

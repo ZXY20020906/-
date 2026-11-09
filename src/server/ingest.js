@@ -483,9 +483,24 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
 
   // ⑧ D1 三值成对写（storage_key / bytes / sha256 必须来自同一份已校验对象）
   const durationMs = readDurationMs(bytes, mime);
-  const nextKind = isVideoMime(mime)
+  let nextKind = isVideoMime(mime)
     ? 'dynamic'
     : mime.startsWith('image/') ? 'static' : row.kind;
+  /**
+   * 桌宠包**强制**归到 `kind='pet'`（问题 2）。
+   *
+   * 导入表单默认「壁纸」，用户不会为了一只桌宠专门改下拉；只靠表单会让
+   * `kind=static` 和 `mime=application/zip` 长期自相矛盾（公开 DTO 靠 variant 蒙对，
+   * 但所有按 kind 列过滤的地方都会漏）。这里以**包内容**为准，忽略表单选择，
+   * 并在 fixes 里明确告诉用户"已按桌宠包归档"。
+   */
+  if (petPackage?.ok && nextKind !== 'pet') {
+    fixes.push({
+      code: 'petKind',
+      message: `检测到桌宠包，已按桌宠归档（kind=pet），忽略表单选择的「${nextKind}」`,
+    });
+    nextKind = 'pet';
+  }
   await setMediaIdentity(env, row.id, {
     storageKey: key,
     mime,
