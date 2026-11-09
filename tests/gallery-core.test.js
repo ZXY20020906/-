@@ -12,6 +12,8 @@ import {
   formatDimensions,
   formatDuration,
   mediaKind,
+  isPetItem,
+  cardBadge,
   parseFavoriteList,
   parseIdList,
   qualityLabel,
@@ -155,4 +157,20 @@ test('没有轮换时分享链接不带 hash', () => {
   assert.equal(buildShareUrl('https://x.io', '/', []), 'https://x.io/');
   assert.deepEqual(readSharedRotation(''), []);
   assert.deepEqual(readSharedRotation('#'), []);
+});
+
+test('isPetItem：kind=pet 或带 pet 对象都算桌宠（含历史 kind=static 的行）', () => {
+  assert.equal(isPetItem({ kind: 'pet', mime: 'application/zip' }), true);
+  assert.equal(isPetItem({ kind: 'static', mime: 'application/zip', pet: { id: 'whale' } }), true);
+  assert.equal(isPetItem({ kind: 'static', mime: 'application/zip' }), false);
+  assert.equal(isPetItem({ kind: 'dynamic', mime: 'video/mp4' }), false);
+  assert.equal(isPetItem(null), false);
+});
+
+test('cardBadge：桌宠 > 资源包 > null（其余交给视频/清晰度）', () => {
+  assert.equal(cardBadge({ kind: 'pet', mime: 'application/zip' }), '桌宠');
+  assert.equal(cardBadge({ kind: 'static', mime: 'application/zip', pet: { id: 'x' } }), '桌宠');
+  assert.equal(cardBadge({ kind: 'static', mime: 'application/zip' }), '资源包');
+  assert.equal(cardBadge({ kind: 'dynamic', mime: 'video/mp4' }), null);
+  assert.equal(cardBadge({ kind: 'static', mime: 'image/png' }), null);
 });

@@ -14,6 +14,8 @@ import {
   formatDuration,
   matchesAspect,
   mediaKind,
+  cardBadge,
+  isPetItem,
   parseFavoriteList,
   qualityLabel,
   stepIndex,
@@ -598,19 +600,25 @@ function cardHtml(item, index) {
   const kind = mediaKind(item);
   const video = kind === 'video';
   const bundle = kind === 'bundle';
+  // 桌宠也是 zip 资源包，但展示上要能一眼区分（问题 3）：徽标写「桌宠」，
+  // 预览优先用 pet.previewUrl（有的历史数据只有 pet 里带预览、thumbUrl 为空）。
+  const pet = item && item.pet && typeof item.pet === 'object' ? item.pet : null;
   const duration = formatDuration(item.durationMs);
-  const badge = bundle
-    ? '资源包'
-    : video ? (isMotionModule() && duration ? duration : '动态') : qualityLabel(item.width, item.height);
+  // 徽标统一走 gallery-core 的 cardBadge（桌宠 > 资源包），其余按视频/清晰度
+  const badge = cardBadge(item)
+    || (video ? (isMotionModule() && duration ? duration : '动态') : qualityLabel(item.width, item.height));
   const favorite = state.favorites.includes(item.slug);
-  const spec = bundle
-    ? formatBytes(item.bytes)
-    : [formatDimensions(item.width, item.height), duration, formatBytes(item.bytes)].filter(Boolean).join(' · ');
+  const spec = pet
+    ? [pet.displayName || item.title, pet.tracks ? `${pet.tracks.length} 状态` : '', formatBytes(item.bytes)].filter(Boolean).join(' · ')
+    : bundle
+      ? formatBytes(item.bytes)
+      : [formatDimensions(item.width, item.height), duration, formatBytes(item.bytes)].filter(Boolean).join(' · ');
+  const cover = (pet && pet.previewUrl) || item.thumbUrl;
   let media;
-  if (bundle && item.thumbUrl) {
-    // 资源包有封面图就显示封面，别用通用 ZIP 磁贴盖住作品本身
-    media = `<img src="${esc(item.thumbUrl)}" alt="${esc(item.title)}" loading="lazy" decoding="async">`;
-  } else if (bundle) media = bundleTile(item);
+  if ((bundle || pet) && cover) {
+    // 资源包/桌宠有封面图就显示封面，别用通用 ZIP 磁贴盖住作品本身
+    media = `<img src="${esc(cover)}" alt="${esc(item.title)}" loading="lazy" decoding="async">`;
+  } else if (bundle || pet) media = bundleTile(item);
   else if (video && item.thumbUrl) {
     // 有封面图就不要再下整段视频了
     media = `<img src="${esc(item.thumbUrl)}" alt="${esc(item.title)}" loading="lazy" decoding="async"
@@ -737,6 +745,13 @@ function syncPageUrl(page) {
 
 // ------------------------------------------------------------------ 详情层
 function specLine(item) {
+  // 桌宠：把"几只/几行×几列/多少状态"说清楚（它也是 zip，但不止是资源包）
+  if (item && item.pet && typeof item.pet === 'object') {
+    const pet = item.pet;
+    const shape = Array.isArray(pet.frames) && pet.frames.length ? `${pet.frames.length} 行 × ${pet.columns || 0} 列` : '';
+    const states = Array.isArray(pet.tracks) && pet.tracks.length ? `${pet.tracks.length} 状态` : '';
+    return [formatBytes(item.bytes), pet.displayName || item.title, shape, states, '桌宠 ZIP'].filter(Boolean).join(' · ');
+  }
   if (mediaKind(item) === 'bundle') {
     return [formatBytes(item.bytes), item.category ? item.category.name : '未分类', 'ZIP 包'].join(' · ');
   }
@@ -787,7 +802,7 @@ function renderViewer() {
   const openButton = $('[data-action="open-original"]');
   if (applyButton) applyButton.textContent = bundle ? '复制下载直链' : '应用（复制直链）';
   if (openButton) {
-    if (bundle) openButton.textContent = '下载文件';
+    if (bundle) openButton.textContent = isPetItem(item) ? '下载桌宠包' : '下载文件';
     else if (kind === 'video' && isMotionModule()) openButton.textContent = '下载视频';
     else openButton.textContent = '打开原图';
   }

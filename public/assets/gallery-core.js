@@ -195,6 +195,28 @@ export function mediaKind(item) {
   return item?.kind === 'dynamic' ? 'video' : 'image';
 }
 
+/**
+ * 是不是桌宠包。
+ *
+ * 认两个来源：`kind === 'pet'`（020 迁移后新数据都有）或 `pet` 对象存在
+ * （历史数据只有 variant 标记、kind 还是 static）。任一成立就算桌宠。
+ */
+export function isPetItem(item) {
+  if (!item || typeof item !== 'object') return false;
+  if (item.kind === 'pet') return true;
+  return Boolean(item.pet && typeof item.pet === 'object');
+}
+
+/**
+ * 卡片左上角徽标。桌宠优先于「资源包」——它是最具体的类型。
+ * 返回 null 表示交给调用方按视频/清晰度决定。
+ */
+export function cardBadge(item) {
+  if (isPetItem(item)) return '桌宠';
+  if (mediaKind(item) === 'bundle') return '资源包';
+  return null;
+}
+
 /** 直链可能是 /media/... 也可能是 R2 自定义域名的绝对地址。 */
 export function absoluteUrl(path, origin) {
   const value = String(path ?? '');
