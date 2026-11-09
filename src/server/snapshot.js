@@ -318,6 +318,25 @@ export function snapshotListPayload({ url, snapshot, meta = null }) {
 }
 
 /**
+ * 最近一次重建的结果（管理端状态可见）。
+ *
+ * 为什么必须记：`rebuildSnapshotQuietly` 的约定是"失败不抛"——这对上传是好事，
+ * 但代价是"数据已发布、前台永远旧"可以**静默**存在好几天（真实发生过）。
+ * 所以每次重建都留一条结构化记录，管理端 `GET /api/admin/snapshot-status` 读它。
+ */
+let lastRebuild = { at: 0, ok: null, reason: '', version: '', total: 0, error: '' };
+
+/** 读最近一次重建（给管理端状态接口用；返回副本，调用方改不动内部状态）。 */
+export function lastSnapshotRebuild() {
+  return { ...lastRebuild };
+}
+
+/** 测试用：清空重建状态（用例之间不互相污染）。 */
+export function resetSnapshotRebuildState() {
+  lastRebuild = { at: 0, ok: null, reason: '', version: '', total: 0, error: '' };
+}
+
+/**
  * **写操作之后的重建入口**：`ingest.js` 的四个触发点与后台编辑/删除都调它。
  *
  * 三条铁律：
@@ -330,16 +349,30 @@ export function snapshotListPayload({ url, snapshot, meta = null }) {
  * @param {{force?: boolean}} [options]
  */
 export async function rebuildSnapshotQuietly(env, reason = '变更', options = {}) {
-  if (!snapshotAutoEnabled(env)) return null;
+  if (!snapshotAutoEnabled(env)) {
+    // 关掉重建时也要留痕：否则"为什么前台不更新"会被误判成 bug
+    lastRebuild = { at: Date.now(), ok: null, reason, version: '', total: 0, error: 'snapshot-auto-disabled' };
+    return null;
+  }
   try {
     const result = await publishSnapshot(env, options);
+    lastRebuild = {
+      at: Date.now(),
+      ok: true,
+      reason,
+      version: result.version || '',
+      total: Number(result.total) || 0,
+      error: '',
+    };
     if (result.wrote) {
       console.log(`[snapshot] ${reason} ⇒ 新版本 ${result.version}（${result.total} 条，${result.ms}ms）`);
     }
     return result;
   } catch (error) {
+    const message = String(error?.message ?? error).slice(0, 300);
     // 快照构建失败：current.json 仍是旧版本，公开读继续可用（只是内容旧一点）。
-    console.error(`[snapshot] ${reason} 后重建快照失败（保留旧 current.json）`, error?.message ?? error);
+    console.error(`[snapshot] ${reason} 后重建快照失败（保留旧 current.json）`, message);
+    lastRebuild = { at: Date.now(), ok: false, reason, version: '', total: 0, error: message };
     return null;
   }
 }

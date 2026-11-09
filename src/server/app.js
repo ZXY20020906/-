@@ -17,6 +17,7 @@ import * as wallpaperRoutes from './routes/wallpapers.js';
 import * as uploadRoutes from './routes/uploads.js';
 import * as categoryRoutes from './routes/categories.js';
 import * as tagRoutes from './routes/tags.js';
+import * as adminStatusRoutes from './routes/admin-status.js';
 import * as likeRoutes from './routes/likes.js';
 import * as subtagRoutes from './routes/subtags.js';
 import * as memberRoutes from './routes/members.js';
@@ -95,6 +96,8 @@ const DEFINITIONS = [
   { method: 'DELETE', path: '/api/admin/categories/:id', handler: categoryRoutes.remove, auth: 'session' },
   { method: 'GET', path: '/api/admin/category-options', handler: categoryRoutes.options, auth: 'session' },
   { method: 'GET', path: '/api/admin/tag-stats', handler: categoryRoutes.tagStats, auth: 'session' },
+  // 快照健康：最近一次重建的时间/结果/原因（失败不再是"静默的"）
+  { method: 'GET', path: '/api/admin/snapshot-status', handler: adminStatusRoutes.snapshotStatus, auth: 'session' },
 
   // 标签（分类页的第二块）
   { method: 'GET', path: '/api/admin/tags', handler: tagRoutes.list, auth: 'session' },

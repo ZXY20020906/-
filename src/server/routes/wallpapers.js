@@ -618,6 +618,9 @@ export async function approveAll({ env, actor }) {
     targetId: 'bulk',
     detail: '批量通过审核（已发布未审核）',
   });
+  // 审核状态直接决定公开可见性（PUBLIC_VISIBLE 里有 review_status='approved'）：
+  // 之前这里漏了重建，导致「全部通过审核」之后前台一直是旧快照（真实事故）。
+  await rebuildSnapshotQuietly(env, '批量通过审核');
   return json({ approved: true });
 }
 
