@@ -501,7 +501,7 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
     });
     nextKind = 'pet';
   }
-  await setMediaIdentity(env, row.id, {
+  const identity = {
     storageKey: key,
     mime,
     bytes: check.size,
@@ -512,7 +512,27 @@ export async function ingestAsset(env, actor, row, asset, options = {}) {
     kind: nextKind,
     actor: row.storage_key ? MEDIA_ACTOR.REPLACE : MEDIA_ACTOR.UPLOAD,
     updatedAt: now,
-  });
+  };
+  try {
+    await setMediaIdentity(env, row.id, identity);
+  } catch (error) {
+    /**
+     * 老库兼容（问题 2 的迁移**尚未**执行时）：`kind` 列还带着
+     * `CHECK (kind IN ('static','dynamic'))`，写 `pet` 会被约束拒绝。
+     * 这时**不能**让上传失败 —— 退化成 `static`（旧行为）并明确告警，
+     * 等 `schema/020_pet_kind.sql` 执行后自动变成 `pet`。
+     */
+    const message = String(error?.message ?? error);
+    if (nextKind === 'pet' && /CHECK constraint|constraint failed/i.test(message)) {
+      warnings.push({
+        code: 'pet-kind-unsupported',
+        message: '当前库的 kind 约束还不允许 pet（需执行 schema/020_pet_kind.sql）；本次按旧行为存为 static',
+      });
+      await setMediaIdentity(env, row.id, { ...identity, kind: row.kind || 'static' });
+    } else {
+      throw error;
+    }
+  }
   await run(env, Q.markWallpaperVerified, now, videoInfo.codec, videoInfo.faststart, row.id);
   if (softReason) {
     await run(env, Q.setWallpaperVariantQueue, 1, softReason, 'draft', now, row.id);

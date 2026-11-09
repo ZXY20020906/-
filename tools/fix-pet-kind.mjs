@@ -44,16 +44,17 @@ function parseArgs(argv) {
   return out;
 }
 
-/** 本地 sqlite（导出文件）→ 最小 D1 门面（只实现本脚本要用的三种形状）。 */
+/** 本地 sqlite（导出文件）→ 最小 D1 门面（只实现本脚本要用的 query）。 */
 function d1FromSqlite(db) {
   const bind = (args) => args.map((value) => (value === undefined ? null : value));
   return {
-    async all(sql, ...args) {
-      return { results: db.prepare(sql).all(...bind(args)) };
-    },
-    async run(sql, ...args) {
-      const info = db.prepare(sql).run(...bind(args));
-      return { changes: Number(info.changes) || 0 };
+    async query(sql, args = []) {
+      const statement = db.prepare(sql);
+      if (/^\s*(select|with)/i.test(sql)) {
+        return { results: statement.all(...bind(args)), meta: {} };
+      }
+      const info = statement.run(...bind(args));
+      return { results: [], meta: { changes: Number(info.changes) || 0 } };
     },
   };
 }
@@ -87,7 +88,7 @@ async function main() {
     source = `d1:${databaseId}`;
   }
 
-  const rows = (await db.all(SELECT)).results || [];
+  const rows = (await db.query(SELECT, [])).results || [];
   console.log(`数据源 ${source}`);
   console.log(`命中 ${rows.length} 行（kind≠pet 但 variants 里有 pet 标记）`);
   for (const row of rows) {
@@ -102,8 +103,9 @@ async function main() {
 
   let changed = 0;
   for (const row of rows) {
-    const result = await db.run('UPDATE wallpapers SET kind = ?, updated_at = ? WHERE id = ? AND kind <> ?', 'pet', Date.now(), row.id, 'pet');
-    changed += Number(result.changes) || 0;
+    // 用参数数组走 D1 的 params（sqlite 分支同形），避免把值拼进 SQL
+    const result = await db.query('UPDATE wallpapers SET kind = ?, updated_at = ? WHERE id = ? AND kind <> ?', ['pet', Date.now(), row.id, 'pet']);
+    changed += Number(result.meta && result.meta.changes) || 0;
   }
   console.log(`\n已更新 ${changed} 行。建议随后重建公开快照：node tools/build-snapshot.mjs`);
 }
