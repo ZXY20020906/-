@@ -120,9 +120,16 @@
       credentials: 'same-origin',
       headers: { 'x-folia-client': 'admin', ...headers },
     };
-    if (body !== undefined && !raw) {
-      init.headers['content-type'] = 'application/json';
-      init.body = JSON.stringify(body);
+    if (body !== undefined) {
+      if (raw) {
+        // `raw: true` = 调用方自己给了 `FormData`/`Blob`/`ReadableStream`。
+        // 这里必须把 body 原样塞进 init：既不能 JSON.stringify，也不能手写
+        // `content-type` —— multipart 的 boundary 只能由浏览器自己生成。
+        init.body = body;
+      } else {
+        init.headers['content-type'] = 'application/json';
+        init.body = JSON.stringify(body);
+      }
     }
     const response = await fetch(`/api${path}`, init);
     let payload = null;
