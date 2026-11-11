@@ -785,6 +785,10 @@ function renderViewer() {
   const favorite = state.favorites.includes(item.slug);
   $('#viewer-favorite').textContent = favorite ? '★ 已喜欢' : '☆ 喜欢';
 
+  // 预览里的「删除」只在编辑态出现；点击处理在 editor.js（它才有 removeWallpaper）
+  const viewerDelete = $('#viewer-delete');
+  if (viewerDelete) viewerDelete.hidden = !(state.editing && canManageContent(state.user));
+
   // 包和开机动画都要能"下载到设备"，按钮文案要说清楚
   const applyButton = $('[data-action="apply"]');
   const openButton = $('[data-action="open-original"]');

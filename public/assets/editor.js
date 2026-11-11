@@ -131,6 +131,29 @@ function itemOf(slug) {
   return facade.state.items.find((item) => item.slug === slug) || null;
 }
 
+/** 预览弹层里的删除按钮：只在编辑态、有删除权限、且正在看某一张时出现。 */
+function syncViewerDelete() {
+  const button = document.querySelector('#viewer-delete');
+  if (!button) return;
+  const list = facade.state.viewerList || [];
+  const item = list[facade.state.viewerIndex];
+  button.hidden = !(facade.state.editing && canDelete() && item);
+  if (!button.dataset.wired) {
+    button.dataset.wired = '1';
+    button.addEventListener('click', async () => {
+      const current = (facade.state.viewerList || [])[facade.state.viewerIndex];
+      if (!current) return;
+      try {
+        await removeWallpaper(current);
+        const dialog = document.querySelector('#viewer');
+        if (dialog && dialog.open) dialog.close();
+      } catch (error) {
+        report(error);
+      }
+    });
+  }
+}
+
 function decorateGrid() {
   if (!facade.state.editing) return;
   for (const card of $$('#grid .card')) {
@@ -147,7 +170,6 @@ function decorateGrid() {
 
     const tools = [];
     if (canEditItem(item)) tools.push('<span class="admin-tool" role="button" tabindex="0" data-edit="edit" title="编辑标题、分类、标签">✎</span>');
-    if (canDelete()) tools.push('<span class="admin-tool danger" role="button" tabindex="0" data-edit="delete" title="删除">✕</span>');
     host.innerHTML = tools.join('');
 
     let status = $('.admin-status', card);
@@ -171,6 +193,7 @@ function decorateGrid() {
     status.hidden = !label;
     status.dataset.state = item.status || 'draft';
   }
+  syncViewerDelete();
 }
 
 function onCaptureClick(event) {
