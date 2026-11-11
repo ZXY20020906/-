@@ -786,6 +786,12 @@ function renderViewer() {
   const favorite = state.favorites.includes(item.slug);
   $('#viewer-favorite').textContent = favorite ? '★ 已喜欢' : '☆ 喜欢';
 
+  // 编辑模式：预览里直接给「编辑」「删除」，不用关掉预览再回网格里点笔
+  const viewerEditable = state.editing && canManageContent(state.user);
+  const viewerEditButton = $('#viewer-edit');
+  const viewerDeleteButton = $('#viewer-delete');
+  if (viewerEditButton) viewerEditButton.hidden = !viewerEditable;
+  if (viewerDeleteButton) viewerDeleteButton.hidden = !viewerEditable;
 
   // 包和开机动画都要能"下载到设备"，按钮文案要说清楚
   const applyButton = $('[data-action="apply"]');
