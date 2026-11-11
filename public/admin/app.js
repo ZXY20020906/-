@@ -1145,7 +1145,6 @@
       </div>
       <div class="toolbar">
         <input type="search" id="wp-q" placeholder="搜索标题…" value="${esc(state.filters.q)}">
-        <select id="wp-cat"><option value="">全部分类</option></select>
         <select id="wp-tag"><option value="">全部标签</option></select>
         <select id="wp-subtag-filter"><option value="">子标签</option></select>
         <select id="wp-review-filter">
@@ -1153,6 +1152,7 @@
           <option value="approved">已审核</option>
           <option value="pending">未审核</option>
         </select>
+        <select id="wp-cat"><option value="">全部分类</option></select>
         <select id="wp-status">
           <option value="">全部状态</option>
           <option value="published">已发布</option>
