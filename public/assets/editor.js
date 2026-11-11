@@ -161,6 +161,16 @@ function decorateGrid() {
       status.className = 'admin-status';
       card.appendChild(status);
     }
+    // 编辑模式下在卡片下方列出标签：一眼能认出要编辑的是哪张
+    let tagsEl = $(".card-tags", card);
+    if (!tagsEl) {
+      tagsEl = document.createElement("span");
+      tagsEl.className = "card-tags";
+      card.appendChild(tagsEl);
+    }
+    const tagText = Array.isArray(item.tags) && item.tags.length ? item.tags.join(" · ") : "";
+    tagsEl.textContent = tagText;
+    tagsEl.hidden = !tagText;
     const label = item.status === 'published' ? '' : item.status === 'hidden' ? '已下线' : '草稿';
     status.textContent = label;
     status.hidden = !label;
