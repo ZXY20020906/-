@@ -293,28 +293,6 @@ function pageSize() {
  * 编辑模式下列表换成管理接口：草稿、下线的作品也要能看见，否则「改」无从谈起。
  * 管理接口本来就是 offset 分页，直接按页码取。
  */
-async function loadAdminList() {
-  const requestedPage = state.page;
-  const params = new URLSearchParams({
-    limit: String(activePageSize),
-    offset: String((requestedPage - 1) * activePageSize),
-  });
-  const category = state.categories.find((item) => item.slug === state.tab);
-  if (category) params.set('categoryId', category.id);
-  if (state.q) params.set('q', state.q);
-  if (state.type) params.set('kind', state.type);
-
-  const data = await api(`/admin/wallpapers?${params.toString()}`);
-  remember(data.items);
-  state.items = data.items;
-  state.total = Number(data.total ?? data.items.length);
-  state.pageCount = Math.max(1, Math.ceil(state.total / activePageSize));
-  // 删到最后一页以后，退到新的最后一页，别停在空白页
-  if (!data.items.length && requestedPage > state.pageCount) {
-    state.page = state.pageCount;
-    return loadAdminList();
-  }
-}
 
 async function setEditing(on) {
   state.editing = Boolean(on) && canManageContent(state.user);
@@ -376,7 +354,17 @@ async function loadList({ page = state.page } = {}) {
     if (state.tag === FAVORITE_TAG) {
       await loadFavorites();
     } else if (state.editing) {
-      await loadAdminList();
+      // 编辑模式只用公开口径那张表（与画廊完全同源）：
+      // 未上线/草稿/未审核不进前台，避免"编辑模式能看到 155 张、直观看只有 44 张"的错位。
+      let data = await fetchPublicList(state.page);
+      state.total = Number(data.total ?? data.items.length);
+      state.pageCount = Math.max(1, Number(data.pageCount) || Math.ceil(state.total / activePageSize) || 1);
+      if (!data.items.length && state.page > state.pageCount) {
+        state.page = state.pageCount;
+        data = await fetchPublicList(state.page);
+      }
+      // 公开列表没有 status 字段：能出现在这里就说明是已上线的，补一个标记让 canEditItem 通过
+      state.items = data.items.map((item) => ({ ...item, status: 'published' }));
     } else {
       let data = await fetchPublicList(state.page);
       state.total = Number(data.total ?? data.items.length);
