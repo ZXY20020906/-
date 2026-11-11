@@ -1,0 +1,102 @@
+# 部署到 Cloudflare Pages（GitHub Actions）
+#
+# 先干跑、再自动：
+#   1) 现在只有 workflow_dispatch —— 在 Actions 页面手动 Run workflow（可指定分支/ref）
+#   2) 干跑通过（快照重建 + 部署 + 前台可见）后，把文件末尾的 `push:` 段取消注释
+#
+# 为什么不直接 `wrangler pages deploy public`：
+#   本项目的 API 在 `functions/` 下（functions/api/[[path]].js、functions/media/[[path]].js），
+#   `tools/sync-deploy.mjs` 会把 public / functions / src / schema 合并进 `deploy/`，
+#   直接发布 `public` 会丢掉整个 API。因此这里发布 `./deploy`。
+#
+# 权限最小化：CLOUDFLARE_API_TOKEN 只需 Account · Cloudflare Pages · Edit（+ Read）。
+#   ⚠️ 若开启 SNAPSHOT（仓库变量 ENABLE_SNAPSHOT=true），还需 Account · D1 · Read（导出快照用）。
+name: deploy
+
+on:
+  # 干跑阶段：只允许手动触发。干跑通过后再打开下面的 push 触发器。
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 这次部署的原因（写进日志）
+        required: false
+        default: manual
+
+  # ── 干跑通过后取消注释（并把上面的 workflow_dispatch 保留作兜底）──
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - 'src/**'
+  #     - 'public/**'
+  #     - 'functions/**'
+  #     - 'schema/**'
+  #     - 'package.json'
+  #     - '.github/workflows/deploy.yml'
+
+# Secrets 只在主分支 push 与手动触发里可见；fork 的 PR 不会触发（本工作流没有 pull_request 事件）
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # 双保险：即便有人误配触发事件，也只在 main 或手动触发时部署
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Show context
+        run: |
+          echo "ref=${{ github.ref }}"
+          echo "sha=${{ github.sha }}"
+          echo "reason=${{ inputs.reason }}"
+
+      # 站点没有任何运行时依赖（package.json 无 dependencies），所以不需要 npm ci。
+      # 保留这一步是为了将来加依赖时不必改工作流：有 lock 才装。
+      - name: Install (only if a lockfile exists)
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else echo "no package-lock.json — skip install"; fi
+
+      - name: Test
+        run: npm test
+
+      # ── 快照重建（可选，默认关闭）──
+      # 公开接口的快照只在「D1 额度耗尽 / 绑定失效」时兜底；日常改前台不依赖它。
+      # 打开方式：仓库 Settings → Variables → 新增 ENABLE_SNAPSHOT=true
+      # 同时给 Token 补 Account · D1 · Read 权限。
+      - name: Rebuild public snapshot (optional)
+        if: vars.ENABLE_SNAPSHOT == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          mkdir -p build
+          npx -y wrangler@3.99.0 d1 export folia --remote --output=build/d1-export.sql
+          sqlite3 build/d1-export.sqlite < build/d1-export.sql
+          node tools/build-public-snapshot.mjs --sqlite build/d1-export.sqlite --commit "${{ github.sha }}"
+          echo "snapshot rebuilt"
+
+      - name: Sync deploy directory
+        run: node tools/sync-deploy.mjs
+
+      - name: Deploy to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx -y wrangler@3.99.0 pages deploy ./deploy \
+            --project-name=folia \
+            --branch=main \
+            --commit-dirty=true \
+            --commit-hash="${{ github.sha }}"
