@@ -53,12 +53,13 @@ async function request(path, { method = 'GET', body } = {}) {
 
 // ------------------------------------------------------- 谁是负责人（权限）
 const has = (cap) => facade.has(cap);
-const canCreate = () => has('wallpaper:create');
 const canPublish = () => has('wallpaper:publish');
 const canDelete = () => has('wallpaper:delete');
 
 function canEditItem(item) {
   if (!item) return false;
+  // 第 4 项：前台编辑模式只用于「已上线」的壁纸（草稿/已下线不给编辑入口）
+  if (item.status !== 'published') return false;
   if (has('wallpaper:update:any')) return true;
   if (!has('wallpaper:update:own')) return false;
   const user = facade.state.user;
@@ -84,8 +85,7 @@ function injectBar() {
   bar.hidden = true;
   bar.innerHTML = `
     <span class="edit-bar-label">编辑模式</span>
-    ${canCreate() ? '<button type="button" class="edit-bar-btn" data-admin="upload">＋ 上传</button>' : ''}
-    ${has('category:create') ? '<button type="button" class="edit-bar-btn" data-admin="categories">分类</button>' : ''}
+    <!-- 第 3 项：前台编辑模式只做「预览 / 改名 / 改分类 / 删除」，上传与分类管理收归后台 -->
     <a class="edit-bar-btn" href="/admin/" title="成员、审计日志、批量导入">高级</a>
     <button type="button" class="edit-bar-btn ghost" data-admin="exit">退出编辑</button>`;
   document.body.appendChild(bar);
@@ -147,11 +147,6 @@ function decorateGrid() {
 
     const tools = [];
     if (canEditItem(item)) tools.push('<span class="admin-tool" role="button" tabindex="0" data-edit="edit" title="编辑标题、分类、标签">✎</span>');
-    if (canPublish()) {
-      tools.push(item.status === 'published'
-        ? '<span class="admin-tool" role="button" tabindex="0" data-edit="unpublish" title="下线">↓</span>'
-        : '<span class="admin-tool" role="button" tabindex="0" data-edit="publish" title="发布">↑</span>');
-    }
     if (canDelete()) tools.push('<span class="admin-tool danger" role="button" tabindex="0" data-edit="delete" title="删除">✕</span>');
     host.innerHTML = tools.join('');
 
@@ -250,34 +245,8 @@ function categoryOptions(selectedId) {
   return rows.join('');
 }
 
-async function loadTags() {
-  try {
-    const data = await request('/admin/tags');
-    return data.tags || [];
-  } catch {
-    return [];
-  }
-}
-
 // ------------------------------------------------------------------ 编辑作品
 async function openWallpaperDialog(item) {
-  const tags = await loadTags();
-  const chosen = new Set(item.tags || []);
-  const tagHtml = tags.map((tag) => `
-    <label class="tag-pick-item">
-      <input type="checkbox" name="tags" value="${esc(tag.name)}"${chosen.has(tag.name) ? ' checked' : ''}>
-      <span>${esc(tag.name)}</span>
-    </label>`).join('');
-
-  const statusField = canPublish() ? `
-    <label class="field-row">状态
-      <select name="status">
-        <option value="draft"${item.status === 'draft' ? ' selected' : ''}>草稿（前台看不到）</option>
-        <option value="published"${item.status === 'published' ? ' selected' : ''}>已发布</option>
-        <option value="hidden"${item.status === 'hidden' ? ' selected' : ''}>已下线</option>
-      </select>
-    </label>` : '';
-
   const dialog = openSheet(`
     <form>
       <h3>编辑「${esc(item.title)}」</h3>
@@ -287,11 +256,7 @@ async function openWallpaperDialog(item) {
       <label class="field-row">分类
         <select name="categoryId">${categoryOptions(item.category ? item.category.id : '')}</select>
       </label>
-      <fieldset class="tag-pick">
-        <legend>标签</legend>
-        ${tagHtml || '<span class="muted small">还没有标签，去高级后台建一个</span>'}
-      </fieldset>
-      ${statusField}
+      <p class="sheet-hint">标签：${(item.tags || []).length ? esc((item.tags || []).join(' · ')) : '（无）'} · 编辑模式下不可改</p>
       <p class="sheet-hint">文件：${esc(item.mime || '未上传')} · ${esc(facade.formatBytes(item.bytes))}${
         item.width && item.height ? ` · ${item.width}×${item.height}` : ''
       }</p>
@@ -303,20 +268,30 @@ async function openWallpaperDialog(item) {
     </form>`, {
     onSubmit: async (scope, close) => {
       const form = $('form', scope);
-      const tagsPicked = $$('input[name="tags"]:checked', form).map((input) => input.value);
       const body = {
         title: $('input[name="title"]', form).value.trim(),
         categoryId: $('select[name="categoryId"]', form).value || null,
-        tags: tagsPicked,
       };
-      if (canPublish()) {
-        body.status = $('select[name="status"]', form).value;
-      }
       try {
-        await request(`/admin/wallpapers/${encodeURIComponent(item.id)}`, { method: 'PATCH', body });
+        const updated = await request(`/admin/wallpapers/${encodeURIComponent(item.id)}`, { method: 'PATCH', body });
         close();
         toast('已保存', 'ok');
-        await facade.refresh();
+        // 第 4 项：原地更新卡片文案（不改顺序），只有拿不到返回值时才退回整表刷新
+        const patch = updated && (updated.wallpaper || updated);
+        if (patch && typeof patch === 'object' && typeof patch.title === 'string') {
+          item.title = patch.title;
+          if (patch.category) item.category = patch.category;
+          const card = `#grid .card[data-slug="${item.slug}"]`;
+          const node = document.querySelector(card);
+          if (node) {
+            const titleNode = node.querySelector('.card-title, h2, h3');
+            if (titleNode) titleNode.textContent = item.title;
+            const catNode = node.querySelector('.card-cat');
+            if (catNode && item.category) catNode.textContent = item.category.name;
+          }
+        } else {
+          await facade.refresh();
+        }
       } catch (error) {
         report(error);
       }
