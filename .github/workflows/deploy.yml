@@ -14,7 +14,7 @@
 name: deploy
 
 on:
-  # 干跑阶段：只允许手动触发。干跑通过后再打开下面的 push 触发器。
+  # 手动兜底：Actions 页面 Run workflow，可指定 ref
   workflow_dispatch:
     inputs:
       reason:
@@ -22,16 +22,16 @@ on:
         required: false
         default: manual
 
-  # ── 干跑通过后取消注释（并把上面的 workflow_dispatch 保留作兜底）──
-  # push:
-  #   branches: [main]
-  #   paths:
-  #     - 'src/**'
-  #     - 'public/**'
-  #     - 'functions/**'
-  #     - 'schema/**'
-  #     - 'package.json'
-  #     - '.github/workflows/deploy.yml'
+  # 自动触发：push 到 main 且改动落在站点文件上（2026-11-11 干跑 #1 通过后打开）
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'public/**'
+      - 'functions/**'
+      - 'schema/**'
+      - 'package.json'
+      - '.github/workflows/deploy.yml'
 
 # Secrets 只在主分支 push 与手动触发里可见；fork 的 PR 不会触发（本工作流没有 pull_request 事件）
 permissions:
