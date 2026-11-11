@@ -593,8 +593,9 @@ function cardHtml(item, index) {
   const pet = item && item.pet && typeof item.pet === 'object' ? item.pet : null;
   const duration = formatDuration(item.durationMs);
   // 徽标统一走 gallery-core 的 cardBadge（桌宠 > 资源包），其余按视频/清晰度
+  // 壁纸模块不再显示「动态」字样（用户要求）；开机动画模块仍显示时长
   const badge = cardBadge(item)
-    || (video ? (isMotionModule() && duration ? duration : '动态') : qualityLabel(item.width, item.height));
+    || (video ? (isMotionModule() && duration ? duration : '') : qualityLabel(item.width, item.height));
   const favorite = state.favorites.includes(item.slug);
   const spec = pet
     ? [pet.displayName || item.title, pet.tracks ? `${pet.tracks.length} 状态` : '', formatBytes(item.bytes)].filter(Boolean).join(' · ')
