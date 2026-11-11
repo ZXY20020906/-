@@ -131,29 +131,6 @@ function itemOf(slug) {
   return facade.state.items.find((item) => item.slug === slug) || null;
 }
 
-/** 预览弹层里的删除按钮：只在编辑态、有删除权限、且正在看某一张时出现。 */
-function syncViewerDelete() {
-  const button = document.querySelector('#viewer-delete');
-  if (!button) return;
-  const list = facade.state.viewerList || [];
-  const item = list[facade.state.viewerIndex];
-  button.hidden = !(facade.state.editing && canDelete() && item);
-  if (!button.dataset.wired) {
-    button.dataset.wired = '1';
-    button.addEventListener('click', async () => {
-      const current = (facade.state.viewerList || [])[facade.state.viewerIndex];
-      if (!current) return;
-      try {
-        await removeWallpaper(current);
-        const dialog = document.querySelector('#viewer');
-        if (dialog && dialog.open) dialog.close();
-      } catch (error) {
-        report(error);
-      }
-    });
-  }
-}
-
 function decorateGrid() {
   if (!facade.state.editing) return;
   for (const card of $$('#grid .card')) {
@@ -193,7 +170,6 @@ function decorateGrid() {
     status.hidden = !label;
     status.dataset.state = item.status || 'draft';
   }
-  syncViewerDelete();
 }
 
 function onCaptureClick(event) {
@@ -284,8 +260,8 @@ async function openWallpaperDialog(item) {
         item.width && item.height ? ` · ${item.width}×${item.height}` : ''
       }</p>
       <footer>
+        <button type="button" class="btn danger" data-remove>删除</button>
         <button type="button" class="btn ghost" data-close>取消</button>
-        <button type="button" class="btn" data-replace>替换文件</button>
         <button type="submit" class="btn primary">保存</button>
       </footer>
     </form>`, {
@@ -321,25 +297,18 @@ async function openWallpaperDialog(item) {
     },
   });
 
-  $('[data-replace]', dialog).addEventListener('click', () => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = 'image/*,video/*,.zip';
-    input.addEventListener('change', async () => {
-      const file = input.files && input.files[0];
-      if (!file) return;
-      try {
-        toast('正在上传…', 'info');
-        await replaceAsset(item.id, file);
-        toast('文件已替换', 'ok');
-        if (dialog.open) dialog.close();
-        await facade.refresh();
-      } catch (error) {
-        report(error);
-      }
-    });
-    input.click();
+  $('[data-remove]', dialog).addEventListener('click', async () => {
+    if (!window.confirm(`删除「${item.title}」？原文件也会一起删掉，不能撤销。`)) return;
+    try {
+      await request(`/admin/wallpapers/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
+      toast('已删除', 'ok');
+      if (dialog.open) dialog.close();
+      await facade.refresh();
+    } catch (error) {
+      report(error);
+    }
   });
+
 }
 
 async function replaceAsset(wallpaperId, file) {
