@@ -203,10 +203,11 @@ async function togglePublish(item) {
 }
 
 async function removeWallpaper(item) {
-  if (!window.confirm(`删除「${item.title}」？原文件也会一起删掉，不能撤销。`)) return;
+  if (!window.confirm(`删除「${item.title}」？原文件也会一起删掉，不能撤销。`)) return false;
   await request(`/admin/wallpapers/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
   toast('已删除', 'ok');
   await facade.refresh();
+  return true;
 }
 
 // ------------------------------------------------------------------ 弹层
@@ -663,6 +664,36 @@ async function makeThumbnail(file) {
   }
 }
 
+// ------------------------------------------------------------------ 预览里的编辑/删除
+/**
+ * 预览弹层底部的「编辑」「删除」：编辑模式下才可见（由 gallery 控制显隐）。
+ * 用事件委托挂一次，避免每次打开预览都重新绑定、也避免按钮还没渲染时抓不到。
+ */
+function onViewerAction(event) {
+  const target = event.target;
+  if (!target || typeof target.closest !== 'function') return;
+  const editButton = target.closest('#viewer-edit');
+  const deleteButton = target.closest('#viewer-delete');
+  if (!editButton && !deleteButton) return;
+  event.preventDefault();
+  event.stopPropagation();
+
+  const list = facade.state.viewerList || [];
+  const item = list[facade.state.viewerIndex];
+  if (!item) return;
+
+  if (editButton) {
+    openWallpaperDialog(item).catch(report);
+    return;
+  }
+  removeWallpaper(item).then((removed) => {
+    // 只有真的删掉了才关预览；点"取消"不该把预览也关掉
+    if (!removed) return;
+    const viewer = document.querySelector('#viewer');
+    if (viewer && viewer.open) viewer.close();
+  }).catch(report);
+}
+
 // ------------------------------------------------------------------ 挂载
 export function mountEditor(f) {
   facade = f;
@@ -674,6 +705,7 @@ export function mountEditor(f) {
   document.addEventListener('folia:grid', () => decorateGrid());
   document.addEventListener('click', onCaptureClick, true);
   document.addEventListener('keydown', onCaptureKeydown, true);
+  document.addEventListener('click', onViewerAction, true);
 
   // ?edit=1 深链：等第一屏列表渲染完再切，避免和首屏的公开列表请求打架
   if (new URLSearchParams(location.search).get('edit') === '1') {
