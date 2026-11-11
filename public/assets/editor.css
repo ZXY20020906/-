@@ -274,3 +274,6 @@ body.editing .sort-field { display: none; }
 /* 编辑模式：卡片下方显示标签，便于快速定位目标 */
 .card-tags { display: block; margin-top: 4px; font-size: 11px; line-height: 1.4; color: var(--muted, #9aa0aa); word-break: break-all; }
 .card-tags[hidden] { display: none; }
+
+/* 兜底：即便浏览器拿到旧版 editor.js，卡片上的删除按钮也不显示（删除已收进编辑弹层） */
+.admin-tool[data-edit="delete"] { display: none !important; }
