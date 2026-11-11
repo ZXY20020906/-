@@ -183,3 +183,28 @@ test('R7 刷新时间戳：NOW 与快照版本不冲突（防止版本秒级碰�
   if (sqliteSkip) return;
   assert.ok(Number.isFinite(NOW));
 });
+
+
+test('R8 软删作品（status=hidden）⇒ 快照重建，total -1', { skip: sqliteSkip }, async (t) => {
+  if (sqliteSkip) return t.skip('no sqlite');
+  const site = makeSite(t);
+  const env = snapshotEnv(site.env);
+  globalThis.__snapshotEnv = env;
+  site.insert({ id: 'wp_soft_keep', slug: 'soft-keep', status: 'published', review_status: 'approved' });
+  site.insert({ id: 'wp_soft_drop', slug: 'soft-drop', status: 'published', review_status: 'approved' });
+
+  const beforeTotal = await total(env);
+  const beforeVersion = await version(env);
+
+  // 软删：行还在、R2 文件还在，只是 status 变 hidden
+  const res = await admin('PATCH', '/api/admin/wallpapers/wp_soft_drop', { status: 'hidden' });
+  assert.equal(res.status, 200, res.text.slice(0, 300));
+
+  assert.equal(beforeTotal, 2);
+  assert.equal(await total(env), 1, '软删后公开列表 -1');
+  assert.notEqual(await version(env), beforeVersion, '软删也要重建快照');
+
+  const row = site.db.prepare('SELECT status, storage_key FROM wallpapers WHERE id = ?').get('wp_soft_drop');
+  assert.equal(row.status, 'hidden');
+  assert.ok(row.storage_key, '软删必须保留 R2 文件引用（不是硬删）');
+});
