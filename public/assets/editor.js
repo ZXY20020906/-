@@ -285,9 +285,9 @@ async function openWallpaperDialog(item) {
         item.width && item.height ? ` · ${item.width}×${item.height}` : ''
       }</p>
       <footer>
+        <button type="submit" class="btn primary">保存</button>
         <button type="button" class="btn danger" data-remove>删除</button>
         <button type="button" class="btn ghost" data-close>取消</button>
-        <button type="submit" class="btn primary">保存</button>
       </footer>
     </form>`, {
     onSubmit: async (scope, close) => {
