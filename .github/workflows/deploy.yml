@@ -32,6 +32,7 @@ on:
       - 'schema/**'
       - 'package.json'
       - 'tools/**'
+      - 'tests/**'
       - '.github/workflows/deploy.yml'
 
 # Secrets 只在主分支 push 与手动触发里可见；fork 的 PR 不会触发（本工作流没有 pull_request 事件）
