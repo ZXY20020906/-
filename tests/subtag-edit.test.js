@@ -79,3 +79,10 @@ test('前端编辑弹层：读后台字典、没有就显示「无标签」、�
   assert.ok(src.includes("method: 'POST'") === false || !/POST[\s\S]{0,80}\/admin\/subtags/.test(src),
     '前端不允许新建子标签（字典在后端维护）');
 });
+
+test('卡片下方同时显示标签与子标签（编辑模式用来定位目标）', () => {
+  const src = readFileSync('public/assets/editor.js', 'utf8');
+  assert.ok(src.includes('标签：${item.tags.join'), '卡片行要带标签');
+  assert.ok(src.includes('子标签：${item.subtag}'), '卡片行要带子标签');
+  assert.ok(src.includes('metaText'), '两段拼成一行，空的一段不显示');
+});
