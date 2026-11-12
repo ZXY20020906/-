@@ -540,7 +540,8 @@ function renderFilters() {
 async function loadSubtags() {
   try {
     const params = new URLSearchParams();
-    if (state.category) params.set('category', state.category);
+    // 分类用的是 tab 的 slug（state.category 是旧字段，可能为空）
+    if (state.tab) params.set('category', state.tab);
     if (state.tag && state.tag !== FAVORITE_TAG) params.set('tag', state.tag);
     const data = await api(`/public/subtags?${params.toString()}`);
     state.subtags = data.subtags ?? [];
@@ -893,11 +894,13 @@ function toggleCurrentFavorite() {
 function switchTab(tab) {
   if (tab === state.tab) return;
   state.tab = tab;
+  state.tag = '';
+  state.subtag = '';
   renderTabs();
   renderModuleNote();
   renderFilters(); // 「喜欢」角标按模块算，切 tab 要跟着变
-  // 标签也按分类走：这个模块可能有自己的标签
-  loadTags().then(renderFilters).catch(() => {});
+  // 标签/子标签都按分类走：这个模块可能有自己的一套
+  Promise.all([loadTags(), loadSubtags()]).then(renderFilters).catch(() => {});
   syncHash();
   loadList({ page: 1 });
 }
@@ -967,6 +970,8 @@ function boot() {
       renderTabs();
       renderModuleNote();
       await loadTags();
+      // 子标签行首屏就要出现（以前只有点了标签才加载，所以默认看不到这一行）
+      await loadSubtags();
       // 喜欢以服务端为准；本机老记录会顺手搬上去
       await Promise.race([
         syncLikes(),
