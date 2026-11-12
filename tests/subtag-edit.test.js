@@ -86,3 +86,11 @@ test('卡片下方同时显示标签与子标签（编辑模式用来定位目�
   assert.ok(src.includes('子标签：${item.subtag}'), '卡片行要带子标签');
   assert.ok(src.includes('metaText'), '两段拼成一行，空的一段不显示');
 });
+
+test('前台筛选栏：标签行下面有子标签行，首屏就加载', () => {
+  const src = readFileSync('public/assets/gallery.js', 'utf8');
+  assert.ok(src.includes("chipHtml('subtag'"), '子标签 chip 要能点（data-filter=subtag）');
+  assert.ok(/await loadTags\(\);[\s\S]{0,240}await loadSubtags\(\);/.test(src), 'boot 链里在标签之后加载子标签');
+  assert.ok(/Promise\.all\(\[loadTags\(\), loadSubtags\(\)\]\)/.test(src), '切分类时标签与子标签一起刷新');
+  assert.ok(src.includes("params.set('category', state.tab)"), '子标签按分类过滤');
+});
