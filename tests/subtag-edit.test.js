@@ -74,6 +74,7 @@ test('后台子标签字典可读（空表返回空数组）', { skip: sqliteSki
 test('前端编辑弹层：读后台字典、没有就显示「无标签」、不新建', () => {
   const src = readFileSync('public/assets/editor.js', 'utf8');
   assert.ok(src.includes("request('/admin/subtags')"), '子标签选项必须来自后台字典');
+  assert.ok(src.includes("request('/admin/subtags/used')"), '还要合并「作品上实际用过的子标签」');
   assert.ok(src.includes('无标签'), '没有子标签时要有明确提示');
   assert.ok(/body\.subtag\s*=/.test(src), '保存时要提交 subtag');
   assert.ok(src.includes("method: 'POST'") === false || !/POST[\s\S]{0,80}\/admin\/subtags/.test(src),

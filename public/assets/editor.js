@@ -248,26 +248,41 @@ function categoryOptions(selectedId) {
 }
 
 // ------------------------------------------------------------------ 编辑作品
-/** 标签选择项：字典在后端维护（/admin/subtags），这里只读；没有就明确显示"无标签"。 */
+/**
+ * 标签选择项：
+ *   · /admin/subtags       —— 后台维护的字典（带所属标签 tagName）
+ *   · /admin/subtags/used  —— 作品上**实际用过的**值（字典没建全时也能选到）
+ * 两个合并去重；都没有就明确显示"无标签"。字段名仍是 subtag。
+ */
 async function subtagFieldHtml(item) {
   const current = String(item.subtag || '');
-  try {
-    const data = await request('/admin/subtags');
-    const rows = Array.isArray(data && data.subtags) ? data.subtags : [];
-    if (!rows.length) return { html: '<p class="sheet-hint">标签：无标签（在后台「分类」里创建）</p>', editable: false };
-    const options = rows.map((row) => (
-      `<option value="${esc(row.name)}"${row.name === current ? ' selected' : ''}>${esc(row.name)}${row.tagName ? `（${esc(row.tagName)}）` : ''}</option>`
-    )).join('');
-    return {
-      html: `<label class="field-row">标签
-        <select name="subtag"><option value=""${current ? '' : ' selected'}>（无标签）</option>${options}</select>
-      </label>`,
-      editable: true,
-    };
-  } catch {
-    // 没权限/网络失败都不能把弹层卡住：按"没有标签"处理，原来的值保持不变
-    return { html: '<p class="sheet-hint">标签：无标签（读取失败，稍后重试）</p>', editable: false };
+  const [dictResult, usedResult] = await Promise.allSettled([
+    request('/admin/subtags'),
+    request('/admin/subtags/used'),
+  ]);
+  const dict = dictResult.status === 'fulfilled' && Array.isArray(dictResult.value && dictResult.value.subtags)
+    ? dictResult.value.subtags : [];
+  const used = usedResult.status === 'fulfilled' && Array.isArray(usedResult.value && usedResult.value.subtags)
+    ? usedResult.value.subtags : [];
+
+  const names = new Map(); // name -> tagName（'': 未知所属）
+  for (const row of dict) if (row && row.name) names.set(row.name, row.tagName || '');
+  for (const name of used) if (typeof name === 'string' && name && !names.has(name)) names.set(name, '');
+
+  if (!names.size) {
+    return { html: '<p class="sheet-hint">标签：无标签（在后台「分类」里创建，或给作品填过子标签后自动出现）</p>', editable: false };
   }
+  if (current && !names.has(current)) names.set(current, '');
+
+  const options = [...names.entries()].map(([name, tagName]) => (
+    `<option value="${esc(name)}"${name === current ? ' selected' : ''}>${esc(name)}${tagName ? `（${esc(tagName)}）` : ''}</option>`
+  )).join('');
+  return {
+    html: `<label class="field-row">标签
+      <select name="subtag"><option value=""${current ? '' : ' selected'}>（无标签）</option>${options}</select>
+    </label>`,
+    editable: true,
+  };
 }
 
 async function openWallpaperDialog(item) {
