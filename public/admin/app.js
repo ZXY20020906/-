@@ -1818,6 +1818,12 @@
             <div class="small" id="wp-file-name" style="margin-top:6px"></div>
           </div>`}
         <p class="hint" id="wp-progress"></p>
+        ${editing ? `<label class="field">封面（可选：皮肤包/资源包没有首帧时用它）
+          <div class="row">
+            <input type="file" id="wp-poster-file" accept="image/png,image/jpeg,image/webp">
+            <span class="small" id="wp-poster-note"></span>
+          </div>
+        </label>` : ''}
         <footer>
           <button type="button" class="btn ghost" data-close>取消</button>
           <button type="submit" class="btn primary">${editing ? '保存' : '创建'}</button>
@@ -1827,6 +1833,28 @@
       let chosenFile = null;
       $('[data-close]', dialog).addEventListener('click', closeDialog);
 
+      const posterFile = $('#wp-poster-file', dialog);
+      if (posterFile) {
+        posterFile.addEventListener('change', async () => {
+          const f = posterFile.files && posterFile.files[0];
+          if (!f) return;
+          const note = $('#wp-poster-note', dialog);
+          if (note) note.textContent = '上传中…';
+          try {
+            const r = await fetch(`/api/admin/wallpapers/${encodeURIComponent(item.id)}/poster`, {
+              method: 'PUT',
+              headers: { 'x-folia-client': 'admin', 'content-type': f.type || 'image/png' },
+              body: f,
+            });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            if (note) note.textContent = '已上传，保存后生效';
+            toast('封面已上传', 'ok');
+          } catch (e) {
+            if (note) note.textContent = '上传失败';
+            toast('封面上传失败：' + e.message, 'err');
+          }
+        });
+      }
       const drop = $('#wp-drop', dialog);
       if (drop) {
         const input = document.createElement('input');

@@ -80,6 +80,7 @@ const DEFINITIONS = [
   { method: 'POST', path: '/api/admin/wallpapers/:id/publish', handler: wallpaperRoutes.publish, auth: 'session' },
   { method: 'PUT', path: '/api/admin/wallpapers/:id/asset', handler: wallpaperRoutes.upload, auth: 'session' },
   { method: 'PUT', path: '/api/admin/wallpapers/:id/thumb', handler: wallpaperRoutes.uploadThumb, auth: 'session' },
+  { method: 'PUT', path: '/api/admin/wallpapers/:id/poster', handler: wallpaperRoutes.uploadPoster, auth: 'session' },
   // 大文件分片上传（R2 multipart）
   { method: 'POST', path: '/api/admin/uploads/init', handler: uploadRoutes.init, auth: 'session' },
   { method: 'PUT', path: '/api/admin/uploads/part', handler: uploadRoutes.part, auth: 'session' },

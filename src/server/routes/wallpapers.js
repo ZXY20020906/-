@@ -31,7 +31,7 @@ import {
 } from '../../core/errors.js';
 import { created, json, readJson } from '../http.js';
 import { wallpaperDto } from '../dto.js';
-import { deleteAsset, mediaBaseFor, putAsset as putR2, thumbKey, verifyAsset } from '../storage.js';
+import { deleteAsset, mediaBaseFor, posterKey, putAsset as putR2, thumbKey, verifyAsset } from '../storage.js';
 import { newId, safeJsonArray, sha256Bytes } from '../util.js';
 import { buildReorderPlan } from '../../core/ordering.js';
 import { AUDIT_ACTION, writeAudit } from '../audit.js';
@@ -585,6 +585,43 @@ export async function uploadThumb({ env, actor, request, params }) {
   await recordDailyUsage(env, actor, bytes.byteLength);
 
   return json({ thumbUrl: `/media/${key}`, width: meta.width, height: meta.height });
+}
+
+/**
+ * PUT /api/admin/wallpapers/:id/poster —— 上传封面（皮肤包 / 资源包没有首帧可抽时手动补）。
+ * 与缩略图同一套：限流 + 配额 + 写入回读校验 + 旧图清理；写完重建公开快照。
+ */
+export async function uploadPoster({ env, actor, request, params }) {
+  const row = await loadWallpaper(env, params.id);
+  assertCan(actor, ACTION.ASSET_UPLOAD);
+  assertCan(actor, ACTION.WALLPAPER_UPDATE, row);
+  assertUploadRate(actor, request);
+
+  const MAX = 8 * 1024 * 1024;
+  const declared = Number(request.headers.get('content-length') ?? 0);
+  if (declared > MAX) throw payloadTooLarge('封面不能超过 8MB');
+  const buffer = await request.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  if (!bytes.byteLength) throw badRequest('封面是空的');
+  if (bytes.byteLength > MAX) throw payloadTooLarge('封面不能超过 8MB');
+
+  const meta = readMediaMeta(bytes);
+  if (!meta.mime || !meta.mime.startsWith('image/')) throw unsupportedMedia('封面必须是图片（png/jpg/webp）');
+
+  await assertDailyQuota(env, actor, bytes.byteLength);
+  const sha = await sha256Bytes(bytes);
+  const key = posterKey(row.id, sha, meta.mime);
+  await putR2(env, key, bytes, meta.mime);
+  const check = await verifyAsset(env, key, bytes.byteLength);
+  if (!check.ok) {
+    await deleteAsset(env, key);
+    throw storageVerifyFailed('封面写入校验失败，请重试');
+  }
+  if (row.poster_key && row.poster_key !== key) await deleteAsset(env, row.poster_key);
+  await run(env, Q.updateWallpaperPoster, key, row.id);
+  await recordDailyUsage(env, actor, bytes.byteLength);
+  await rebuildSnapshotQuietly(env, '上传封面');
+  return json({ posterUrl: `/media/${key}`, width: meta.width, height: meta.height });
 }
 
 export async function remove({ env, actor, params }) {
