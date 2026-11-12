@@ -113,8 +113,8 @@ body.editing .card > .badge { display: none; }
 /* 编辑模式下收藏按钮会挡住操作条，先让位 */
 body.editing .like-btn { opacity: 0; pointer-events: none; }
 
-/* 公开接口才认排序 / 标签 / 分辨率筛选，编辑模式下先藏起来，避免界面说谎 */
-body.editing #filters,
+/* 编辑模式现在也走公开列表（同一套 tag/subtag 筛选），筛选栏要保留；
+   只有「排序」仍是公开接口的展示选项，暂时不放进编辑模式。 */
 body.editing .sort-field { display: none; }
 
 /* ------------------------------------------------------------ 弹层 */
