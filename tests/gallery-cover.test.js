@@ -17,3 +17,10 @@ test('后台上传封面后提示与真相一致（已落库，不需要再保�
   assert.ok(admin.includes('/poster'), '后台调用封面上传接口');
   assert.ok(!admin.includes('已上传，保存后生效'), '文案不该让人以为还要点保存才生效');
 });
+
+test('后台列表缩略图也用 posterUrl（前台显示了后台也要同步）', () => {
+  const admin = readFileSync('public/admin/app.js', 'utf8');
+  const fn = admin.slice(admin.indexOf('function thumbHtml('), admin.indexOf('function formatDuration('));
+  assert.ok(/item\.posterUrl \|\|/.test(fn), '后台 thumbHtml 优先取 posterUrl');
+  assert.ok(!/const cover = item\.thumbUrl &&/.test(fn), '旧写法（只认 thumbUrl）应已移除');
+});

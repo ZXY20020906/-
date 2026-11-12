@@ -34,8 +34,8 @@
 
   function thumbHtml(item) {
     if (!item.url) return '<div class="thumb-empty">无文件</div>';
-    // 有封面就显示封面，资源包和视频都一样
-    const cover = item.thumbUrl && item.thumbUrl !== item.url ? item.thumbUrl : null;
+    // 封面优先级：手动上传的 poster > 缩略图（资源包没有首帧，只能靠 poster）
+    const cover = item.posterUrl || (item.thumbUrl && item.thumbUrl !== item.url ? item.thumbUrl : null);
     if (cover) return `<img class="thumb" src="${esc(cover)}" alt="" loading="lazy">`;
     if (isBundleAsset(item)) return '<div class="thumb-bundle">ZIP</div>';
     if (item.mime && item.mime.startsWith('video/')) {
