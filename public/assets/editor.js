@@ -205,7 +205,8 @@ async function togglePublish(item) {
 }
 
 async function removeWallpaper(item) {
-  if (!window.confirm(`删除「${item.title}」？原文件也会一起删掉，不能撤销。`)) return false;
+  const ok = await confirmSheet(`删除「${item.title}」？\n原文件也会一起删掉，不能撤销。`);
+  if (!ok) return false;
   await request(`/admin/wallpapers/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
   toast('已删除', 'ok');
   await facade.refresh();
@@ -213,6 +214,30 @@ async function removeWallpaper(item) {
 }
 
 // ------------------------------------------------------------------ 弹层
+/** 居中的确认框：替代 window.confirm（浏览器原生确认条在窗口顶部，看不见按钮）。
+ *  返回 Promise<boolean>：确认 true / 取消 false。 */
+function confirmSheet(message, { confirmText = '删除', cancelText = '取消', danger = true } = {}) {
+  return new Promise((resolve) => {
+    const dialog = document.createElement('dialog');
+    dialog.className = 'sheet confirm-sheet';
+    dialog.innerHTML = `
+      <form method="dialog">
+        <p class="confirm-text">${esc(message)}</p>
+        <footer>
+          <button value="ok" class="btn ${danger ? 'danger' : 'primary'}">${esc(confirmText)}</button>
+          <button value="cancel" class="btn ghost">${esc(cancelText)}</button>
+        </footer>
+      </form>`;
+    document.body.appendChild(dialog);
+    dialog.addEventListener('close', () => {
+      resolve(dialog.returnValue === 'ok');
+      dialog.remove();
+    });
+    if (typeof dialog.showModal === 'function') dialog.showModal();
+    else dialog.setAttribute('open', '');
+  });
+}
+
 function openSheet(html, { onSubmit } = {}) {
   const dialog = document.createElement('dialog');
   dialog.className = 'sheet';
@@ -345,7 +370,8 @@ async function openWallpaperDialog(item) {
   });
 
   $('[data-remove]', dialog).addEventListener('click', async () => {
-    if (!window.confirm(`删除「${item.title}」？原文件也会一起删掉，不能撤销。`)) return;
+    const ok = await confirmSheet(`删除「${item.title}」？\n原文件也会一起删掉，不能撤销。`);
+    if (!ok) return;
     try {
       await request(`/admin/wallpapers/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
       toast('已删除', 'ok');
@@ -606,7 +632,8 @@ async function deleteCategory(row, after) {
   const used = Number(row.dataset.count || 0);
 
   if (!used) {
-    if (!window.confirm(`删除空白分类「${name}」？`)) return;
+    const ok = await confirmSheet(`删除空白分类「${name}」？`);
+    if (!ok) return;
     try {
       await request(`/admin/categories/${encodeURIComponent(id)}`, { method: 'DELETE' });
       toast('分类已删除', 'ok');

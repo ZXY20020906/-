@@ -103,3 +103,12 @@ test('编辑模式也显示标签/子标签筛选（不再隐藏 #filters）', (
   assert.ok(!/state\.tag = '';\s*\n\s*state\.aspect = ''/.test(gallery), '进编辑模式不再清空标签筛选');
   assert.ok(/fetchPublicList\(state\.page\)/.test(gallery), '编辑模式走公开列表，筛选参数才生效');
 });
+
+test('删除确认用居中弹层，不用 window.confirm', () => {
+  const src = readFileSync('public/assets/editor.js', 'utf8');
+  const css = readFileSync('public/assets/editor.css', 'utf8');
+  assert.ok(src.includes('function confirmSheet('), '要有居中确认框');
+  assert.ok(!/window\.confirm\(/.test(src), '不能再出现 window.confirm（原生确认条在窗口顶部）');
+  assert.ok(/await confirmSheet\(/.test(src), '删除前要 await 确认结果');
+  assert.ok(css.includes('.confirm-sheet'), '确认框要居中且限宽');
+});

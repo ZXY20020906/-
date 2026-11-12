@@ -277,3 +277,7 @@ body.editing .sort-field { display: none; }
 
 /* 兜底：即便浏览器拿到旧版 editor.js，卡片上的删除按钮也不显示（删除已收进编辑弹层） */
 .admin-tool[data-edit="delete"] { display: none !important; }
+
+/* 居中确认框：原生 window.confirm 在窗口顶部，用户看不到按钮 */
+.confirm-sheet { width: min(420px, calc(100vw - 32px)); }
+.confirm-text { margin: 0; white-space: pre-line; line-height: 1.65; font-size: 14px; }
