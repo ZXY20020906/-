@@ -246,7 +246,30 @@ function categoryOptions(selectedId) {
 }
 
 // ------------------------------------------------------------------ 编辑作品
+/** 子标签选择项：字典在后端维护（/admin/subtags），这里只读；没有就明确显示"无子标签"。 */
+async function subtagFieldHtml(item) {
+  const current = String(item.subtag || '');
+  try {
+    const data = await request('/admin/subtags');
+    const rows = Array.isArray(data && data.subtags) ? data.subtags : [];
+    if (!rows.length) return { html: '<p class="sheet-hint">子标签：无子标签（在后台「分类 → 子标签」里创建）</p>', editable: false };
+    const options = rows.map((row) => (
+      `<option value="${esc(row.name)}"${row.name === current ? ' selected' : ''}>${esc(row.name)}${row.tagName ? `（${esc(row.tagName)}）` : ''}</option>`
+    )).join('');
+    return {
+      html: `<label class="field-row">子标签
+        <select name="subtag"><option value=""${current ? '' : ' selected'}>（无子标签）</option>${options}</select>
+      </label>`,
+      editable: true,
+    };
+  } catch {
+    // 没权限/网络失败都不能把弹层卡住：按"没有子标签"处理，原来的值保持不变
+    return { html: '<p class="sheet-hint">子标签：无子标签（读取失败，稍后重试）</p>', editable: false };
+  }
+}
+
 async function openWallpaperDialog(item) {
+  const subtagField = await subtagFieldHtml(item);
   const dialog = openSheet(`
     <form>
       <h3>编辑「${esc(item.title)}」</h3>
@@ -256,6 +279,7 @@ async function openWallpaperDialog(item) {
       <label class="field-row">分类
         <select name="categoryId">${categoryOptions(item.category ? item.category.id : '')}</select>
       </label>
+      ${subtagField.html}
       <p class="sheet-hint">标签：${(item.tags || []).length ? esc((item.tags || []).join(' · ')) : '（无）'} · 编辑模式下不可改</p>
       <p class="sheet-hint">文件：${esc(item.mime || '未上传')} · ${esc(facade.formatBytes(item.bytes))}${
         item.width && item.height ? ` · ${item.width}×${item.height}` : ''
@@ -272,6 +296,11 @@ async function openWallpaperDialog(item) {
         title: $('input[name="title"]', form).value.trim(),
         categoryId: $('select[name="categoryId"]', form).value || null,
       };
+      // 只有真的给了下拉框才提交子标签；没有字典时不动原值
+      if (subtagField.editable) {
+        const select = $('select[name="subtag"]', form);
+        body.subtag = select ? select.value : '';
+      }
       try {
         const updated = await request(`/admin/wallpapers/${encodeURIComponent(item.id)}`, { method: 'PATCH', body });
         close();
