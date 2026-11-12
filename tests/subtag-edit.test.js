@@ -94,3 +94,11 @@ test('前台筛选栏：标签行下面有子标签行，首屏就加载', () =>
   assert.ok(/Promise\.all\(\[loadTags\(\), loadSubtags\(\)\]\)/.test(src), '切分类时标签与子标签一起刷新');
   assert.ok(src.includes("params.set('category', state.tab)"), '子标签按分类过滤');
 });
+
+test('编辑模式也显示标签/子标签筛选（不再隐藏 #filters）', () => {
+  const gallery = readFileSync('public/assets/gallery.js', 'utf8');
+  const css = readFileSync('public/assets/editor.css', 'utf8');
+  assert.ok(!/body\.editing #filters/.test(css), '编辑模式不该再把筛选栏藏起来');
+  assert.ok(!/state\.tag = '';\s*\n\s*state\.aspect = ''/.test(gallery), '进编辑模式不再清空标签筛选');
+  assert.ok(/fetchPublicList\(state\.page\)/.test(gallery), '编辑模式走公开列表，筛选参数才生效');
+});
