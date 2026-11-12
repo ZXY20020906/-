@@ -3,7 +3,7 @@
  * 作品上的 subtag 仍是文本字段。这里锁三件事：
  *   ① PATCH { subtag } 能写进公开 DTO
  *   ② PATCH { subtag: '' } 能清空
- *   ③ 前端只读字典、不新建；没有子标签时显示「无子标签」
+ *   ③ 前端只读字典、不新建；没有子标签时显示「无标签」
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -71,10 +71,10 @@ test('后台子标签字典可读（空表返回空数组）', { skip: sqliteSki
   assert.ok(Array.isArray(list), 'subtags 必须是数组');
 });
 
-test('前端编辑弹层：读后台字典、没有就显示「无子标签」、不新建', () => {
+test('前端编辑弹层：读后台字典、没有就显示「无标签」、不新建', () => {
   const src = readFileSync('public/assets/editor.js', 'utf8');
   assert.ok(src.includes("request('/admin/subtags')"), '子标签选项必须来自后台字典');
-  assert.ok(src.includes('无子标签'), '没有子标签时要有明确提示');
+  assert.ok(src.includes('无标签'), '没有子标签时要有明确提示');
   assert.ok(/body\.subtag\s*=/.test(src), '保存时要提交 subtag');
   assert.ok(src.includes("method: 'POST'") === false || !/POST[\s\S]{0,80}\/admin\/subtags/.test(src),
     '前端不允许新建子标签（字典在后端维护）');
