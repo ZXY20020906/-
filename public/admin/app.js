@@ -1847,7 +1847,7 @@
               body: f,
             });
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
-            if (note) note.textContent = '已上传，保存后生效';
+            if (note) note.textContent = '已上传，前台刷新即可看到';
             toast('封面已上传', 'ok');
           } catch (e) {
             if (note) note.textContent = '上传失败';

@@ -599,7 +599,9 @@ function cardHtml(item, index) {
     : bundle
       ? formatBytes(item.bytes)
       : [formatDimensions(item.width, item.height), duration, formatBytes(item.bytes)].filter(Boolean).join(' · ');
-  const cover = (pet && pet.previewUrl) || item.thumbUrl;
+  // 封面优先级：桌宠自带预览 > 手动上传的封面（posterUrl）> 缩略图
+  // 皮肤包 / 资源包没有首帧可抽，只能靠后台上传的 poster
+  const cover = (pet && pet.previewUrl) || item.posterUrl || item.thumbUrl;
   let media;
   if ((bundle || pet) && cover) {
     // 资源包/桌宠有封面图就显示封面，别用通用 ZIP 磁贴盖住作品本身
@@ -759,7 +761,11 @@ function renderViewer() {
   const bundle = kind === 'bundle';
 
   if (bundle) {
-    stage.innerHTML = `
+    // 有手动上传的封面就展示封面（皮肤包/资源包没有首帧）
+    stage.innerHTML = item.posterUrl
+      ? `<img src="${esc(item.posterUrl)}" alt="${esc(item.title)}">
+         <p class="muted small">资源包 · ${esc(formatBytes(item.bytes))} · 下载后按说明解压使用</p>`
+      : `
       <div class="bundle-preview">
         <span class="bundle-mark">ZIP</span>
         <p>资源包，不能在线预览</p>
