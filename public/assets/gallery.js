@@ -296,11 +296,7 @@ function pageSize() {
 
 async function setEditing(on) {
   state.editing = Boolean(on) && canManageContent(state.user);
-  if (state.editing) {
-    // 标签 / 分辨率筛选只有公开接口认，编辑模式下先清掉，免得界面显示的条件和结果对不上
-    state.tag = '';
-    state.aspect = '';
-  }
+  // 进编辑模式保留当前筛选（编辑模式也走公开列表，tag/subtag/aspect 都认）
   document.body.classList.toggle('editing', state.editing);
   renderTabs();
   renderFilters();
