@@ -1,0 +1,81 @@
+/**
+ * 前台编辑弹层的「子标签」：可选项来自后台字典（/api/admin/subtags），
+ * 作品上的 subtag 仍是文本字段。这里锁三件事：
+ *   ① PATCH { subtag } 能写进公开 DTO
+ *   ② PATCH { subtag: '' } 能清空
+ *   ③ 前端只读字典、不新建；没有子标签时显示「无子标签」
+ */
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+
+import { call, openSite, sqliteSkip } from './sqlite-site.js';
+
+const DEVICE = 'f'.repeat(43);
+const TOKEN = 'subtag-edit-token';
+const sha = (text) => createHash('sha256').update(text).digest('hex');
+const cookie = () => `folia_session=${TOKEN}; folia_device=${DEVICE}`;
+
+function makeSite() {
+  const site = openSite([{
+    id: 'wp_sub',
+    slug: 'sub',
+    title: '露西',
+    status: 'published',
+    review_status: 'approved',
+    category_id: 'cat_wallpaper',
+    kind: 'static',
+  }]);
+  const now = Date.now();
+  site.db.prepare(`INSERT INTO sessions (token_hash, user_id, created_at, expires_at, user_agent, ip_hash, device_hash, last_seen_at)
+    VALUES (?, 'usr_site', ?, ?, '', '', ?, ?)`)
+    .run(sha(TOKEN), now, now + 3600_000, sha(DEVICE), now);
+  return site;
+}
+
+const admin = (env, method, path, body) => call(env, path, {
+  method,
+  headers: {
+    'x-folia-client': 'admin',
+    cookie: cookie(),
+    ...(body ? { 'content-type': 'application/json' } : {}),
+  },
+  body: body ? JSON.stringify(body) : undefined,
+});
+
+test('PATCH subtag ⇒ 公开接口带出来；清空 ⇒ 回到空串', { skip: sqliteSkip }, async () => {
+  const site = makeSite();
+  const env = site.env;
+
+  const set = await admin(env, 'PATCH', '/api/admin/wallpapers/wp_sub', { subtag: '动漫' });
+  assert.equal(set.status, 200, set.text.slice(0, 300));
+
+  const pub = await call(env, '/api/public/wallpapers?limit=10');
+  const item = pub.body.data.items.find((row) => row.id === 'wp_sub');
+  assert.ok(item, '作品应当出现在公开列表');
+  assert.equal(item.subtag, '动漫', '公开 DTO 必须带 subtag');
+
+  const clear = await admin(env, 'PATCH', '/api/admin/wallpapers/wp_sub', { subtag: '' });
+  assert.equal(clear.status, 200, clear.text.slice(0, 300));
+  const pub2 = await call(env, '/api/public/wallpapers?limit=10');
+  assert.equal(pub2.body.data.items.find((row) => row.id === 'wp_sub').subtag, '');
+});
+
+test('后台子标签字典可读（空表返回空数组）', { skip: sqliteSkip }, async () => {
+  const site = makeSite();
+  const res = await admin(site.env, 'GET', '/api/admin/subtags');
+  assert.equal(res.status, 200, res.text.slice(0, 300));
+  // 路由统一包在 data 里；兼容两种形状，避免以后换封装就红
+  const list = res.body && (res.body.subtags || (res.body.data && res.body.data.subtags));
+  assert.ok(Array.isArray(list), 'subtags 必须是数组');
+});
+
+test('前端编辑弹层：读后台字典、没有就显示「无子标签」、不新建', () => {
+  const src = readFileSync('public/assets/editor.js', 'utf8');
+  assert.ok(src.includes("request('/admin/subtags')"), '子标签选项必须来自后台字典');
+  assert.ok(src.includes('无子标签'), '没有子标签时要有明确提示');
+  assert.ok(/body\.subtag\s*=/.test(src), '保存时要提交 subtag');
+  assert.ok(src.includes("method: 'POST'") === false || !/POST[\s\S]{0,80}\/admin\/subtags/.test(src),
+    '前端不允许新建子标签（字典在后端维护）');
+});
