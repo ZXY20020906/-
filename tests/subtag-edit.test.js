@@ -112,3 +112,15 @@ test('删除确认用居中弹层，不用 window.confirm', () => {
   assert.ok(/await confirmSheet\(/.test(src), '删除前要 await 确认结果');
   assert.ok(css.includes('.confirm-sheet'), '确认框要居中且限宽');
 });
+
+test('编辑弹层：标签（多选 chips）与子标签（下拉）是两行', () => {
+  const src = readFileSync('public/assets/editor.js', 'utf8');
+  const css = readFileSync('public/assets/editor.css', 'utf8');
+  assert.ok(src.includes('async function tagsFieldHtml('), '要有「标签」字段');
+  assert.ok(src.includes("request('/admin/tags')"), '标签字典来自后台');
+  assert.ok(src.includes('tag-pick--chips'), '标签用 chips 多选');
+  assert.ok(src.includes('<label class="field-row">子标签'), '「子标签」单独一行下拉');
+  assert.ok(src.includes('body.tags ='), '保存时提交 tags');
+  assert.ok(!src.includes('已有标签'), '旧的只读「已有标签」行应移除');
+  assert.ok(css.includes('.tag-chip.active'), 'chips 选中态要有样式');
+});

@@ -281,3 +281,9 @@ body.editing .sort-field { display: none; }
 /* 居中确认框：原生 window.confirm 在窗口顶部，用户看不到按钮 */
 .confirm-sheet { width: min(420px, calc(100vw - 32px)); }
 .confirm-text { margin: 0; white-space: pre-line; line-height: 1.65; font-size: 14px; }
+
+/* 编辑弹层里的标签多选（chips） */
+.tag-pick--chips { border: 0; padding: 0; gap: 8px; }
+.tag-chip { border: 1px solid var(--line); background: transparent; color: var(--text); border-radius: 999px; padding: 4px 12px; font-size: 12px; cursor: pointer; }
+.tag-chip.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.field-label { font-size: 12px; color: var(--muted); }

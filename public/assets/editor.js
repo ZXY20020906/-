@@ -279,6 +279,25 @@ function categoryOptions(selectedId) {
  *   · /admin/subtags/used  —— 作品上**实际用过的**值（字典没建全时也能选到）
  * 两个合并去重；都没有就明确显示"无标签"。字段名仍是 subtag。
  */
+/** 标签（多选 chips）：字典来自 /admin/tags，选中的写回 item.tags。 */
+async function tagsFieldHtml(item) {
+  let names = [];
+  try {
+    const data = await request('/admin/tags');
+    names = (Array.isArray(data && data.tags) ? data.tags : []).map((row) => row && row.name).filter(Boolean);
+  } catch {
+    names = [];
+  }
+  const chosen = new Set(item.tags || []);
+  // 作品上有、字典里没有的标签也要能看见（否则一保存就被清掉）
+  for (const tag of chosen) if (tag && !names.includes(tag)) names.push(tag);
+  if (!names.length) return '<p class="sheet-hint">标签：无（后台「分类」里创建标签字典）</p>';
+  const chips = names.map((name) => (
+    `<button type="button" class="tag-chip${chosen.has(name) ? ' active' : ''}" data-tag="${esc(name)}" aria-pressed="${chosen.has(name) ? 'true' : 'false'}">${esc(name)}</button>`
+  )).join('');
+  return `<div class="field-row"><span class="field-label">标签</span><div class="tag-pick tag-pick--chips">${chips}</div></div>`;
+}
+
 async function subtagFieldHtml(item) {
   const current = String(item.subtag || '');
   const [dictResult, usedResult] = await Promise.allSettled([
@@ -295,7 +314,7 @@ async function subtagFieldHtml(item) {
   for (const name of used) if (typeof name === 'string' && name && !names.has(name)) names.set(name, '');
 
   if (!names.size) {
-    return { html: '<p class="sheet-hint">标签：无标签（在后台「分类」里创建，或给作品填过子标签后自动出现）</p>', editable: false };
+    return { html: '<p class="sheet-hint">子标签：无（后台「分类 → 子标签」里创建，或给作品填过后出现）</p>', editable: false };
   }
   if (current && !names.has(current)) names.set(current, '');
 
@@ -303,7 +322,7 @@ async function subtagFieldHtml(item) {
     `<option value="${esc(name)}"${name === current ? ' selected' : ''}>${esc(name)}${tagName ? `（${esc(tagName)}）` : ''}</option>`
   )).join('');
   return {
-    html: `<label class="field-row">标签
+    html: `<label class="field-row">子标签
       <select name="subtag"><option value=""${current ? '' : ' selected'}>（无标签）</option>${options}</select>
     </label>`,
     editable: true,
@@ -311,7 +330,7 @@ async function subtagFieldHtml(item) {
 }
 
 async function openWallpaperDialog(item) {
-  const subtagField = await subtagFieldHtml(item);
+  const [tagsHtml, subtagField] = await Promise.all([tagsFieldHtml(item), subtagFieldHtml(item)]);
   const dialog = openSheet(`
     <form>
       <h3>编辑「${esc(item.title)}」</h3>
@@ -321,8 +340,8 @@ async function openWallpaperDialog(item) {
       <label class="field-row">分类
         <select name="categoryId">${categoryOptions(item.category ? item.category.id : '')}</select>
       </label>
+      ${tagsHtml}
       ${subtagField.html}
-      <p class="sheet-hint">已有标签：${(item.tags || []).length ? esc((item.tags || []).join(' · ')) : '（无）'} · 编辑模式下不可改</p>
       <p class="sheet-hint">文件：${esc(item.mime || '未上传')} · ${esc(facade.formatBytes(item.bytes))}${
         item.width && item.height ? ` · ${item.width}×${item.height}` : ''
       }</p>
@@ -338,7 +357,12 @@ async function openWallpaperDialog(item) {
         title: $('input[name="title"]', form).value.trim(),
         categoryId: $('select[name="categoryId"]', form).value || null,
       };
-      // 只有真的给了下拉框才提交标签；没有字典时不动原值
+      // 标签 chips：只有渲染出来过才提交（字典读取失败时不动原标签）
+      const chipsHost = $('.tag-pick--chips', form);
+      if (chipsHost) {
+        body.tags = $$('.tag-chip.active', chipsHost).map((node) => node.dataset.tag).filter(Boolean);
+      }
+      // 只有真的给了下拉框才提交子标签；没有字典时不动原值
       if (subtagField.editable) {
         const select = $('select[name="subtag"]', form);
         body.subtag = select ? select.value : '';
@@ -368,6 +392,16 @@ async function openWallpaperDialog(item) {
       }
     },
   });
+
+  const chips = $('.tag-pick--chips', dialog);
+  if (chips) {
+    chips.addEventListener('click', (event) => {
+      const chip = event.target.closest('.tag-chip');
+      if (!chip) return;
+      chip.classList.toggle('active');
+      chip.setAttribute('aria-pressed', chip.classList.contains('active') ? 'true' : 'false');
+    });
+  }
 
   $('[data-remove]', dialog).addEventListener('click', async () => {
     const ok = await confirmSheet(`删除「${item.title}」？\n原文件也会一起删掉，不能撤销。`);
